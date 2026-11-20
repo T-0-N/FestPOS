@@ -68,9 +68,18 @@ def _files() -> list[str]:
                   and not _excluded(n, rules))
 
 
-def _add(z: zipfile.ZipFile, path: Path, rel: str) -> None:
+def _exec_in_git() -> set[str]:
+    """Dateien, die Git als ausführbar kennt (100755) – unter Windows kennt das Dateisystem kein «ausführbar»."""
+    if not (ROOT / ".git").exists():
+        return set()
+    out = subprocess.run(["git", "ls-files", "-s", "-z"], cwd=ROOT, check=True, capture_output=True).stdout.decode()
+    return {e.split("\t", 1)[1] for e in out.split("\0") if e.startswith("100755 ")}
+
+
+def _add(z: zipfile.ZipFile, path: Path, rel: str, exe: set[str] | None = None) -> None:
     info = zipfile.ZipInfo.from_file(path, "festpos/" + rel)
-    info.external_attr = ((0o100755 if path.stat().st_mode & stat.S_IXUSR else 0o100644) & 0xFFFF) << 16
+    x = rel in exe if exe else bool(path.stat().st_mode & stat.S_IXUSR)
+    info.external_attr = ((0o100755 if x else 0o100644) & 0xFFFF) << 16
     info.compress_type = zipfile.ZIP_DEFLATED
     z.writestr(info, path.read_bytes())
 
@@ -97,8 +106,9 @@ def main(argv: list[str] | None = None) -> None:
         except (pakete.PaketFehler, OSError, subprocess.CalledProcessError, zipfile.BadZipFile) as e:
             sys.exit(f"FEHLER: Pakete für den Pi: {e}")
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+            exe = _exec_in_git()
             for rel in names:
-                _add(z, ROOT / rel, rel)
+                _add(z, ROOT / rel, rel, exe)
             for rel in extra:
                 _add(z, Path(d) / rel, rel)
     tmp.replace(out)
