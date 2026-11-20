@@ -1,0 +1,19 @@
+# FestPOS – pi-gen-Einstellungen für das fertige Image (T12). Gebaut wird in der CI (.github/workflows/image.yml)
+# oder lokal: deploy/pi-gen/build.sh (braucht Docker, am schnellsten auf einem arm64-Rechner).
+# Keine Geheimnisse: keine festpos.conf, keine Zertifikate, keine Datenbank, keine SSH-Schlüssel, leere machine-id –
+# alles entsteht beim ersten Start (Ersteinrichtung im Browser, T11).
+IMG_NAME=festpos
+RELEASE=trixie
+TARGET_HOSTNAME=festpos
+LOCALE_DEFAULT=de_CH.UTF-8
+KEYBOARD_KEYMAP=ch
+KEYBOARD_LAYOUT="German (Switzerland)"
+TIMEZONE_DEFAULT=Europe/Zurich
+# Benutzer und SSH: im Raspberry Pi Imager unter «Einstellungen anpassen» (Benutzer, Passwort, SSH-Schlüssel).
+# Ohne diese Angaben ist der Benutzer gesperrt und SSH aus – eingerichtet wird im Browser.
+FIRST_USER_NAME=festpos-admin
+DISABLE_FIRST_BOOT_USER_RENAME=1
+ENABLE_SSH=0
+STAGE_LIST="stage0 stage1 stage2 stage-festpos"
+DEPLOY_COMPRESSION=xz
+COMPRESSION_LEVEL=6

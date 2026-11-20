@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="de-CH" translate="no" class="nocursor">
+<head>
+<meta charset="utf-8">
+<meta name="google" content="notranslate">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FestPOS</title>
+<link rel="icon" href="icons/icon-192.png">
+<style>
+@font-face { font-family: "Barlow Condensed"; font-weight: 500; src: url(fonts/barlow-condensed-latin-500-normal.woff2) format("woff2"); }
+@font-face { font-family: "Barlow Condensed"; font-weight: 600; src: url(fonts/barlow-condensed-latin-600-normal.woff2) format("woff2"); }
+@font-face { font-family: "Barlow Condensed"; font-weight: 700; src: url(fonts/barlow-condensed-latin-700-normal.woff2) format("woff2"); }
+:root {
+  --bg: #0f1210; --card: #1b201c; --line: #2c342e; --ink: #f2f5f2; --muted: #9aa69c;
+  --ok: #2bb34a; --wait: #f2b705; --bad: #e5484d; --off: #59625b; --hi: #019724;
+  --kiosk: #ff8a1f;   /* orange: Handy nicht im Kiosk-Modus (Fully) */
+  --u: min(1vw, 1.8vh);
+}
+* { box-sizing: border-box; margin: 0; }
+/* Herunterfahren / Neustart angekündigt (T27, common.js): gross über allem */
+.pwnotice { position: fixed; top: 0; left: 0; right: 0; z-index: 90; padding: calc(var(--u) * 2) calc(var(--u) * 3);
+  background: var(--bad); color: #fff; text-align: center; font-size: calc(var(--u) * 5); font-weight: 700;
+  box-shadow: 0 calc(var(--u) * .5) calc(var(--u) * 3) rgb(0 0 0 / .5); }
+/* Mauszeiger: sichtbar, sobald die Maus bewegt wird; nach 3 s Ruhe wieder weg (status.js) */
+html.nocursor, html.nocursor * { cursor: none !important; }
+html, body { height: 100%; background: var(--bg); color: var(--ink); overflow: hidden;
+  font: 600 calc(var(--u) * 2.3) / 1.15 "Barlow Condensed", "Arial Narrow", sans-serif; font-variant-numeric: tabular-nums; }
+body { display: grid; grid-template-rows: auto 1fr auto; grid-template-columns: minmax(0, 1fr); gap: calc(var(--u) * 1.2); padding: calc(var(--u) * 1.5); }
+
+header { display: flex; align-items: center; gap: calc(var(--u) * 2); }
+header .brand { flex: none; display: flex; align-items: center; gap: calc(var(--u) * 1); font-size: calc(var(--u) * 3.4); font-weight: 700; }
+header .brand i { width: calc(var(--u) * 2.1); height: calc(var(--u) * 2.7); background: var(--hi); border-radius: 4px; }
+header .brand .logo { display: block; height: calc(var(--u) * 4.4); width: auto; max-width: calc(var(--u) * 28); object-fit: contain; }
+header .brand .logo.plate { background: #fff; padding: calc(var(--u) * .4) calc(var(--u) * .8); border-radius: 6px; }
+header .event { min-width: 0; flex: 0 1 auto; color: var(--muted); font-size: calc(var(--u) * 2.8); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+header .pill { margin-left: auto; display: flex; align-items: center; gap: calc(var(--u) * 1); min-width: 0; flex: 0 1 auto;
+  padding: calc(var(--u) * .7) calc(var(--u) * 1.6); border-radius: 999px; background: rgb(43 179 74 / .14); color: var(--ok); }
+header .pill b { font-size: calc(var(--u) * 2.8); white-space: nowrap; }
+header .pill span { min-width: 0; color: var(--ink); opacity: .85; font-size: calc(var(--u) * 2.1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+header .pill.wait { background: rgb(242 183 5 / .14); color: var(--wait); }
+header .pill.bad { background: rgb(229 72 77 / .2); color: var(--bad); }
+header .clock { flex: none; font-size: calc(var(--u) * 5); font-weight: 700; letter-spacing: .02em; }
+
+main { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: calc(var(--u) * 1.2); min-height: 0; }
+.col { display: flex; flex-direction: column; gap: calc(var(--u) * 1.2); min-height: 0; min-width: 0; }
+.col > .card { flex: none; }
+.col > .card.grow { flex: 0 1 auto; }
+.col.left .log { flex: 1 1 0; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: calc(var(--u) * 1.2);
+  padding: calc(var(--u) * 1.2) calc(var(--u) * 1.6); min-height: 0; overflow: hidden; }
+h2 { font-size: calc(var(--u) * 2); color: var(--muted); font-weight: 600; letter-spacing: .04em; margin-bottom: calc(var(--u) * .6); }
+
+/* Drucker: grosse Kacheln mit farbigem Rand */
+.printers { display: grid; gap: calc(var(--u) * 1); }
+.printer { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: calc(var(--u) * 1.3); min-width: 0;
+  background: var(--card); border: 1px solid var(--line); border-left: calc(var(--u) * .8) solid var(--ok);
+  border-radius: calc(var(--u) * 1.2); padding: calc(var(--u) * .8) calc(var(--u) * 1.6); }
+.printer .dot { width: calc(var(--u) * 2.4); height: calc(var(--u) * 2.4); border-radius: 50%; background: var(--ok); }
+.printer .nm { font-size: calc(var(--u) * 3.1); font-weight: 700; line-height: 1.05; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.printer .sub { color: var(--muted); font-size: calc(var(--u) * 2.1); margin-top: calc(var(--u) * .3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.printer .st { font-size: calc(var(--u) * 2.7); font-weight: 700; text-align: right; white-space: nowrap; }
+.printer.wait { border-left-color: var(--wait); } .printer.wait .dot { background: var(--wait); } .printer.wait .st { color: var(--wait); }
+.printer.bad { border-left-color: var(--bad); background: #2a1517; } .printer.bad .dot { background: var(--bad); animation: blink 1s steps(2) infinite; } .printer.bad .st { color: var(--bad); }
+.printer.off { border-left-color: var(--off); opacity: .6; } .printer.off .dot { background: var(--off); }
+@keyframes blink { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .printer.bad .dot, .lamp.bad::before { animation: none; } }
+
+/* Letzte Bestellungen */
+/* Eine Zeile pro Bestellung, wo Platz ist: Tisch und Druckstand nebeneinander, Betrag und Nummer nebeneinander –
+   erst wenn es nicht reicht, rutscht der Druckstand bzw. die Nummer darunter (mehr Bestellungen sichtbar) */
+.order { display: grid; grid-template-columns: calc(var(--u) * 6.4) minmax(0, 1fr) auto; column-gap: calc(var(--u) * 1.2); align-items: baseline;
+  padding: calc(var(--u) * .45) 0; border-top: 1px solid var(--line); cursor: pointer; }
+.order.cut { display: none; }
+.order .what { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: calc(var(--u) * 1.6); min-width: 0; }
+.order .what .where { flex: 0 1 auto; min-width: 0; }
+.order .time { font-size: calc(var(--u) * 2.7); color: var(--muted); }
+.order .where { font-size: calc(var(--u) * 2.8); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.order .where small { font-size: calc(var(--u) * 2.1); font-weight: 500; color: var(--muted); margin-left: .5em; }
+.order .lamps { display: flex; flex-wrap: wrap; gap: calc(var(--u) * 1.4); font-size: calc(var(--u) * 2.1); color: var(--muted); }
+.order .amt { font-size: calc(var(--u) * 2.8); text-align: right; display: flex; flex-direction: row-reverse; flex-wrap: wrap;
+  align-items: baseline; column-gap: calc(var(--u) * 1.2); max-width: calc(var(--u) * 30); }
+.order .amt b { font-weight: inherit; white-space: nowrap; }
+.order .amt small { flex: 1 0 auto; text-align: right; font-size: calc(var(--u) * 1.9); color: var(--muted); font-weight: 500; white-space: nowrap; }
+.order.problem .where { color: var(--bad); }
+
+/* Kontrolllampen */
+.lamp { display: inline-flex; align-items: center; gap: .45em; white-space: nowrap; }
+.lamp::before { content: ""; width: .7em; height: .7em; border-radius: 50%; background: var(--off); flex: none; }
+.lamp.ok::before { background: var(--ok); }
+.lamp.wait::before { background: var(--wait); }
+.lamp.kiosk::before { background: var(--kiosk); }
+.lamp.bad::before { background: var(--bad); animation: blink 1s steps(2) infinite; }
+.list { display: grid; gap: calc(var(--u) * .5); }
+.item { display: grid; grid-template-columns: 1fr auto; gap: calc(var(--u) * 1); align-items: baseline; font-size: calc(var(--u) * 2.6); }
+.item .lamp { overflow: hidden; text-overflow: ellipsis; }
+.item .note { color: var(--muted); font-size: calc(var(--u) * 2.1); white-space: nowrap; }
+.item .note.bad { color: var(--bad); } .item .note.wait { color: var(--wait); } .item .note.kiosk { color: var(--kiosk); }
+.item.off .lamp { color: var(--muted); }
+.chips { display: flex; flex-wrap: wrap; gap: calc(var(--u) * .5) calc(var(--u) * 1.8); font-size: calc(var(--u) * 2.3); }
+.chips > .item { display: block; font-size: inherit; }
+.chips > .item .note:not(.wait) { display: none; }
+.chips > .item .note { margin-left: .4em; }
+.chips > .note { color: var(--muted); }
+.chips + .chips { margin-top: calc(var(--u) * .6); }
+/* Pi-Zeilen: passt die Notiz nicht neben den Namen, rutscht sie ganz auf die nächste Zeile (nie mitten im Text) */
+#cluster .item { display: flex; flex-wrap: wrap; justify-content: space-between; column-gap: calc(var(--u) * 1); }
+#cluster .item .note { margin-left: auto; min-width: 0; white-space: normal; text-align: right; }
+.uplink.inet .lamp { width: 1.05em; }
+.uplink.inet .val, .uplink.inet .sub { white-space: normal; }
+.cluster-sum { color: var(--muted); font-size: calc(var(--u) * 2.1); margin-top: calc(var(--u) * .4); }
+.cluster-sum.bad { color: var(--bad); }
+
+footer { display: flex; align-items: baseline; gap: calc(var(--u) * 3); color: var(--muted); font-size: calc(var(--u) * 2.1); }
+footer b { color: var(--ink); font-size: calc(var(--u) * 2.8); margin-right: .25em; }
+footer > span { white-space: nowrap; }
+footer .ver { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* Links zur Bestell-App und zur Verwaltung (nur am Handy und am PC, nie am Bildschirm des Pi) */
+footer .jump { display: flex; gap: calc(var(--u) * 1); margin-left: auto; }
+footer .jump[hidden], footer .jump a[hidden] { display: none; }
+footer .jump + .ver { margin-left: 0; }
+footer .jump a { color: var(--ink); text-decoration: none; border: 1px solid var(--line); border-radius: 999px; white-space: nowrap;
+  padding: calc(var(--u) * .4) calc(var(--u) * 1.4); font-size: calc(var(--u) * 2.2); font-weight: 700; }
+footer .jump a:hover { border-color: var(--ink); }
+.alert-link { display: inline-block; margin-top: 3vh; padding: 1.4vh 3vh; border-radius: 999px; background: #fff; color: #7a0c12;
+  text-decoration: none; font-size: calc(var(--u) * 3); }
+.alert-link[hidden] { display: none; }
+.stornotag { background: var(--bad); color: #fff; font-weight: 700; border-radius: 4px; padding: 0 5px; font-size: .8em; }
+.empty { color: var(--muted); font-size: calc(var(--u) * 2.2); padding-top: calc(var(--u) * .6); }
+
+.alert { position: fixed; inset: 0; display: none; place-items: center; text-align: center; background: rgb(120 12 18 / .94); padding: 6vh; }
+.alert div { font-size: calc(var(--u) * 6); font-weight: 700; line-height: 1.1; }
+.alert small { display: block; font-size: calc(var(--u) * 2.6); font-weight: 500; margin-top: 2vh; opacity: .9; }
+body.offline .alert { display: grid; }
+/* ---- Ansichten (status.js setzt v-pi / v-tablet / v-pc / small, übersteuerbar mit ?ansicht=) ----
+   quer, schmal (Pi 7" 800×480):      zwei Spalten, gross – von weitem lesbar (Grundeinstellung oben)
+   quer, ab 1000 px (Tablet, PC, TV): drei Spalten – Drucker | Bestellungen | Handys, Netzwerk
+   hoch (Tablet hochkant, Touch Display 2): Drucker, darunter Handys und Netzwerk nebeneinander, dann Bestellungen */
+@media (min-aspect-ratio: 5/4) and (min-width: 1000px) {
+  /* Drucker als Reihe über zwei Spalten, darunter die Bestellungen gleich breit (früher blieb links unter
+     den Druckern viel Platz leer und die Bestellungen standen zweizeilig in der schmalen Mitte) */
+  html:not(.small) main { grid-template-columns: minmax(0, 2.5fr) minmax(0, 1fr); }
+  html:not(.small) .col.left { min-height: 0; }
+  html:not(.small) .col.left .printers { grid-template-columns: repeat(auto-fit, minmax(calc(var(--u) * 40), 1fr)); }
+  html.v-pi { --u: clamp(6px, min(.8vw, 1.45vh), 15px); }       /* TV / grosser Monitor am Pi: von weitem */
+  html.v-tablet { --u: clamp(6px, min(.75vw, 1.3vh), 11px); }
+  html.v-pc { --u: clamp(6px, min(.62vw, 1.1vh), 10px); }       /* am Schreibtisch: mehr auf einmal */
+}
+/* Pi 7" quer (zwei schmale Spalten): ohne «1 Artikel · #0030» passt eine Bestellung meist auf eine Zeile (Nummer: antippen) */
+@media (min-aspect-ratio: 5/4) and (max-width: 999px) {
+  html:not(.small) .order .amt small { display: none; }
+}
+@media (max-aspect-ratio: 5/4) {
+  html:not(.small) { --u: min(1.15vw, 1.6vh); }
+  html.v-pc:not(.small) { --u: min(1vw, 1.45vh); }
+  html:not(.small) main { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: auto auto auto minmax(0, 1fr);
+    grid-template-areas: "prn prn" "dev net" "dev clu" "log log"; }
+  html:not(.small) .col { display: contents; }
+  html:not(.small) .printers { grid-area: prn; grid-template-columns: repeat(auto-fit, minmax(calc(var(--u) * 40), 1fr)); }
+  html:not(.small) .phones { grid-area: dev; }
+  html:not(.small) .clu { grid-area: clu; align-self: start; }
+  html:not(.small) .net { grid-area: net; align-self: start; }
+  html:not(.small) .log { grid-area: log; }
+}
+/* kleine Displays (3,5" 480×320): etwas grösser, Nebensachen weg */
+.item .ip { color: var(--muted); font-weight: 500; margin-right: .8em; }
+.bat { color: var(--muted); font-weight: 500; margin-right: .8em; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bat::before { content: ""; display: inline-block; box-sizing: border-box; width: 1.35em; height: .7em; margin-right: .3em;
+  padding: .1em; border: .12em solid currentColor; border-radius: .18em; vertical-align: -.02em;
+  background: linear-gradient(90deg, currentColor var(--lvl, 0%), transparent var(--lvl, 0%)) content-box; }
+.bat i { font-style: normal; margin-left: .15em; }
+.bat.wait { color: var(--wait); } .bat.bad { color: var(--bad); }
+#devices.noip .ip, #devices.nostate .note .on { display: none; }
+.item .who { color: var(--muted); font-weight: 500; font-size: .8em; margin-left: .35em; }
+#devices.nowho .who { display: none; }
+.lamp.idle::before { background: transparent; box-shadow: inset 0 0 0 2px var(--ok); }
+
+/* ---- kleines Display (3,5", 480×320): kompakt, ganze Seite scrollbar, Kopf bleibt stehen ---- */
+html.small { --u: 6.2px; overflow-y: auto; scrollbar-width: none; touch-action: none; user-select: none; -webkit-user-select: none; }
+html.small::-webkit-scrollbar { display: none; }
+html.small, html.small body { height: auto; min-height: 100%; overflow-x: hidden; }
+html.small body { overflow: visible; grid-template-rows: auto auto auto; gap: 6px; padding: 0 6px 6px; }
+.small header { position: sticky; top: 0; z-index: 2; background: var(--bg); padding: 5px 0 4px; gap: 8px; }
+.small header .brand, .small header .event { display: none; }
+.small header .pill { margin-left: 0; flex: 1 1 auto; padding: 3px 10px; }
+.small header .pill b { font-size: 17px; } .small header .pill span { font-size: 14px; }
+.small header .clock { font-size: 26px; }
+.small main { grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr); gap: 6px; align-items: start; }
+.small .col.left { display: contents; }
+.small .printers { grid-column: 1 / -1; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 6px; }
+.small .printer { grid-template-columns: auto minmax(0, 1fr) auto; padding: 5px 8px; gap: 7px; border-left-width: 5px; border-radius: 8px; }
+.small .printer .dot { width: 12px; height: 12px; }
+.small .printer .nm { font-size: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.small .printer .sub { display: none; }
+.small .printer .st { font-size: 16px; }
+.small .col { gap: 6px; }
+.small .card { padding: 5px 8px 6px; border-radius: 8px; overflow: visible; }
+.small .log { flex: none; grid-column: 1; }
+/* Handy hochkant (nicht das 3,5"-Display am Pi): eine Spalte – Drucker, Handys, Netzwerk, Server, dann die
+   Bestellungen über die ganze Breite (zwei Spalten schneiden dort Platz und «nicht erreichbar» ab) */
+@media (orientation: portrait) {
+  html.small.phone main { grid-template-columns: minmax(0, 1fr); }
+  html.small.phone .col { display: contents; }
+  html.small.phone .printers { order: 0; }
+  html.small.phone .phones { order: 1; }
+  html.small.phone .net { order: 2; }
+  html.small.phone .clu { order: 3; }
+  html.small.phone .log { order: 4; grid-column: 1; }
+  html.small.phone .order .where small { display: inline; font-size: 13px; }     /* Platz reicht: Gerät (Bedienung) */
+}
+.small h2 { font-size: 13px; margin-bottom: 2px; }
+.small .order { grid-template-columns: auto minmax(0, 1fr) auto; column-gap: 7px; padding: 3px 0; align-items: center; }
+.small .order .time { font-size: 14px; }
+.small .order .where { font-size: 16px; }
+.small .order .where small, .small .order .amt small { display: none; }
+.small .order .lamps { gap: 2px 8px; font-size: 13px; }
+.small .order .lamp.ok .lbl { display: none; }
+.small .order .amt { font-size: 15px; }
+.small .item { font-size: 15px; gap: 6px; }
+.small .item .note { font-size: 13px; }
+.small .item .ip { margin-right: .5em; }
+.small .item { grid-template-columns: auto minmax(0, 1fr); }
+.small .item .lamp { white-space: nowrap; }
+.small .item .note { white-space: normal; text-align: right; line-height: 1.1; }
+
+.small .item .note .on { display: none; }
+.small .item:has(.bat) .ip { display: none; }           /* 3,5": Akku wichtiger als die IP */
+.small .order .what { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 8px; min-width: 0; }
+.small .chips { font-size: 15px; gap: 2px 12px; }
+.small .cluster-sum { font-size: 13px; }
+.small footer { gap: 14px; font-size: 13px; padding-top: 2px; }
+.small footer b { font-size: 17px; }
+.small footer .ver { display: none; }
+.small footer { flex-wrap: wrap; }
+.small footer .jump a { font-size: 15px; padding: 6px 12px; }
+.small .empty { font-size: 14px; }
+/* Gerät antippen: Details und (ab Festleitung) Neustart */
+.tap { cursor: pointer; }
+.item.tap:hover .lamp, .lamp.tap:hover { text-decoration: underline; text-underline-offset: .2em; }
+.item.tap:focus-visible, .lamp.tap:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; border-radius: 4px; }
+#detail-sheet { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: rgb(0 0 0 / .6);
+  padding: calc(var(--u) * 2); }
+#detail-sheet[hidden] { display: none; }
+main [hidden] { display: none !important; }        /* Karten und Zeilen ohne Geräte im Einsatz */
+#detail-sheet .panel { width: min(100%, calc(var(--u) * 70)); max-height: 100%; overflow: auto; background: var(--card);
+  border: 1px solid var(--line); border-radius: calc(var(--u) * 1.4); padding: calc(var(--u) * 1.6) calc(var(--u) * 2.2); }
+#detail-sheet .head { display: flex; align-items: center; justify-content: space-between; gap: 1em; margin-bottom: calc(var(--u) * 1); }
+#detail-sheet .head b { font-size: calc(var(--u) * 3.4); }
+#detail-sheet dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: calc(var(--u) * .4) calc(var(--u) * 2);
+  font-size: calc(var(--u) * 2.3); }
+#detail-sheet dt { color: var(--muted); font-weight: 500; }
+#detail-sheet dd { margin: 0; overflow-wrap: anywhere; }
+#detail-sheet .hint { color: var(--muted); font-size: calc(var(--u) * 2); font-weight: 500; margin-top: calc(var(--u) * 1); }
+#detail-sheet .acts { display: flex; flex-wrap: wrap; align-items: center; gap: calc(var(--u) * 1); margin-top: calc(var(--u) * 1.6);
+  font-size: calc(var(--u) * 2.3); }
+#detail-sheet button { font: inherit; font-weight: 700; color: var(--ink); background: transparent; border: 2px solid var(--line);
+  border-radius: calc(var(--u) * .8); padding: calc(var(--u) * .6) calc(var(--u) * 1.4); cursor: pointer; }
+#detail-sheet button:hover { border-color: var(--ink); }
+#detail-sheet button.danger { border-color: var(--bad); color: var(--bad); }
+#detail-sheet .head button { border: 0; font-size: calc(var(--u) * 3); padding: 0 calc(var(--u) * .6); }
+#detail-sheet .msg { margin-top: calc(var(--u) * 1.2); color: var(--wait); font-size: calc(var(--u) * 2.2); }
+/* T29: alle Bestellungen seit dem Tagesabschluss – Liste und eine Bestellung */
+.card.log.tap { cursor: pointer; }
+.card.log h2 { display: flex; justify-content: space-between; align-items: baseline; gap: 1em; }
+.card.log h2 .more-link { color: var(--muted); font-weight: 600; white-space: nowrap; }
+#detail-sheet .ol-sum { color: var(--muted); font-weight: 600; margin-bottom: calc(var(--u) * .8); }
+#detail-sheet .ol { display: grid; gap: calc(var(--u) * .3); }
+#detail-sheet .ol-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 0 calc(var(--u) * 1.2); align-items: baseline;
+  width: 100%; text-align: left; padding: calc(var(--u) * .6) calc(var(--u) * .8); border-width: 1px; font-weight: 500; }
+#detail-sheet .ol-row .t { color: var(--muted); font-variant-numeric: tabular-nums; }
+#detail-sheet .ol-row .w { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#detail-sheet .ol-row .w small { color: var(--muted); margin-left: .4em; }
+#detail-sheet .ol-row .a { font-weight: 700; font-variant-numeric: tabular-nums; }
+#detail-sheet .ol-row .st { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 0 calc(var(--u) * 1.2); font-size: .85em; }
+#detail-sheet .ol-row.problem { border-color: var(--bad); }
+#detail-sheet .ol-row.test { opacity: .75; }
+#detail-sheet .od-lines { display: grid; gap: calc(var(--u) * .3); margin: calc(var(--u) * .8) 0; }
+#detail-sheet .od-lines .l { display: flex; justify-content: space-between; gap: 1em; }
+#detail-sheet .od-lines .l small { display: block; color: var(--muted); }
+#detail-sheet .od-lines .l.gone span:first-child { text-decoration: line-through; color: var(--muted); }
+#detail-sheet h3 { margin: calc(var(--u) * 1.2) 0 calc(var(--u) * .4); font-size: 1em; color: var(--muted); }
+#detail-sheet .back { margin-bottom: calc(var(--u) * .8); }
+.small #detail-sheet .ol-row { font-size: 14px; }
+.small #detail-sheet { padding: 6px; }
+.small #detail-sheet .panel { padding: 8px 10px; border-radius: 8px; }
+.small #detail-sheet .head b { font-size: 20px; }
+.small #detail-sheet dl, .small #detail-sheet .acts { font-size: 15px; }
+.small #detail-sheet .hint, .small #detail-sheet .msg { font-size: 13px; }
+.small #detail-sheet button { padding: 5px 10px; border-radius: 6px; }
+/* Mobilfunk-Router: Empfang in Balken, darunter Anbieter und Netz */
+.uplink { display: grid; grid-template-columns: auto auto minmax(0, 1fr); align-items: center; column-gap: calc(var(--u) * 1);
+  font-size: calc(var(--u) * 2.4); margin-bottom: calc(var(--u) * .9); }
+.uplink[hidden] { display: none; }
+.uplink .sig { display: inline-flex; align-items: flex-end; gap: calc(var(--u) * .3); height: 1.05em; }
+.uplink .sig i { width: calc(var(--u) * .75); border-radius: 1px; background: var(--line); }
+.uplink .sig i:nth-child(1) { height: 28%; } .uplink .sig i:nth-child(2) { height: 52%; }
+.uplink .sig i:nth-child(3) { height: 76%; } .uplink .sig i:nth-child(4) { height: 100%; }
+.uplink.ok .sig i.on { background: var(--ok); } .uplink.wait .sig i.on { background: var(--wait); }
+.uplink.bad .sig i { background: var(--bad); opacity: .45; }
+.uplink .nm { font-weight: 700; white-space: nowrap; }
+.uplink .val { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.uplink.wait .val { color: var(--wait); } .uplink.bad .val { color: var(--bad); }
+.uplink .sub { grid-column: 2 / -1; min-width: 0; color: var(--muted); font-size: .82em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.uplink.tap:hover .nm { text-decoration: underline; text-underline-offset: .2em; }
+.uplink.tap:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; border-radius: 4px; }
+.small .uplink { font-size: 15px; margin-bottom: 4px; column-gap: 7px; }
+.small .uplink .sig { gap: 2px; } .small .uplink .sig i { width: 4px; }
+/* Router-Details: übrige Angaben in zwei Spalten (nicht am 3,5"-Display) */
+html:not(.small) #detail-sheet dl.more { grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr); margin-top: calc(var(--u) * 1.4); }
+.small #detail-sheet dl.more { margin-top: 8px; }
+#detail-sheet:has(dl.more) .panel { width: min(100%, calc(var(--u) * 90)); }
+/* Verlauf im Detailblatt */
+.upchart { margin: calc(var(--u) * 1.2) 0 0; }
+.upchart .plot { position: relative; height: calc(var(--u) * 14); margin-left: calc(var(--u) * 5.2); }
+.upchart svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.upchart .zw { fill: rgb(242 183 5 / .12); } .upchart .zb { fill: rgb(229 72 77 / .14); }
+.upchart .g { stroke: var(--line); stroke-width: 1; }
+.upchart .l { fill: none; stroke: var(--ok); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
+.upchart .now { position: absolute; width: calc(var(--u) * 1.2); height: calc(var(--u) * 1.2); margin: calc(var(--u) * -.6) 0 0 calc(var(--u) * -.6);
+  border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 calc(var(--u) * .35) var(--card); }
+.upchart .now.wait { background: var(--wait); } .upchart .now.bad { background: var(--bad); }
+.small .upchart .now { width: 8px; height: 8px; margin: -4px 0 0 -4px; box-shadow: 0 0 0 2px var(--card); }
+.upchart .yl { position: absolute; right: 100%; transform: translateY(-50%); padding-right: .5em; color: var(--muted);
+  font-size: calc(var(--u) * 1.7); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.upchart figcaption { display: flex; justify-content: space-between; gap: 1em; margin-left: calc(var(--u) * 5.2);
+  color: var(--muted); font-size: calc(var(--u) * 1.8); margin-top: calc(var(--u) * .4); }
+.small .upchart .plot { height: 84px; margin-left: 36px; } .small .upchart figcaption { margin-left: 36px; font-size: 12px; }
+.small .upchart .yl { font-size: 11px; }
+/* Übungsbestellungen aus dem Testmodus */
+.testtag { background: #ffd400; color: #000; font-weight: 700; border-radius: 4px; padding: 0 5px; font-size: .8em; }
+/* Handys im Testmodus (T7): Marke TEST, oben im Kärtchen «Alle aus dem Testmodus» (ab zwei Handys) */
+.item .note .testtag { margin-right: .4em; }
+.phones { position: relative; }
+.testall { position: absolute; top: calc(var(--u) * 1); right: calc(var(--u) * 1.2); font: inherit; font-size: calc(var(--u) * 1.9);
+  font-weight: 700; color: var(--wait); background: transparent; border: 2px solid var(--wait); border-radius: calc(var(--u) * .8);
+  padding: calc(var(--u) * .2) calc(var(--u) * 1); cursor: pointer; }
+.order.test { opacity: .7; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><i></i><span>FestPOS</span></div>
+  <div class="event" id="event"></div>
+  <div class="pill" id="pill"><b id="state" data-i18n="status.head.connecting">…</b><span id="detail"></span></div>
+  <div class="clock" id="clock">--:--</div>
+</header>
+<div id="detail-sheet" hidden></div>
+<main>
+  <div class="col left">
+    <div class="printers" id="printers"></div>
+    <section class="card log tap" data-orders="1" role="button" tabindex="0"><h2><span data-i18n="status.card.recent_orders">…</span><span class="more-link" data-i18n="status.orders.all">…</span></h2><div id="orders"></div></section>
+  </div>
+  <div class="col">
+    <section class="card grow phones"><h2 data-i18n="status.card.phones">…</h2>
+      <button type="button" class="testall" id="testall" data-testall="1" data-i18n="status.dev.test_all_btn" hidden>…</button><div class="list" id="devices"></div></section>
+    <section class="card net"><h2 data-i18n="status.card.network">…</h2><div class="uplink tap" id="uplink" data-up="1" role="button" tabindex="0" hidden></div><div class="uplink inet tap" id="inet" data-inet="1" role="button" tabindex="0" hidden></div><div class="chips" id="network"></div></section>
+    <section class="card clu" id="cluster-card"><h2 data-i18n="status.card.cluster">…</h2><div class="list" id="cluster"></div><div class="cluster-sum" id="cluster-sum" hidden></div></section>
+  </div>
+</main>
+<footer>
+  <span><b id="k-orders">0</b><span data-i18n="status.foot.orders">…</span></span>
+  <span><b id="k-hour">0</b><span data-i18n="status.foot.last_hour">…</span></span>
+  <span><b id="k-total">0.00</b><span id="k-cur">CHF</span></span>
+  <nav class="jump" id="jump" hidden><a id="j-app" href="/" hidden data-i18n="status.nav.app">…</a><a id="j-admin" href="/admin.html" hidden data-i18n="status.nav.admin">…</a></nav>
+  <span class="ver" id="ver"></span>
+</footer>
+<div class="alert"><div><span id="alert-title" data-i18n="status.down.title">…</span>
+  <small id="alert-sub" data-i18n="status.down.text">…</small>
+  <a class="alert-link" id="alert-link" href="/admin.html" hidden data-i18n="status.nav.login">…</a></div></div>
+<script src="status-frame.js"></script>
+<script src="common.js"></script>
+<script src="i18n.js"></script>
+<script src="status.js"></script>
+</body>
+</html>

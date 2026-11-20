@@ -1,0 +1,54 @@
+# FestPOS – bei jeder Änderung: Lint und alle Tests (auch mit echtem rqlite-Cluster).
+name: Prüfung
+on:
+  push:
+    branches: ["**"]                  # Tags prüft der Release-Workflow (release.yml ruft diesen auf)
+  pull_request:
+  workflow_call:
+
+# Actions sind auf Commit-Nummern festgelegt (Review 2026-11, D4): ein verschobenes Tag «v4» bringt so keinen fremden
+# Code in den Bau. Erneuern: git ls-remote https://github.com/<action> 'refs/tags/v4' 'refs/tags/v4^{}'
+permissions:
+  contents: read
+
+jobs:
+  pruefen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30                 # Tests ~10 min; das Installieren (Chromium) dauert manchmal über 10 min
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.13"          # wie Raspberry Pi OS Trixie
+      - name: rqlite (feste Version, Prüfsumme)
+        run: |
+          curl -fsSL -o rq.tgz https://github.com/rqlite/rqlite/releases/download/v10.5.3/rqlite-v10.5.3-linux-amd64.tar.gz
+          echo "93dc04417d9d233e79eb359e325793b1f92daa84ec93694953f4bff6307fda2b  rq.tgz" | sha256sum -c
+          tar xzf rq.tgz
+          echo "RQLITED=$PWD/rqlite-v10.5.3-linux-amd64/rqlited" >> "$GITHUB_ENV"
+      - name: Python-Pakete (dieselben festen Versionen wie auf dem Pi)
+        run: |
+          python -m pip install --require-hashes -r requirements.txt
+          python -m pip install -r requirements-dev.txt
+      - name: Werkzeuge
+        run: |
+          sudo apt-get install -y --no-install-recommends shellcheck
+          python -m playwright install --with-deps chromium   # für den Browser-Rauchtest
+      - name: Prüfen
+        env:
+          FESTPOS_ALLE_TESTS: "1"           # ohne rqlited/Chromium übersprungene Tests zählen hier als Fehler
+        run: |
+          set -o pipefail
+          tools/check.sh 2>&1 | tee check.log
+      - name: Fehler als Hinweise anzeigen
+        if: failure()
+        run: |
+          # die wichtigsten Zeilen als Annotation (sichtbar in der Übersicht und im Pull Request)
+          grep -E "^(FAILED|ERROR) |^E +|Fehler|fehlt|error" check.log | head -8 | while IFS= read -r z; do echo "::error::$z"; done
+          echo "::error title=Ende des Protokolls::$(tail -n 40 check.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+      - name: Protokoll aufbewahren
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: check-log
+          path: check.log

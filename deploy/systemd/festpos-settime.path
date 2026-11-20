@@ -1,0 +1,10 @@
+[Unit]
+Description=FestPOS: Uhrzeit-Aufträge der App übernehmen (ohne sudo)
+
+[Path]
+# solange ein Auftrag dort liegt (auch einer, der vor dem Start abgelegt wurde)
+DirectoryNotEmpty=/run/festpos/zeit
+Unit=festpos-settime.service
+
+[Install]
+WantedBy=multi-user.target

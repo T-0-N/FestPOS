@@ -1,0 +1,3 @@
+# FestPOS – USB-Stick mit Update (festpos.zip + festpos.zip.sig): festpos-update --usb <gerät>
+# Nur USB-Speicher mit Dateisystem; ob er etwas taugt (Signatur, neuere Version), prüft festpos-update.
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="festpos-usb@%k.service"

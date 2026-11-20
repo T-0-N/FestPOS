@@ -1,0 +1,68 @@
+# FestPOS – was NICHT auf eine neue SD-Karte gehört (T10 «SD-Karte schreiben», T12 Image mit pi-gen).
+#
+# Eine Zeile pro Pfad oder Muster («*» passt auf alles, auch über «/» hinweg):
+#   /pfad                 Datei oder Ordner auf der Systempartition (/) – wird nicht kopiert
+#   /ordner/*             nur der Inhalt fehlt, der Ordner selbst bleibt (mit Besitzer und Rechten)
+#   /ordner/* ordner      wie oben, aber alle Unterordner bleiben leer erhalten (z. B. /var/log)
+#   boot:muster           Datei oder Ordner auf der Boot-Partition (kommt je nach Buchstabe neu dazu)
+# Hinter «#» steht, warum. Neue gerätespezifische Dateien späterer Aufgaben gehören nur hierher.
+
+# Laufzeit (eigene Dateisysteme, nur die leeren Ordner)
+/proc/*
+/sys/*
+/dev/*
+/run/*
+/tmp/*
+/mnt/*
+/media/*
+/lost+found/*
+/boot/firmware/*                      # Boot-Partition: eigener Schritt (boot:…)
+
+# Keine Datenbank – sonst gäbe es zwei getrennte Datenbestände
+/var/lib/festpos/rqlite/*
+/var/lib/festpos/gruenden
+/var/lib/festpos/festpos.db
+/var/lib/festpos/festpos.db-*
+
+# Leases der Handys (DHCP)
+/var/lib/festpos/dhcp.leases
+/var/lib/festpos/dhcp/*
+
+# Logs (Ordner bleiben, Dateien nicht)
+/var/log/* ordner
+
+# Stand der Sicherung und des Updates gehören zu diesem Pi
+/var/lib/festpos-sicherung/status.json
+/var/lib/festpos/update/*
+/var/lib/festpos-update/*
+
+# Pro Gerät: entsteht beim ersten Start neu (systemd, festpos-node)
+/etc/machine-id                       # leere Datei: systemd erzeugt eine neue
+/var/lib/dbus/machine-id
+/var/lib/systemd/random-seed
+/var/lib/systemd/credential.secret
+/etc/ssh/ssh_host_*                   # neue SSH-Schlüssel (festpos-node)
+/etc/ssh/.festpos-node
+/var/lib/festpos/adb/*                # ADB-Schlüssel (T2): Handys fragen am neuen Pi einmal «Zulassen»
+/var/lib/chrony/*                     # Gang der Uhr dieses Pi
+/var/lib/festpos/einrichtung/*        # Einrichtungscode der Ersteinrichtung (T11)
+/var/lib/festpos/einrichtung-sicherung/*   # Sicherung, die die App nach der Ersteinrichtung einspielt (T11)
+/etc/issue.d/festpos.issue            # Hinweis «noch nicht eingerichtet» auf dem Bildschirm
+
+# Unnötig bzw. privat
+/var/cache/apt/archives/*.deb
+/var/lib/festpos-kiosk/chromium/*     # Profil der Statusanzeige (Chromium legt es neu an)
+/home/*/.bash_history
+/root/.bash_history
+/swapfile
+
+# Boot-Partition: kommt für den gewählten Buchstaben neu dazu (app/kartenboot.py) bzw. gehört zu diesem Pi
+boot:festpos.conf
+boot:node.conf
+boot:festpos-tls
+boot:festpos-tls.alt-*
+boot:festpos.conf.alt-*
+boot:festpos-update*.pub
+boot:festpos-einrichtung*.txt
+boot:karte-*
+boot:ca.key

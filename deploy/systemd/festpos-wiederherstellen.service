@@ -1,0 +1,8 @@
+[Unit]
+Description=FestPOS: Auftrag der Verwaltung ausführen (Schlüssel einspielen, Kartenpaket, 3 Pi, APK vom Stick)
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/festpos-wiederherstellen --anfrage
+TimeoutStartSec=180

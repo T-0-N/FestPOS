@@ -1,0 +1,9 @@
+[Unit]
+Description=FestPOS: geändertes Drucker-Netz übernehmen (schreibt die App, app/printer_net.py)
+
+[Path]
+PathChanged=/var/lib/festpos/druckernetz
+Unit=festpos-druckernetz.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+# Caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Lokale Konfiguration und Daten (nie ins Repo)
+deploy/festpos.conf
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+
+# Bauergebnisse
+dist/
+# Pakete für den Pi: holt tools/pakete.py beim Bauen (nicht im Git)
+deploy/wheels/
+deploy/rqlite-*.tar.gz
+*.zip
+*.zip.sig
+
+# Arbeitsdateien (Mockups, Screenshots, Übersetzungs-Entwürfe)
+scratch/
+deploy/pi-gen/work/
+deploy/pi-gen/out/

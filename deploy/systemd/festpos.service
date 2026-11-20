@@ -1,0 +1,28 @@
+[Unit]
+Description=FestPOS: Web-App, API und Druck-Spooler
+After=rqlited.service festpos-node.service
+Requires=festpos-node.service
+Wants=rqlited.service
+# Ersteinrichtung (keine festpos.conf, T11): dann läuft festpos-einrichtung.service statt der App
+ConditionPathExists=!/run/festpos/einrichtung
+
+[Service]
+User=festpos
+Group=festpos
+EnvironmentFile=/etc/festpos/env
+WorkingDirectory=/opt/festpos
+# Ein Prozess, zwei HTTPS-Ports: 443 Handys (Gerätezertifikat), 8443 Verwaltung.
+# So läuft der Druck-Spooler garantiert nur einmal pro Knoten.
+ExecStart=/opt/festpos/venv/bin/python -m app.serve
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+Restart=always
+RestartSec=1
+# Härtung: keine neuen Rechte (Uhrzeit stellt der root-Dienst festpos-settime.path, kein sudo – REV-050),
+# kein Zugriff auf /home und /root, /usr /boot /etc nur lesen, eigenes /tmp
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

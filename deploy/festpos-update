@@ -1,0 +1,1025 @@
+#!/opt/festpos/venv/bin/python3 -I
+"""FestPOS – signierte Updates prüfen und einspielen (läuft als root, ab Version 2026.10.10-26).
+
+  festpos-update --schluessel      Update-Schlüssel auf der Boot-Partition anzeigen (und der App melden)
+  festpos-update --anfrage         vom Dienst festpos-update.path: Aufträge der App ausführen
+  festpos-update --usb sda1        vom Dienst festpos-usb@sda1 (udev): Update auf einem USB-Stick suchen
+  festpos-update --ordner ~/       Update aus einem Ordner holen (festpos.zip + festpos.zip.sig) –
+                                   wie ein USB-Stick, z.B. nach «scp festpos.zip* pi@…:~/»
+  festpos-update --netz-aus        Internet für «Update aus dem Internet» wieder aus (macht sonst ein Zeitgeber)
+
+Aufträge der App: install, rollback, keys, net_up/net_down/net_share (Internet), tunnel (QR-Bestellung, T22),
+cloudflared (Tunnel-Programm installieren oder aktualisieren).
+
+Die App (Benutzer festpos) darf nichts installieren. Sie legt einen Auftrag in /run/festpos/update ab (wie bei
+der Uhrzeit); systemd startet dann diesen Helfer. Er traut der App nicht:
+  - er kopiert das Paket in seinen eigenen Ordner (/var/lib/festpos-update, nur root),
+  - prüft die Signatur selbst – mit den Schlüsseln auf der Boot-Partition (festpos-update*.pub, nur root),
+  - nimmt nur NEUERE Versionen an (zurück geht es nur zur Sicherung /opt/festpos.alt),
+  - spielt sie mit deploy/update.sh AUS DEM PAKET ein (Sicherung, Probelauf, automatischer Rückfall).
+Antworten und Fortschritt: /run/festpos/update-status (gehört root, die App liest nur).
+
+USB-Stick und Ordner: ein gültiges, neueres Paket wird der App übergeben, die es auf alle Pi verteilt (einer
+nach dem anderen, der druckende zuletzt). Läuft die App nicht, wird es nur auf diesem Pi eingespielt.
+"""
+import fcntl
+import grp
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import ssl
+import stat
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from pathlib import Path
+
+sys.dont_write_bytecode = True                         # nichts als root in /opt/festpos schreiben
+DEST = Path(os.environ.get("FESTPOS_DEST", "/opt/festpos"))
+ALT = Path(os.environ.get("FESTPOS_ALT", "/opt/festpos.alt"))
+sys.path.insert(0, os.environ.get("FESTPOS_RELEASE_LIB", str(DEST)))
+from app import release  # noqa: E402  (gehört root wie dieses Programm)
+
+PAKETE = Path(os.environ.get("FESTPOS_UPDATE_DIR", "/var/lib/festpos/update"))       # gehört festpos: nur lesen
+ANFRAGEN = Path(os.environ.get("FESTPOS_UPDATE_REQ", "/run/festpos/update"))         # Aufträge der App
+STATUS = Path(os.environ.get("FESTPOS_UPDATE_STATUS", "/run/festpos/update-status"))  # Antworten (root, lesbar)
+WORK = Path(os.environ.get("FESTPOS_UPDATE_WORK", "/var/lib/festpos-update"))       # nur root
+USB_MNT = Path(os.environ.get("FESTPOS_USB_MOUNT", "/run/festpos-usb"))
+USB_LOCK = Path(os.environ.get("FESTPOS_USB_LOCK", "/run/festpos-usb.lock"))   # gemeinsam mit festpos-sicherung
+HEALTH = os.environ.get("FESTPOS_UPDATE_HEALTH", "https://127.0.0.1:8443/api/health")
+TIMEOUT = int(os.environ.get("FESTPOS_UPDATE_TIMEOUT", str(45 * 60)))
+APP_WAIT = float(os.environ.get("FESTPOS_UPDATE_APP_WAIT", "120"))     # Stick beim Start: auf FestPOS warten
+ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+DEV_RE = re.compile(r"^sd[a-z]{1,3}[0-9]{0,3}$")          # USB-Speicher (sda, sdb1 …)
+FS_TYPES = {"vfat": "vfat", "exfat": "exfat", "ntfs": "ntfs3", "ext4": "ext4", "ext3": "ext3", "ext2": "ext2"}
+USB_DIRS = ("", "festpos-update")                        # wo auf dem Stick gesucht wird
+
+
+def boot_dir() -> Path:
+    b = os.environ.get("FESTPOS_BOOT")
+    if b:
+        return Path(b)
+    return Path("/boot/firmware") if os.path.isdir("/boot/firmware") else Path("/boot")
+
+
+def version_of(d: Path) -> str:
+    try:
+        return (d / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    try:
+        m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', (d / "app" / "main.py").read_text(encoding="utf-8"), re.M)
+        return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
+# -- Ausgabe für die App (/run/festpos/update-status, alles 0644) -------------------------------------------------
+def _status_dir() -> None:
+    """Fehlende Ausgabeordner (samt Oberordnern) anlegen – 0755, unabhängig von der umask, damit die App sie lesen kann.
+    Rechte ändert der Helfer nur an Ordnern, die er eben selbst angelegt hat, und nie über eine Verknüpfung; den
+    Standardordner legt systemd-tmpfiles mit 0755 an (festpos-tmpfiles.conf)."""
+    for p in reversed([p for p in (STATUS, *STATUS.parents) if not p.exists()]):
+        try:
+            p.mkdir(mode=0o755)
+        except FileExistsError:
+            continue                                   # inzwischen von jemand anderem angelegt: nicht anfassen
+        fd = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fchmod(fd, 0o755)
+        finally:
+            os.close(fd)
+
+
+def _new_file(p: Path, mode: int = 0o644) -> int:
+    """Neue Datei (ohne Verknüpfungen zu folgen) mit genau diesen Rechten – die umask kürzt sie nicht (T43)."""
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    os.fchmod(fd, mode)
+    return fd
+
+
+def write_status(name: str, data: dict) -> None:
+    _status_dir()
+    tmp = STATUS / f".{name}.neu"
+    tmp.unlink(missing_ok=True)
+    with open(_new_file(tmp), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, STATUS / name)
+
+
+def publish_keys() -> tuple[list, list]:
+    """Schlüssel der Boot-Partition für die App (die darf die Boot-Partition nicht lesen) – nur öffentliche Teile."""
+    boot = boot_dir()
+    keys, problems = release.load_keys(boot)
+    for p in sorted(boot.glob("festpos-update*")):          # privater Schlüssel aus Versehen auf den Pi kopiert?
+        if p.suffix != ".pub":
+            try:
+                if b"PRIVATE KEY" in release.read_regular(p, release.MAX_KEYFILE)[:200]:
+                    problems.append(f"{p.name}: PRIVATER Schlüssel auf der Boot-Partition – sofort löschen!")
+            except (OSError, release.ReleaseError):
+                pass
+    try:
+        write_status("keys.json", {"at": int(time.time()), "boot": str(boot), "keys": [k.public() for k in keys],
+                                   "problems": problems, "version": version_of(DEST), "backup": version_of(ALT) or None})
+    except OSError as e:
+        print(f"Schlüssel nicht gemeldet: {e}", file=sys.stderr)
+    return keys, problems
+
+
+class Protokoll:
+    """Fortschritt (Ausgabe von update.sh) zeilenweise nach <id>.log – die Verwaltung zeigt die letzten Zeilen."""
+
+    def __init__(self, rid: str | None):
+        self.lines: list[str] = []
+        self.f = None
+        if rid:
+            _status_dir()
+            p = STATUS / f"{rid}.log"
+            p.unlink(missing_ok=True)
+            self.f = open(_new_file(p), "w", encoding="utf-8")
+
+    def __call__(self, line: str) -> None:
+        line = line.rstrip("\n")
+        print(line, flush=True)                              # auch ins Journal (journalctl -u festpos-update)
+        self.lines.append(line)
+        if self.f:
+            self.f.write(line + "\n")
+            self.f.flush()
+
+    def tail(self, n: int = 40) -> list[str]:
+        return [x[:300] for x in self.lines[-n:]]
+
+    def close(self) -> None:
+        if self.f:
+            self.f.close()
+
+
+def run(cmd: list[str], log: Protokoll, cwd: Path | None = None) -> int:
+    """Befehl ausführen, Ausgabe ins Protokoll; nach TIMEOUT abbrechen."""
+    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         text=True, errors="replace", bufsize=1, start_new_session=True)
+
+    def lesen():
+        for line in p.stdout:
+            log(line)
+    t = threading.Thread(target=lesen, daemon=True)
+    t.start()
+    try:
+        rc = p.wait(TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log(f"FEHLER: nach {TIMEOUT // 60} Minuten abgebrochen")
+        os.killpg(p.pid, 9)
+        rc = p.wait()
+    t.join(10)
+    return rc
+
+
+def summary(lines: list[str], ok: bool) -> str:
+    """Die aussagekräftigste Zeile von update.sh (FEHLER/WARNUNG/OK) für die Anzeige."""
+    for prefix in (("FEHLER", "WARNUNG") if not ok else ("WARNUNG", "OK:")):
+        hits = [x for x in lines if x.startswith(prefix)]
+        if hits:
+            return hits[-1 if ok else 0][:300]
+    return (lines[-1] if lines else "")[:300]
+
+
+# -- Pakete --------------------------------------------------------------------------------------------------
+def work_dir() -> Path:
+    WORK.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(WORK)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise RuntimeError(f"{WORK} ist kein eigener Ordner")
+    os.chmod(WORK, 0o700)
+    return WORK
+
+
+def fresh(p: Path) -> Path:
+    if p.is_dir() and not p.is_symlink():
+        shutil.rmtree(p)
+    else:
+        p.unlink(missing_ok=True)
+    return p
+
+
+def take(zip_src: Path, sig_src: Path, name: str, expect_sha: str | None = None) -> dict:
+    """Paket in den eigenen Ordner kopieren (die Quelle kann sich danach nicht mehr ändern)."""
+    w = work_dir()
+    z = fresh(w / f"{name}.zip")
+    try:
+        sha = release.copy_regular(zip_src, z)
+        sig = release.read_regular(sig_src, release.MAX_SIG)
+    except FileNotFoundError as e:
+        z.unlink(missing_ok=True)
+        raise release.ReleaseError("missing") from e
+    except OSError as e:                                      # Verknüpfung, Pipe … (O_NOFOLLOW)
+        z.unlink(missing_ok=True)
+        raise release.ReleaseError("not_a_file") from e
+    if expect_sha and sha != expect_sha:
+        z.unlink(missing_ok=True)
+        raise release.ReleaseError("sha_mismatch")
+    return {"zip": z, "sig": sig, "sha": sha}
+
+
+def check(p: dict, keys: list) -> dict:
+    """Signatur und Aufbau der Kopie prüfen -> p mit version, key."""
+    try:
+        key = release.verify(p["zip"], p["sig"], keys)
+        info = release.inspect_zip(p["zip"])
+    except release.ReleaseError:
+        p["zip"].unlink(missing_ok=True)
+        raise
+    return {**p, "version": info["version"], "key": key, "size": p["zip"].stat().st_size}
+
+
+def install(p: dict, log: Protokoll) -> dict:
+    """Geprüftes Paket mit seinem update.sh einspielen -> Ergebnis."""
+    before = version_of(DEST)
+    if not release.newer(p["version"], before):
+        p["zip"].unlink(missing_ok=True)
+        raise release.ReleaseError("not_newer", version=p["version"], installed=before or "?")
+    neu = fresh(work_dir() / f"neu-{os.getpid()}")               # eigener Ordner (USB und Auftrag zugleich)
+    try:
+        root = release.extract_zip(p["zip"], neu)
+        log(f"==> Signatur gültig ({p['key'].comment or p['key'].fp}) – spiele Version {p['version']} ein")
+        rc = run(["bash", str(root / "deploy" / "update.sh")], log, cwd=root)
+    finally:
+        shutil.rmtree(neu, ignore_errors=True)
+        p["zip"].unlink(missing_ok=True)
+    after = version_of(DEST)
+    # 2 = läuft, wartet aber auf die Datenbank. Erfolg aber nur, wenn danach wirklich die neue Version da ist:
+    # ein update.sh, das gar nicht erst läuft (z.B. Windows-Zeilenenden), endet ebenfalls mit 2.
+    ok = rc in (0, 2) and after == p["version"]
+    code = None if ok else "not_installed" if rc in (0, 2) else "update_failed"
+    return {"ok": ok, "rc": rc, "before": before, "after": after, "code": code,
+            "kw": {"installed": after or "?"} if code == "not_installed" else {}, "msg": summary(log.lines, ok)}
+
+
+def rollback(req: dict, log: Protokoll) -> dict:
+    """Zur Sicherung /opt/festpos.alt wechseln – nur, wenn noch genau der Stand läuft, für den der Auftrag gilt."""
+    before, backup = version_of(DEST), version_of(ALT)
+    if not (ALT / "app").is_dir():
+        raise release.ReleaseError("no_backup")
+    if before != req.get("from") or (req.get("to") and backup != req.get("to")):
+        raise release.ReleaseError("rollback_changed", version=before or "?", backup=backup or "?")
+    src = DEST / "deploy"
+    if not (src / "update.sh").is_file() or not (src / "install-lib.sh").is_file():
+        raise release.ReleaseError("no_backup")
+    d = fresh(work_dir() / "zurueck") / "deploy"                # Kopie: --zurueck tauscht /opt/festpos/deploy aus
+    d.mkdir(parents=True)
+    for f in ("update.sh", "install-lib.sh"):
+        shutil.copy(src / f, d / f)
+    log(f"==> Zurück von Version {before} auf {backup}")
+    rc = run(["bash", str(d / "update.sh"), "--zurueck", "--ja"], log, cwd=d)
+    shutil.rmtree(d.parent, ignore_errors=True)
+    after = version_of(DEST)
+    ok = rc == 0 and after == backup
+    return {"ok": ok, "rc": rc, "before": before, "after": after, "code": None if ok else "rollback_failed",
+            "msg": summary(log.lines, ok)}
+
+
+# -- Internet für ein Update aus dem Netz (Aufträge net_up / net_down) ---------------------------------------
+# Die Pi haben kein Gateway und keinen DNS. Für «Aus dem Internet» schaltet dieser Helper kurz eine Verbindung ein –
+# über einen Router im FestPOS-Netz (Route + DNS), das WLAN des Pi oder einen USB-Netzwerkadapter (DHCP) – und
+# danach wieder aus. Herunterladen und prüfen macht die App (ohne root). Bleibt «aus» aus (App abgestürzt),
+# schaltet ein Zeitgeber (systemd-run) die Verbindung nach NET_MAX Sekunden ab; der Funk ist sonst immer aus.
+# Mit «share» (Neues Handy ausrollen) gibt dieser Pi die Verbindung ans FestPOS-Netz weiter (Weiterleitung + NAT,
+# eigene nft-Tabelle) – bis net_down oder bis zum Zeitgeber.
+NET_CON = "festpos-internet"                               # NetworkManager-Verbindung, nur im Arbeitsspeicher
+NET_TIMER = "festpos-internet-aus"
+NET_MAX = int(os.environ.get("FESTPOS_NET_MAX", str(30 * 60)))
+SYS_NET = Path(os.environ.get("FESTPOS_SYS_NET", "/sys/class/net"))
+RESOLV = Path(os.environ.get("FESTPOS_RESOLV", "/etc/resolv.conf"))
+NODE_ENV = Path(os.environ.get("FESTPOS_NODE_ENV", "/etc/festpos/env"))
+SSID_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,32}$")
+PSK_RE = re.compile(r"^(?:[\x20-\x7e]{8,63}|[0-9a-fA-F]{64})$")
+
+
+def sh(cmd: list[str], log: Protokoll, timeout: int = 90) -> int:
+    """Kurzer Befehl (nmcli, ip …), Ausgabe ins Protokoll."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"{cmd[0]}: {type(e).__name__}")
+        return 127
+    for line in (p.stdout + p.stderr).splitlines()[-5:]:
+        log(f"{cmd[0]}: {line}")
+    return p.returncode
+
+
+def ip4(v) -> str:
+    try:
+        return str(ipaddress.IPv4Address(str(v or "")))
+    except ValueError:
+        raise release.ReleaseError("net_bad") from None
+
+
+def addrs(dev: str | None = None) -> list:
+    """IPv4-Adressen (mit Netz) – eines Geräts oder aller."""
+    p = subprocess.run(["ip", "-4", "-o", "addr", "show", *(["dev", dev] if dev else [])], capture_output=True,
+                       text=True, errors="replace", timeout=10)
+    return [ipaddress.IPv4Interface(m) for m in re.findall(r"\binet (\d+\.\d+\.\d+\.\d+/\d+)", p.stdout)]
+
+
+def lan_net():
+    """Netz des FestPOS-Netzwerks (dort, wo NODE_IP liegt)."""
+    m = re.search(r"^NODE_IP=['\"]?([0-9.]+)", NODE_ENV.read_text(encoding="utf-8") if NODE_ENV.is_file() else "", re.M)
+    for a in addrs():
+        if m and str(a.ip) == m.group(1):
+            return a.network
+    raise release.ReleaseError("net_bad")
+
+
+# Handys per USB-Tethering nie als Internet nehmen: Treiber der Handy-Verbindung oder Hersteller-ID
+# eines Handys (Samsung, Google, Apple, Xiaomi, OnePlus, Motorola, Sony, LG). USB-A-Netzwerkadapter bleiben.
+TETHER_DRIVERS = {"rndis_host", "ipheth"}
+PHONE_VENDORS = {"04e8", "18d1", "05ac", "2717", "2a70", "22b8", "0fce", "1004"}
+
+
+def is_tether(d: Path) -> bool:
+    try:
+        if os.path.basename(os.path.realpath(d / "device" / "driver")) in TETHER_DRIVERS:
+            return True
+        usb = Path(os.path.realpath(d / "device")).parent              # Schnittstelle -> USB-Gerät
+        return (usb / "idVendor").read_text().strip().lower() in PHONE_VENDORS
+    except OSError:
+        return False
+
+
+def devices() -> dict:
+    """Geräte: WLAN (wireless) und USB-Netzwerkadapter (hängt am USB-Bus) -> {"wlan": [...], "usb": [(name, link)]}.
+    Handys per USB-Tethering zählen nicht."""
+    out: dict = {"wlan": [], "usb": []}
+    try:
+        names = sorted(e.name for e in os.scandir(SYS_NET))
+    except OSError:
+        return out
+    for n in names:
+        d = SYS_NET / n
+        if (d / "wireless").exists() or (d / "phy80211").exists():
+            out["wlan"].append(n)
+        elif "/usb" in os.path.realpath(d / "device") and (d / "device").exists() and not is_tether(d):
+            try:
+                link = (d / "carrier").read_text().strip() == "1"
+            except OSError:
+                link = False
+            out["usb"].append((n, link))
+    return out
+
+
+def net_state(data: dict | None = None) -> dict:
+    p = work_dir() / "internet.json"
+    if data is not None:
+        p.write_text(json.dumps(data), encoding="utf-8")
+        return data
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+SHARE_TABLE = "festpos_share"
+IP_FORWARD = Path(os.environ.get("FESTPOS_IP_FORWARD", "/proc/sys/net/ipv4/ip_forward"))
+
+
+def lan_dev(lan) -> str:
+    """Netzwerkgerät des FestPOS-Netzes (dort liegt NODE_IP)."""
+    p = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True, errors="replace", timeout=10)
+    for m in re.finditer(r"^\d+:\s+(\S+)\s+inet (\d+\.\d+\.\d+\.\d+/\d+)", p.stdout, re.M):
+        if ipaddress.IPv4Interface(m.group(2)).network == lan:
+            return m.group(1)
+    raise release.ReleaseError("net_bad")
+
+
+def nft(script: str, log: Protokoll) -> int:
+    try:
+        p = subprocess.run(["nft", "-f", "-"], input=script, capture_output=True, text=True, errors="replace", timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"nft: {type(e).__name__}")
+        return 127
+    for line in (p.stdout + p.stderr).splitlines()[-5:]:
+        log(f"nft: {line}")
+    return p.returncode
+
+
+def share_on(lan, out_dev: str, log: Protokoll, allow: list | None = None) -> None:
+    """Internet an die Geräte im FestPOS-Netz weitergeben: nur aus dem FestPOS-Netz hinaus über out_dev, mit
+    Adressumsetzung; zurück nur Antworten. Ohne net_up keine Weitergabe. allow: nur diese Adressen (dauerhaft: die
+    eingetragenen Handhelds und die Pi); ohne = ganzes Netz (kurz, beim Einrichten neuer Handhelds)."""
+    in_dev = lan_dev(lan)
+    src = "{ " + ", ".join(allow) + " }" if allow else str(lan)
+    rules = f"""table ip {SHARE_TABLE} {{
+    chain forward {{
+        type filter hook forward priority 0; policy drop;
+        ct state established,related accept
+        iifname "{in_dev}" oifname "{out_dev}" ip saddr {src} accept
+    }}
+    chain postrouting {{
+        type nat hook postrouting priority 100;
+        iifname "{in_dev}" oifname "{out_dev}" ip saddr {src} masquerade
+    }}
+}}
+"""
+    nft(f"table ip {SHARE_TABLE}\ndelete table ip {SHARE_TABLE}\n", log)        # alte Reste weg
+    if nft(rules, log):
+        raise release.ReleaseError("net_share")
+    IP_FORWARD.write_text("1\n", encoding="utf-8")
+    log(f"Weitergabe ein: {src if allow else lan} über {out_dev}")
+
+
+def share_off(log: Protokoll) -> None:
+    try:
+        IP_FORWARD.write_text("0\n", encoding="utf-8")
+    except OSError as e:
+        log(f"ip_forward: {type(e).__name__}")
+    nft(f"table ip {SHARE_TABLE}\ndelete table ip {SHARE_TABLE}\n", log)
+
+
+def share_allow(req: dict, lan) -> list | None:
+    """Adressen, die weitergegeben werden dürfen (req «allow»): alle im FestPOS-Netz, höchstens 120. Ohne: None."""
+    if not isinstance(req.get("allow"), list):
+        return None
+    allow = sorted({ip4(x) for x in req["allow"][:120]}, key=ipaddress.IPv4Address)
+    if not allow or any(ipaddress.IPv4Address(x) not in lan for x in allow):
+        raise release.ReleaseError("net_bad")
+    return allow
+
+
+def net_share(req: dict, log: Protokoll) -> dict:
+    """Weitergabe einer bestehenden Verbindung nachführen, ohne sie neu aufzubauen (dauerhaft verbunden: neues
+    Handheld eingetragen, VIP gewechselt, Ausrollen fertig). «off»: nicht mehr weitergeben."""
+    st = net_state()
+    if not st.get("via"):
+        raise release.ReleaseError("net_bad")
+    if req.get("off") is True:
+        share_off(log)
+        log("Weitergabe aus")
+        return {"ok": True}
+    lan = lan_net()
+    try:
+        share_on(lan, st.get("dev") or lan_dev(lan), log, share_allow(req, lan))
+    except OSError:
+        raise release.ReleaseError("net_share") from None
+    return {"ok": True, "iface": st.get("dev") or ""}
+
+
+def net_down(log: Protokoll) -> dict:
+    """Alles wieder aus – auch was ein abgebrochener Lauf stehen liess. Mehrfach aufrufen schadet nicht."""
+    st = net_state()
+    share_off(log)
+    sh(["systemctl", "stop", f"{NET_TIMER}.timer"], log, 20)
+    sh(["systemctl", "reset-failed", f"{NET_TIMER}.timer", f"{NET_TIMER}.service"], log, 20)
+    if subprocess.run(["nmcli", "-t", "-f", "NAME", "connection", "show"], capture_output=True, text=True,
+                      errors="replace", timeout=20).stdout.splitlines().count(NET_CON):
+        sh(["nmcli", "connection", "delete", NET_CON], log)
+    if st.get("gateway"):
+        sh(["ip", "route", "del", "default", "via", st["gateway"]], log, 20)
+    if st.get("resolv") is not None:
+        RESOLV.write_text(st["resolv"], encoding="utf-8")
+    if devices()["wlan"]:
+        sh(["nmcli", "radio", "wifi", "off"], log, 20)
+    (work_dir() / "internet.json").unlink(missing_ok=True)
+    return {"ok": True}
+
+
+def net_up(req: dict, log: Protokoll) -> dict:
+    via = req.get("via")
+    net_down(log)
+    lan = lan_net()
+    st: dict = {"via": via, "at": int(time.time())}
+    if via == "lan":
+        gw, dns = ip4(req.get("gateway")), ip4(req.get("dns"))
+        if ipaddress.IPv4Address(gw) not in lan or gw in (str(lan.network_address), str(lan.broadcast_address)):
+            raise release.ReleaseError("net_gateway", name=gw)
+        if RESOLV.is_symlink():
+            raise release.ReleaseError("net_resolv")
+        st["resolv"] = RESOLV.read_text(encoding="utf-8") if RESOLV.is_file() else ""
+        st["gateway"] = gw
+        net_state(st)                                         # erst festhalten, dann ändern: «aus» findet alles
+        if sh(["ip", "route", "replace", "default", "via", gw, "metric", "900"], log, 20):
+            net_down(log)
+            raise release.ReleaseError("net_gateway", name=gw)
+        RESOLV.write_text(f"# FestPOS: nur für das Update (festpos-update)\nnameserver {dns}\n", encoding="utf-8")
+        dev = ""
+    elif via in ("wlan", "usb"):
+        found = devices()
+        if via == "wlan":
+            ssid, psk = str(req.get("ssid") or ""), str(req.get("psk") or "")
+            if not SSID_RE.match(ssid) or (psk and not PSK_RE.match(psk)):
+                raise release.ReleaseError("net_bad")
+            if not found["wlan"]:
+                raise release.ReleaseError("net_no_wlan")
+            dev = found["wlan"][0]
+            net_state(st)
+            sh(["rfkill", "unblock", "wifi"], log, 20)
+            sh(["nmcli", "radio", "wifi", "on"], log, 20)
+            time.sleep(float(os.environ.get("FESTPOS_NET_SCAN_WAIT", "5")))   # Funk an: Netze erst suchen lassen
+            extra = ["wifi-sec.key-mgmt", "wpa-psk"] if psk else []
+            if sh(["nmcli", "connection", "add", "save", "no", "type", "wifi", "ifname", dev, "con-name", NET_CON,
+                   "ssid", ssid, "connection.autoconnect", "no", "ipv4.method", "auto", "ipv6.method", "disabled",
+                   "ipv4.route-metric", "900", *extra], log):
+                net_down(log)
+                raise release.ReleaseError("net_wlan", name=ssid)
+            pw = work_dir() / "internet.pw"                    # Passwort nicht auf die Befehlszeile (ps)
+            pw.unlink(missing_ok=True)
+            with open(os.open(pw, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "w") as f:
+                f.write(f"802-11-wireless-security.psk:{psk}\n" if psk else "")
+            try:
+                rc = sh(["nmcli", "--wait", "60", "connection", "up", NET_CON, "passwd-file", str(pw)], log, 90)
+            finally:
+                pw.unlink(missing_ok=True)
+            if rc:
+                net_down(log)
+                raise release.ReleaseError("net_wlan", name=ssid)
+        else:
+            if not found["usb"]:
+                raise release.ReleaseError("net_no_usb")
+            linked = [n for n, link in found["usb"] if link]
+            if not linked:
+                raise release.ReleaseError("net_no_link", iface=found["usb"][0][0])
+            dev = linked[0]
+            net_state(st)
+            if sh(["nmcli", "connection", "add", "save", "no", "type", "ethernet", "ifname", dev, "con-name", NET_CON,
+                   "connection.autoconnect", "no", "ipv4.method", "auto", "ipv6.method", "disabled",
+                   "ipv4.route-metric", "900"], log) or \
+                    sh(["nmcli", "--wait", "45", "connection", "up", NET_CON], log, 60):
+                net_down(log)
+                raise release.ReleaseError("net_dhcp", iface=dev)
+        got = addrs(dev)
+        if not got:
+            net_down(log)
+            raise release.ReleaseError("net_dhcp", iface=dev)
+        if any(a.network.overlaps(lan) for a in got):         # gleiches Netz wie FestPOS: würde die Pi stören
+            net_down(log)
+            raise release.ReleaseError("net_same_net", name=str(got[0].network))
+    else:
+        raise release.ReleaseError("net_bad")
+    if req.get("keep") is True:                               # dauerhaft (Verwaltung › Internet, Schalter c)
+        st["keep"] = True
+        net_state(st)
+    else:                                                     # nur kurz: Zeitgeber schaltet sicher wieder ab
+        sh(["systemd-run", f"--unit={NET_TIMER}", f"--on-active={NET_MAX}", "--timer-property=AccuracySec=10s",
+            str(Path(sys.argv[0]).resolve()), "--netz-aus"], log, 20)
+    st["dev"] = dev
+    net_state(st)
+    try:
+        allow = share_allow(req, lan)
+    except release.ReleaseError:
+        net_down(log)
+        raise
+    if req.get("share") is True:                              # Handhelds: über diesen Pi ins Internet
+        try:
+            share_on(lan, dev or lan_dev(lan), log, allow)
+        except (release.ReleaseError, OSError):
+            net_down(log)
+            raise release.ReleaseError("net_share") from None
+    log(f"Internet ein ({via}{' ' + dev if dev else ''}{', weitergegeben' if req.get('share') is True else ''}"
+        f"{', dauerhaft' if req.get('keep') is True else ''})")
+    return {"ok": True, "iface": dev}
+
+
+# -- Cloudflare Tunnel zur QR-Bestellung (Auftrag tunnel, T22) ---------------------------------------------------
+# Die Verwaltung speichert den Token (verschlüsselt, für alle Pi); jeder Pi legt ihn hier ab: tunnel-app.env (nur
+# root, festpos-node nimmt ihn bei jedem Start) und tunnel-app.fp (Fingerabdruck, die App vergleicht). Steht
+# TUNNEL_TOKEN in festpos.conf (tunnel-conf, festpos-node), hat er Vorrang: dann nur speichern, nichts umschalten.
+# Benutzer, Gruppe und Firewall des Gästedienstes legt festpos-node bei jedem Start an – hier nur Dateien und Dienste.
+TUNNEL_DIR = Path(os.environ.get("FESTPOS_TUNNEL_DIR", "/etc/festpos"))
+GAST_DIR = Path(os.environ.get("FESTPOS_GAST_DIR", "/etc/festpos-gast"))
+GAST_GROUP = os.environ.get("FESTPOS_GAST_GROUP", "festpos-gast")
+CLOUDFLARED = Path(os.environ.get("FESTPOS_CLOUDFLARED", "/usr/bin/cloudflared"))
+TUNNEL_UNITS = ("festpos-gast.service", "festpos-tunnel.service")
+# cloudflared kommt nicht mit FestPOS, sondern bei Bedarf aus der Paketquelle von Cloudflare (signiert, apt prüft jedes
+# Paket): sobald der Tunnel an ist und der Pi Internet hat, und danach einmal pro Woche aktualisiert. Der Schlüssel der
+# Paketquelle: deploy/cloudflare-main.gpg aus dem signierten FestPOS-Paket, sonst über HTTPS von Cloudflare (so wie es
+# Cloudflare für die Installation beschreibt). Nur diese eine Quelle wird gelesen, nichts anderes aktualisiert.
+CF_KEY_URL = os.environ.get("FESTPOS_CF_KEY_URL", "https://pkg.cloudflare.com/cloudflare-main.gpg")
+CF_REPO = "https://pkg.cloudflare.com/cloudflared"
+CF_KEYRING = Path(os.environ.get("FESTPOS_CF_KEYRING", "/usr/share/keyrings/festpos-cloudflare.gpg"))
+CF_LIST = Path(os.environ.get("FESTPOS_CF_LIST", "/etc/apt/sources.list.d/festpos-cloudflared.list"))
+APT_GET = os.environ.get("FESTPOS_APT_GET", "apt-get")
+CF_KEY_MAX = 64 * 1024
+
+
+def put_file(p: Path, text: str, mode: int, gid: int = -1) -> None:
+    """Datei sicher ersetzen: erst fertig schreiben (ohne Verknüpfungen zu folgen), dann in einem Schritt umbenennen."""
+    tmp = p.with_name(f".{p.name}.neu")
+    tmp.unlink(missing_ok=True)
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode), "w", encoding="utf-8") as f:
+        f.write(text)
+    if gid >= 0:
+        os.chown(tmp, -1, gid)
+    os.chmod(tmp, mode)
+    os.replace(tmp, p)
+
+
+def tunnel(req: dict, log: Protokoll) -> dict:
+    from app import tunnel_token                              # gehört root wie release
+    off = req.get("off") is True
+    tok = str(req.get("token") or "").strip()
+    if not off and not tunnel_token.parse(tok):
+        raise release.ReleaseError("tunnel_bad")
+    app_env, fp = TUNNEL_DIR / "tunnel-app.env", TUNNEL_DIR / "tunnel-app.fp"
+    if off:
+        app_env.unlink(missing_ok=True)
+        fp.unlink(missing_ok=True)
+    else:
+        put_file(app_env, f"TUNNEL_TOKEN={tok}\n", 0o600)
+        put_file(fp, tunnel_token.fingerprint(tok) + "\n", 0o644)
+    if (TUNNEL_DIR / "tunnel-conf").exists():
+        log("Tunnel: TUNNEL_TOKEN in festpos.conf hat Vorrang – Einstellung der Verwaltung gespeichert, sonst nichts geändert")
+        return {"ok": True, "conf": True}
+    env = TUNNEL_DIR / "tunnel.env"
+    if off:
+        sh(["systemctl", "disable", "--now", *reversed(TUNNEL_UNITS)], log, 60)
+        env.unlink(missing_ok=True)
+        (GAST_DIR / "token").unlink(missing_ok=True)
+        log("Tunnel aus")
+        return {"ok": True}
+    try:
+        gid = grp.getgrnam(GAST_GROUP).gr_gid
+    except KeyError:
+        raise release.ReleaseError("tunnel_no_user") from None    # festpos-node legt ihn beim nächsten Start an
+    GAST_DIR.mkdir(mode=0o750, exist_ok=True)
+    token = GAST_DIR / "token"
+    if not token.is_file() or token.is_symlink() or len(token.read_text(errors="replace").strip()) < 32:
+        put_file(token, secrets.token_hex(24) + "\n", 0o640, gid)     # Schlüssel des Gästedienstes, pro Pi zufällig
+    put_file(env, f"TUNNEL_TOKEN={tok}\n", 0o600)
+    sh(["systemctl", "enable", *TUNNEL_UNITS], log, 60)
+    for unit in TUNNEL_UNITS:
+        sh(["systemctl", "restart", unit], log, 60)
+    cf = CLOUDFLARED.exists()                                 # fehlt es: die App gibt den Auftrag «cloudflared»
+    log("Tunnel ein" + ("" if cf else " – cloudflared fehlt noch (wird installiert, sobald der Pi Internet hat)"))
+    return {"ok": True, "cloudflared": cf}
+
+
+def cf_key(log: Protokoll) -> bytes:
+    """Schlüssel der Paketquelle von Cloudflare: mitgeliefert (im signierten Paket) oder über HTTPS von Cloudflare."""
+    own = DEST / "deploy" / "cloudflare-main.gpg"
+    if own.is_file():
+        return release.read_regular(own, CF_KEY_MAX)
+    with urllib.request.urlopen(CF_KEY_URL, timeout=30, context=ssl.create_default_context()) as r:
+        data = r.read(CF_KEY_MAX + 1)
+    if not data or len(data) > CF_KEY_MAX:
+        raise release.ReleaseError("cf_install")
+    log(f"cloudflared: Schlüssel der Paketquelle von {CF_KEY_URL.split('/')[2]} geholt")
+    return data
+
+
+def put_bytes(p: Path, data: bytes, mode: int) -> None:
+    tmp = p.with_name(f".{p.name}.neu")
+    tmp.unlink(missing_ok=True)
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode), "wb") as f:
+        f.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, p)
+
+
+def cloudflared(req: dict, log: Protokoll) -> bool:
+    """cloudflared installieren, wenn es fehlt; mit «refresh» auf die neuste Version aktualisieren (nur cloudflared, nur
+    aus der Quelle von Cloudflare). Ohne Internet: nichts geändert, False bzw. True, wenn es schon da war."""
+    have = CLOUDFLARED.exists()
+    if have and req.get("refresh") is not True:
+        return True
+    try:
+        key = cf_key(log)
+    except (OSError, ValueError, release.ReleaseError) as e:
+        log(f"cloudflared: Paketquelle nicht erreichbar ({type(e).__name__}) – später nochmals")
+        return have
+    CF_KEYRING.parent.mkdir(parents=True, exist_ok=True)
+    CF_LIST.parent.mkdir(parents=True, exist_ok=True)
+    put_bytes(CF_KEYRING, key, 0o644)
+    put_file(CF_LIST, f"deb [signed-by={CF_KEYRING}] {CF_REPO} any main\n", 0o644)
+    os.environ["DEBIAN_FRONTEND"] = "noninteractive"
+    only = ["-o", f"Dir::Etc::sourcelist={CF_LIST}", "-o", "Dir::Etc::sourceparts=-", "-o", "APT::Get::List-Cleanup=0"]
+    if sh([APT_GET, *only, "update"], log, 300):
+        log("cloudflared: Paketquelle von Cloudflare nicht erreichbar – später nochmals")
+        return have
+    before = CLOUDFLARED.stat().st_mtime_ns if have else None
+    rc = sh([APT_GET, *only, "install", "-y", "--no-install-recommends", *(["--only-upgrade"] if have else []),
+             "cloudflared"], log, 600)
+    put_file(TUNNEL_DIR / "cloudflared-refresh", f"{int(time.time())}\n", 0o644)
+    now = CLOUDFLARED.exists()
+    if rc or not now:
+        log("cloudflared: Installation gescheitert")
+        return now
+    if before != CLOUDFLARED.stat().st_mtime_ns:
+        log("cloudflared " + ("aktualisiert" if have else "installiert"))
+        if (TUNNEL_DIR / "tunnel.env").exists():                 # Tunnel an: mit dem neuen Programm starten
+            sh(["systemctl", "restart", "festpos-tunnel.service"], log, 60)
+    return True
+
+
+# -- Aufträge der App -----------------------------------------------------------------------------------------
+def read_request(path: str) -> dict | None:
+    try:
+        d = json.loads(release.read_regular(path, 4096))
+    except (OSError, ValueError, release.ReleaseError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def process(rid: str, req: dict | None) -> dict:
+    log = Protokoll(rid)
+    write_status("laeuft.json", {"id": rid, "pid": os.getpid(), "at": int(time.time())})
+    out: dict = {"id": rid, "action": (req or {}).get("action"), "ok": False, "code": None, "msg": "",
+                 "before": version_of(DEST), "after": None}
+    try:
+        action = (req or {}).get("action")
+        if action == "keys":
+            out.update(ok=True)
+        elif action == "install":
+            sha, version = str(req.get("sha") or ""), str(req.get("version") or "")
+            if not SHA_RE.match(sha):
+                raise release.ReleaseError("request_bad")
+            keys, _ = release.load_keys(boot_dir())
+            p = check(take(PAKETE / f"{sha}.zip", PAKETE / f"{sha}.sig", "paket", sha), keys)
+            if p["version"] != version:
+                p["zip"].unlink(missing_ok=True)
+                raise release.ReleaseError("version_mismatch", version=p["version"])
+            out.update(install(p, log))
+        elif action == "rollback":
+            out.update(rollback(req, log))
+        elif action == "net_up":
+            out.update(net_up(req, log))
+        elif action == "net_down":
+            out.update(net_down(log))
+        elif action == "net_share":
+            out.update(net_share(req, log))
+        elif action == "tunnel":
+            out.update(tunnel(req, log))
+        elif action == "cloudflared":
+            out.update({"ok": True, "cloudflared": cloudflared(req, log)})
+        else:
+            raise release.ReleaseError("request_bad")
+    except release.ReleaseError as e:
+        log(f"ABGELEHNT: {e.code} {e.kw or ''}".rstrip())
+        out.update(ok=False, code=e.code, kw={k: str(v) for k, v in e.kw.items()})
+    except Exception as e:  # noqa: BLE001 – Antwort muss in jedem Fall kommen
+        log(f"FEHLER: {type(e).__name__}: {e}")
+        out.update(ok=False, code="internal", msg=f"{type(e).__name__}: {e}"[:300])
+    finally:
+        out["log"] = log.tail()
+        out["after"] = out.get("after") or version_of(DEST)
+        out["at"] = int(time.time())
+        log.close()
+        write_status(f"{rid}.json", out)
+        (STATUS / "laeuft.json").unlink(missing_ok=True)
+    return out
+
+
+def aufraeumen() -> None:
+    """Alte Antworten und Protokolle (älter als ein Tag) löschen – /run liegt im Arbeitsspeicher."""
+    grenze = time.time() - 86400
+    try:
+        for d in work_dir().glob("neu-*"):                      # Reste abgebrochener Läufe
+            if d.stat().st_mtime < grenze:
+                shutil.rmtree(d, ignore_errors=True)
+    except (OSError, RuntimeError):
+        pass
+    try:
+        for e in os.scandir(STATUS):
+            if e.is_file(follow_symlinks=False) and e.name not in ("keys.json", "usb.json") and \
+                    e.stat(follow_symlinks=False).st_mtime < grenze:
+                os.unlink(e.path)
+    except OSError:
+        pass
+
+
+def anfragen() -> int:
+    publish_keys()
+    try:
+        eintraege = list(os.scandir(ANFRAGEN))
+    except OSError:
+        eintraege = []
+    jobs = []
+    for e in eintraege:
+        m = re.fullmatch(r"anfrage-([A-Za-z0-9_-]{1,40})", e.name)
+        if m:
+            jobs.append((e.stat(follow_symlinks=False).st_mtime, m.group(1), read_request(e.path)))
+        try:                                                  # ALLES entfernen, sonst startet systemd immer wieder
+            if e.is_dir(follow_symlinks=False):
+                shutil.rmtree(e.path)
+            else:
+                os.unlink(e.path)
+        except OSError:
+            pass
+    rc = 0
+    for _, rid, req in sorted(jobs):
+        rc = rc or (0 if process(rid, req)["ok"] else 2)
+    publish_keys()                                            # Version/Sicherung haben sich evtl. geändert
+    aufraeumen()
+    return rc
+
+
+# -- USB-Stick und Ordner ---------------------------------------------------------------------------------------
+def candidates(d: Path) -> list[tuple[Path, Path]]:
+    """ZIP-Dateien mit passender Signatur (name.zip + name.zip.sig, Gross/klein egal) im Ordner und in festpos-update/."""
+    out = []
+    for sub in USB_DIRS:
+        base = d / sub if sub else d
+        try:
+            names = {n.lower(): n for n in os.listdir(base)} if base.is_dir() and not base.is_symlink() else {}
+        except OSError:
+            continue
+        for low, n in sorted(names.items()):
+            if low.endswith(".zip") and low + ".sig" in names:
+                out.append((base / n, base / names[low + ".sig"]))
+    return out[:5]
+
+
+def app_ready(wait: float = 0) -> bool:
+    """Läuft FestPOS auf diesem Pi (mit Datenbank)? Wartet höchstens wait Sekunden (z.B. Stick beim Starten)."""
+    end = time.monotonic() + wait
+    while True:
+        try:
+            ctx = ssl._create_unverified_context()            # eigener Server auf diesem Pi
+            with urllib.request.urlopen(HEALTH, timeout=3, context=ctx if HEALTH.startswith("https") else None) as r:
+                if json.load(r).get("ready") is True:
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+        if time.monotonic() >= end:
+            return False
+        time.sleep(3)
+
+
+def usb_status(state: str, quelle: str, **kw) -> None:
+    write_status("usb.json", {"at": int(time.time()), "state": state, "source": quelle, **kw})
+
+
+def from_copies(copies: list[dict], quelle: str, wait: float = 0) -> int:
+    """Kopierte Pakete prüfen; das neueste gültige an die App übergeben (oder selbst einspielen)."""
+    keys, _ = publish_keys()
+    good, first_err = [], None
+    for c in copies:
+        try:
+            good.append(check(c, keys))
+        except release.ReleaseError as e:
+            print(f"{c['name']}: abgelehnt ({e.code} {e.kw or ''})", file=sys.stderr)
+            first_err = first_err or e
+            c["zip"].unlink(missing_ok=True)
+    if not good:
+        if first_err:
+            usb_status("invalid", quelle, code=first_err.code, kw={k: str(v) for k, v in first_err.kw.items()})
+            print(f"Kein gültiges Update ({first_err.code}) – nichts geändert.")
+            return 2
+        usb_status("none", quelle)
+        print("Kein Update gefunden (festpos.zip + festpos.zip.sig).")
+        return 0
+    good.sort(key=lambda p: release.version_key(p["version"]))
+    best = good[-1]
+    for p in good[:-1]:
+        p["zip"].unlink(missing_ok=True)
+    installed = version_of(DEST)
+    info = {"version": best["version"], "sha": best["sha"], "size": best["size"],
+            "signer": {"fp": best["key"].fp, "comment": best["key"].comment}}
+    if release.newer(installed, best["version"]):
+        best["zip"].unlink(missing_ok=True)
+        usb_status("old", quelle, installed=installed, **info)
+        print(f"Version {best['version']} ist älter als die installierte {installed} – nichts geändert.")
+        return 0
+    if app_ready(wait):                                        # die App verteilt es auf alle Pi
+        out = STATUS / "paket"
+        fresh(out).mkdir(mode=0o755)
+        shutil.copy(best["zip"], out / f"{best['sha']}.zip")
+        (out / f"{best['sha']}.sig").write_bytes(best["sig"])
+        for f in out.iterdir():
+            os.chmod(f, 0o644)
+        best["zip"].unlink(missing_ok=True)
+        usb_status("handed", quelle, installed=installed, **info)
+        print(f"Version {best['version']} geprüft und an FestPOS übergeben – wird auf alle Pi verteilt (Verwaltung › Update).")
+        return 0
+    if best["version"] == installed:
+        best["zip"].unlink(missing_ok=True)
+        usb_status("old", quelle, installed=installed, **info)
+        print(f"Version {installed} ist schon installiert.")
+        return 0
+    usb_status("installing", quelle, installed=installed, **info)  # App läuft nicht: nur dieser Pi
+    print("FestPOS antwortet nicht – spiele das Update nur auf diesem Pi ein.")
+    log = Protokoll(None)
+    try:
+        res = install(best, log)
+    except release.ReleaseError as e:
+        usb_status("failed", quelle, code=e.code, kw={k: str(v) for k, v in e.kw.items()}, **info)
+        return 2
+    usb_status("installed" if res["ok"] else "failed", quelle, msg=res["msg"], after=res["after"], **info)
+    publish_keys()
+    return 0 if res["ok"] else 2
+
+
+def copy_from(d: Path) -> list[dict]:
+    for old in work_dir().glob("kandidat-*"):               # Reste eines abgebrochenen Laufs
+        old.unlink(missing_ok=True)
+    out = []
+    for n, (z, s) in enumerate(candidates(d)):
+        try:
+            out.append({**take(z, s, f"kandidat-{n}"), "name": z.name})
+        except (OSError, release.ReleaseError) as e:
+            print(f"{z.name}: nicht lesbar ({e})", file=sys.stderr)
+    return out
+
+
+def ordner(d: str) -> int:
+    path = Path(d).expanduser()
+    if not path.is_dir():
+        print(f"Kein Ordner: {d}", file=sys.stderr)
+        return 1
+    return from_copies(copy_from(path), "folder", min(APP_WAIT, 10))
+
+
+def mounts() -> list[tuple[str, str]]:
+    try:
+        with open("/proc/self/mounts", encoding="utf-8") as f:
+            return [(ln.split()[0], ln.split()[1]) for ln in f if len(ln.split()) > 1]
+    except OSError:
+        return []
+
+
+def usb(dev: str) -> int:
+    if not DEV_RE.match(dev):
+        print(f"Unbekanntes Gerät: {dev}", file=sys.stderr)
+        return 1
+    path = f"/dev/{dev}"
+    try:
+        if not stat.S_ISBLK(os.stat(path).st_mode):
+            return 1
+    except OSError:
+        return 1
+    disk = re.sub(r"[0-9]+$", "", dev)
+    for src, target in mounts():                              # Systemplatte (Pi startet von USB-SSD) oder schon eingebunden
+        if src == path or (src.startswith(f"/dev/{disk}") and (target == "/" or target.startswith("/boot"))):
+            print(f"{path}: wird vom System benutzt – nicht angetastet")
+            return 0
+    fs = subprocess.run(["blkid", "-o", "value", "-s", "TYPE", path], capture_output=True, text=True, timeout=20).stdout.strip()
+    if fs not in FS_TYPES:
+        print(f"{path}: Dateisystem «{fs}» wird nicht gelesen")
+        return 0
+    quelle = f"usb:{dev}"
+    usb_status("reading", quelle)
+    mnt = USB_MNT / dev
+    mnt.mkdir(mode=0o700, parents=True, exist_ok=True)
+    USB_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(USB_LOCK, "w") as lock:                      # nicht gleichzeitig mit festpos-sicherung (schreibt)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # ext3/ext4 «noload»: auch nur lesend spielte der Kernel sonst das Journal des fremden Sticks ab (S10)
+        opts = "ro,nosuid,nodev,noexec,noatime" + (",noload" if fs in ("ext3", "ext4") else "")
+        r = subprocess.run(["mount", "-t", FS_TYPES[fs], "-o", opts, path, str(mnt)],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            usb_status("unreadable", quelle)
+            print(f"{path}: nicht lesbar ({r.stderr.strip()})", file=sys.stderr)
+            mnt.rmdir()
+            return 2
+        try:
+            copies = copy_from(mnt)
+        finally:
+            subprocess.run(["umount", str(mnt)], capture_output=True, timeout=60)
+            try:
+                mnt.rmdir()
+            except OSError:
+                subprocess.run(["umount", "-l", str(mnt)], capture_output=True, timeout=20)
+    if copies:
+        print("USB-Stick gelesen – kann entfernt werden.")
+    return from_copies(copies, quelle, APP_WAIT)
+
+
+# -- Schlüssel anzeigen ----------------------------------------------------------------------------------------
+def schluessel() -> int:
+    keys, problems = publish_keys()
+    boot = boot_dir()
+    if keys:
+        print(f"Update-Schlüssel ({boot}/{release.KEY_GLOB}):")
+        for k in keys:
+            print(f"  {k.fp}  {k.comment}  ({k.file})")
+    else:
+        print(f"HINWEIS: Kein Update-Schlüssel ({boot}/festpos-update.pub) – Updates über die Verwaltung und per")
+        print("         USB-Stick sind gesperrt. Siehe ANLEITUNG «Update-Schlüssel einrichten».")
+    for p in problems:
+        print(f"WARNUNG: {p}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv[1:2] == ["--anfrage"]:
+        return anfragen()
+    if argv[1:2] == ["--schluessel"]:
+        return schluessel()
+    if len(argv) == 3 and argv[1] == "--usb":
+        return usb(argv[2])
+    if len(argv) == 3 and argv[1] == "--ordner":
+        return ordner(argv[2])
+    if argv[1:2] == ["--netz-aus"]:
+        net_down(Protokoll(None))
+        return 0
+    print(__doc__.split("\n\n")[1], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

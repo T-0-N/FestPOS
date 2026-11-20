@@ -1,0 +1,10 @@
+[Unit]
+Description=FestPOS: Update-Aufträge der App übernehmen (signierte Pakete, festpos-update)
+
+[Path]
+# solange ein Auftrag dort liegt (auch einer, der vor dem Start abgelegt wurde)
+DirectoryNotEmpty=/run/festpos/update
+Unit=festpos-update.service
+
+[Install]
+WantedBy=multi-user.target

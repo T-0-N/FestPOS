@@ -1,0 +1,10 @@
+[Unit]
+Description=FestPOS: Aufträge der Verwaltung, die root brauchen (Schlüssel einspielen, Kartenpaket, 3 Pi, APK)
+
+[Path]
+# solange ein Auftrag dort liegt (auch einer, der vor dem Start abgelegt wurde)
+DirectoryNotEmpty=/run/festpos/wiederherstellen
+Unit=festpos-wiederherstellen.service
+
+[Install]
+WantedBy=multi-user.target

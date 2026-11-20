@@ -1,0 +1,158 @@
+#!/bin/bash
+# FestPOS – Härtung von SSH und sudo (T23, Entscheid: SSH nur mit Schlüssel).
+#
+# Läuft als root bei jedem Start (festpos-node) und beim Installieren/Update (install-lib.sh):
+#   1. SSH-Schlüssel übernehmen: liegt auf der Boot-Partition «festpos-ssh.pub» (am PC auf die SD-Karte kopiert),
+#      kommen die Schlüssel daraus zum ersten Benutzer (UID 1000) – so sperrt sich niemand aus.
+#   2. sshd: nur Schlüssel, kein root, wenige Versuche, keine Weiterleitungen (/etc/ssh/sshd_config.d/10-festpos.conf;
+#      Dateien in sshd_config.d gelten vor sshd_config, die erste Angabe zählt – auch vor den Einstellungen des Imagers).
+#   3. sudo: nur mit Passwort. «NOPASSWD» des ersten Benutzers (Raspberry Pi OS: /etc/sudoers.d/010_pi-nopasswd) fällt
+#      weg, sobald dieser Benutzer ein Passwort hat; ohne Passwort bleibt es (sonst gäbe es gar kein sudo mehr) und die
+#      Warnung steht im Journal.
+#
+#   festpos-haertung            alles anwenden (still, Meldungen ins Journal)
+#   festpos-haertung --stand    nur zeigen, wie es steht (JSON)
+#
+# Tests: FESTPOS_TEST_ROOT (alle Systempfade darunter), FESTPOS_BOOT (Boot-Partition).
+set -uo pipefail
+R=${FESTPOS_TEST_ROOT:-}
+BOOT=${FESTPOS_BOOT:-$R/boot/firmware}
+[ -d "$BOOT" ] || BOOT=$R/boot
+SSHD_DROP=$R/etc/ssh/sshd_config.d/10-festpos.conf
+SUDO_DROP=$R/etc/sudoers.d/festpos-haertung
+KEYFILE=festpos-ssh.pub
+
+log() { if [ -n "$R" ]; then echo "festpos-haertung: $*" >&2; else logger -t festpos-haertung -- "$*" 2>/dev/null || echo "$*" >&2; fi; }
+
+first_user() {                     # Name, Home des ersten Benutzers (UID 1000)
+  awk -F: '$3 == 1000 { print $1 ":" $6; exit }' "$R/etc/passwd" 2>/dev/null
+}
+
+has_password() {                   # has_password NAME -> 0, wenn ein gültiges Passwort gesetzt ist
+  local h
+  h=$(awk -F: -v u="$1" '$1 == u { print $2; exit }' "$R/etc/shadow" 2>/dev/null)
+  [ -n "$h" ] && [ "${h:0:1}" != "!" ] && [ "${h:0:1}" != "*" ]
+}
+
+key_count() {                      # key_count DATEI -> Anzahl gültiger öffentlicher Schlüssel
+  local n=0 line
+  [ -f "$1" ] || { echo 0; return; }
+  while IFS= read -r line; do
+    case "$line" in ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*\ *|sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-*\ *) n=$((n + 1)) ;; esac
+  done < "$1"
+  echo "$n"
+}
+
+take_keys() {                      # Schlüssel von der Boot-Partition zum ersten Benutzer
+  local src=$BOOT/$KEYFILE user home ak line added=0 tmp
+  [ -f "$src" ] || return 0
+  IFS=: read -r user home <<< "$(first_user)"
+  if [ -z "$user" ]; then log "$KEYFILE gefunden, aber kein Benutzer mit UID 1000"; return 0; fi
+  home=$R$home
+  ak=$home/.ssh/authorized_keys
+  install -d -m 0700 "$home/.ssh"
+  touch "$ak"; chmod 0600 "$ak"
+  tmp=$(mktemp)
+  tr -d '\r' < "$src" > "$tmp"                  # vom Windows-PC: CRLF
+  while IFS= read -r line; do
+    line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$line" in
+      ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*\ *|sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-*\ *) ;;
+      ''|'#'*) continue ;;
+      *) log "Zeile in $KEYFILE ist kein öffentlicher SSH-Schlüssel – übersprungen"; continue ;;
+    esac
+    if command -v ssh-keygen >/dev/null && ! echo "$line" | ssh-keygen -l -f - >/dev/null 2>&1; then
+      log "Schlüssel in $KEYFILE ist ungültig – übersprungen"; continue
+    fi
+    # schon vorhanden (gleicher Typ und Schlüssel, Kommentar egal)?
+    if awk -v k="$(echo "$line" | awk '{print $1" "$2}')" '($1" "$2) == k { f=1 } END { exit !f }' "$ak"; then continue; fi
+    echo "$line" >> "$ak"; added=$((added + 1))
+  done < "$tmp"
+  rm -f "$tmp"
+  chown -R "$user:$user" "$home/.ssh" 2>/dev/null || [ -n "$R" ]
+  mv -f "$src" "$src.uebernommen" 2>/dev/null || true   # nicht bei jedem Start nochmals; sichtbar am PC
+  log "$added SSH-Schlüssel für $user übernommen"
+}
+
+write_sshd() {
+  install -d "${SSHD_DROP%/*}"
+  local new
+  new=$(mktemp)
+  cat > "$new" << 'EOF'
+# FestPOS (T23): SSH nur mit Schlüssel. Wird von festpos-haertung bei jedem Start geschrieben – nicht von Hand ändern.
+# Schlüssel hinzufügen: am PC die Datei festpos-ssh.pub (öffentlicher Schlüssel) auf die Boot-Partition der SD-Karte.
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+MaxAuthTries 3
+LoginGraceTime 30
+MaxStartups 4:50:10
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+PermitTunnel no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+EOF
+  if ! cmp -s "$new" "$SSHD_DROP"; then
+    [ -f "$SSHD_DROP" ] && cp -p "$SSHD_DROP" "$SSHD_DROP.alt"
+    install -m 0644 "$new" "$SSHD_DROP"
+    if [ -z "$R" ] && command -v sshd >/dev/null && compgen -G "/etc/ssh/ssh_host_*_key" >/dev/null && ! sshd -t >/dev/null 2>&1; then
+      if [ -f "$SSHD_DROP.alt" ]; then mv -f "$SSHD_DROP.alt" "$SSHD_DROP"; else rm -f "$SSHD_DROP"; fi
+      rm -f "$new"; log "FEHLER: sshd-Prüfung scheitert mit den neuen Einstellungen – nicht geändert"; return 1
+    fi
+    rm -f "$SSHD_DROP.alt"
+    log "sshd: nur noch Schlüssel"
+    [ -n "$R" ] || systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true   # Sitzungen bleiben
+  fi
+  rm -f "$new"
+}
+
+write_sudo() {
+  local user home f new
+  IFS=: read -r user home <<< "$(first_user)"
+  install -d -m 0750 "$R/etc/sudoers.d"
+  new=$(mktemp)
+  cat > "$new" << 'EOF'
+# FestPOS (T23): sudo nur mit Passwort, kurz gültig, protokolliert. Von festpos-haertung geschrieben.
+Defaults use_pty
+Defaults passwd_tries=3
+Defaults timestamp_timeout=5
+Defaults logfile=/var/log/sudo.log
+EOF
+  if [ -z "$R" ] && command -v visudo >/dev/null && ! visudo -cqf "$new" >/dev/null 2>&1; then
+    rm -f "$new"; log "FEHLER: sudo-Einstellungen ungültig – nicht geändert"; return 1
+  fi
+  cmp -s "$new" "$SUDO_DROP" || install -m 0440 "$new" "$SUDO_DROP"
+  rm -f "$new"
+  [ -n "$user" ] || return 0
+  for f in "$R"/etc/sudoers.d/*; do
+    if [ ! -f "$f" ] || [ "$f" = "$SUDO_DROP" ]; then continue; fi
+    grep -qE "^[[:space:]]*${user}[[:space:]].*NOPASSWD" "$f" || continue
+    if has_password "$user"; then
+      rm -f "$f"; log "sudo für $user braucht jetzt das Passwort (${f##*/} entfernt)"
+    else
+      log "WARNUNG: $user hat kein Passwort – sudo bleibt ohne Passwort (im Imager ein Passwort setzen)"
+    fi
+  done
+}
+
+stand() {
+  local user home keys=0 nopw=false
+  IFS=: read -r user home <<< "$(first_user)"
+  [ -n "$user" ] && keys=$(key_count "$R$home/.ssh/authorized_keys")
+  if [ -n "$user" ] && grep -lqsE "^[[:space:]]*${user}[[:space:]].*NOPASSWD" "$R"/etc/sudoers.d/* 2>/dev/null; then nopw=true; fi
+  printf '{"ssh_keys_only": %s, "user": "%s", "keys": %s, "sudo_without_password": %s, "password_set": %s}\n' \
+    "$([ -f "$SSHD_DROP" ] && echo true || echo false)" "$user" "$keys" "$nopw" \
+    "$([ -n "$user" ] && has_password "$user" && echo true || echo false)"
+}
+
+case "${1:-}" in
+  --stand) stand ;;
+  '') take_keys; write_sshd; write_sudo ;;
+  *) echo "Aufruf: festpos-haertung [--stand]" >&2; exit 2 ;;
+esac
+exit 0

@@ -1,0 +1,65 @@
+#!/bin/bash
+# FestPOS – Notfallwerkzeug
+#
+#   festpos-notfall status        Cluster-Zustand anzeigen
+#   festpos-notfall einzelbetrieb 2 von 3 Knoten sind TOT: diesen Knoten allein weiterlaufen lassen
+#   festpos-notfall neu-beitreten Datenbank dieses Knotens beiseite legen und frisch vom Cluster holen
+#                                 (z.B. nach Einzelbetrieb für die zurückgekehrten Knoten)
+#   festpos-notfall gruenden      ALLE Karten leer und CLUSTER_SIZE=3: diesen Knoten zum Gründer machen
+set -euo pipefail
+DATA=/var/lib/festpos/rqlite
+# shellcheck source=festpos-conf.sh
+source "$(dirname "$0")/festpos-conf.sh"
+festpos_read_conf /etc/festpos/env
+BOOT=/boot/firmware; [ -d "$BOOT" ] || BOOT=/boot
+festpos_read_conf "$BOOT/festpos.conf"
+
+confirm() { read -r -p "$1 Zum Fortfahren 'JA' tippen: " a; [ "$a" = "JA" ] || { echo "Abgebrochen."; exit 1; }; }
+
+case "${1:-status}" in
+  status)
+    echo "Dieser Knoten: $FESTPOS_NODE ($NODE_IP)"
+    curl -s -m 3 "http://127.0.0.1:4001/nodes?pretty" || echo "rqlited antwortet nicht"
+    echo; curl -sk -m 3 https://127.0.0.1:8443/api/health; echo
+    if ip -br addr show | grep -qw "$VIP"; then echo ">> Dieser Knoten hält die VIP $VIP"; fi
+    [ -e "$DATA/.festpos-einzelbetrieb" ] &&
+      echo ">> EINZELBETRIEB seit $(cat "$DATA/.festpos-einzelbetrieb") – endet automatisch, sobald ein anderer Pi neu beigetreten ist"
+    ls -1d "$DATA".verworfen-* 2>/dev/null | sed 's/^/   beiseite gelegte Datenbank: /' || true
+    ;;
+  einzelbetrieb)
+    echo "ACHTUNG: Nur verwenden, wenn die beiden anderen Knoten wirklich AUS sind."
+    echo "Laufen sie doch noch, entstehen zwei getrennte Datenbestände (doppelte Bons möglich)."
+    festpos_rq_member "$DATA" || { echo "Dieser Knoten hat keine Cluster-Daten – Einzelbetrieb nicht möglich."; exit 1; }
+    confirm "Knoten $FESTPOS_NODE wird alleiniger Cluster."
+    systemctl stop festpos rqlited
+    festpos_rq_einzelbetrieb "$DATA" "$FESTPOS_NODE" "$NODE_IP:4002"
+    systemctl start rqlited festpos
+    echo "Einzelbetrieb aktiv."
+    echo "Die anderen Pi später NUR einschalten, solange dieser Pi läuft: sie merken dann selbst, dass ihr"
+    echo "Stand veraltet ist, legen ihn beiseite und treten neu bei. Sicherer: vorher auf ihrer Karte"
+    echo "(Bootpartition) eine leere Datei 'festpos-neu-beitreten' anlegen – siehe ANLEITUNG."
+    ;;
+  neu-beitreten)
+    if [ -e "$DATA/.festpos-einzelbetrieb" ]; then
+      echo "Dieser Pi läuft im Einzelbetrieb und hat die aktuellen Daten – NICHT hier, sondern auf den"
+      echo "zurückgekehrten Pi 'festpos-notfall neu-beitreten' ausführen."
+      exit 1
+    fi
+    confirm "Lokale Datenbank von Knoten $FESTPOS_NODE wird beiseite gelegt und neu vom Cluster geladen."
+    systemctl stop festpos rqlited
+    ZIEL=$(festpos_rq_verwerfen "$DATA") || { echo "FEHLER: Datenbank konnte nicht beiseite gelegt werden."; systemctl start rqlited festpos; exit 1; }
+    echo "Alte Datenbank liegt jetzt in $ZIEL"
+    systemctl start rqlited festpos
+    echo "Knoten tritt neu bei – Status mit 'festpos-notfall status' prüfen."
+    ;;
+  gruenden)
+    # Mitglied (oder Daten vorhanden) -> nicht gründen. Reste eines gescheiterten Beitritts stören nicht.
+    if festpos_rq_member "$DATA"; then echo "Dieser Knoten ist schon Mitglied eines Clusters bzw. hat Daten – Gründen nicht nötig."; exit 1; fi
+    echo "Nur verwenden, wenn KEIN Knoten Daten hat (z.B. alle Karten neu)."
+    confirm "Knoten $FESTPOS_NODE gründet einen neuen Cluster, die anderen treten bei."
+    install -o festpos -g festpos /dev/null /var/lib/festpos/gruenden
+    systemctl restart rqlited festpos
+    echo "Gegründet. Die anderen Knoten treten automatisch bei."
+    ;;
+  *) sed -n '3,9p' "$0"; exit 2 ;;
+esac

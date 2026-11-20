@@ -1,0 +1,704 @@
+#!/opt/festpos/venv/bin/python3 -I
+"""FestPOS – neue SD-Karte im USB-Kartenleser schreiben (T10): das laufende System ohne Datenbank und ohne das, was
+nur zu diesem Pi gehört, auf die Karte kopieren und die Boot-Partition für den gewählten Buchstaben einrichten.
+
+  festpos-karte --liste          Kartenleser und Karten als JSON (für die Verwaltung, über festpos-wiederherstellen)
+  festpos-karte --auftrag        Auftrag (JSON auf stdin) prüfen, ablegen und festpos-karte.service starten
+  festpos-karte --schreiben      vom Dienst festpos-karte.service: den abgelegten Auftrag ausführen (5–15 Minuten)
+  festpos-karte --abbrechen      laufendes Schreiben abbrechen (die Karte wird dabei unbrauchbar gemacht)
+
+Die App (Benutzer festpos) liefert nie einen Pfad: Gerät, Seriennummer und Grösse aus der Liste; ob das Gerät erlaubt
+ist, entscheidet nur dieses Programm – bei der Liste und vor dem Schreiben nochmals. Fortschritt in
+/run/festpos/karte/status.json (ohne Geheimnisse, für alle lesbar). Was nicht auf die Karte kommt: karte-ohne.txt.
+
+Ablauf: prüfen → Partitionen (neue Disk-ID) → System kopieren (tar) → anpassen (PARTUUID, leere machine-id …) →
+Boot-Dateien für den Buchstaben (app/kartenboot.py, wie das Kartenpaket) → kontrollieren (fsck) → auswerfen.
+Bei Abbruch oder Fehler nach dem Partitionieren wird die Partitionstabelle gelöscht: eine halbe Karte startet nie.
+"""
+import fcntl
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+from fnmatch import fnmatch
+from pathlib import Path
+
+sys.dont_write_bytecode = True                         # nichts als root in /opt/festpos schreiben
+DEST = Path(os.environ.get("FESTPOS_DEST", "/opt/festpos"))
+sys.path.insert(0, os.environ.get("FESTPOS_RELEASE_LIB", str(DEST)))
+from app import backup, kartenboot  # noqa: E402  (gehört root wie dieses Programm)
+
+SYS_BLOCK = Path(os.environ.get("FESTPOS_SYS_BLOCK", "/sys/block"))
+DEV = Path(os.environ.get("FESTPOS_DEV", "/dev"))
+MOUNTS = os.environ.get("FESTPOS_PROC_MOUNTS", "/proc/self/mounts")
+KARTE = Path(os.environ.get("FESTPOS_KARTE_DIR", "/run/festpos/karte"))
+QUELLE = Path(os.environ.get("FESTPOS_KARTE_QUELLE", "/"))
+_boot = os.environ.get("FESTPOS_BOOT") or ("/boot/firmware" if os.path.isdir("/boot/firmware") else "/boot")
+BOOT = Path(_boot)
+ETC = Path(os.environ.get("FESTPOS_ETC", "/etc/festpos"))
+OHNE = Path(os.environ.get("FESTPOS_KARTE_OHNE", str(DEST / "deploy" / "karte-ohne.txt")))
+LOCK = Path(os.environ.get("FESTPOS_USB_LOCK", "/run/festpos-usb.lock"))   # gemeinsam mit festpos-update/-sicherung
+SYSTEMCTL = os.environ.get("FESTPOS_KARTE_SYSTEMCTL", "systemctl")
+ATTRS = [] if os.environ.get("FESTPOS_KARTE_OHNE_ATTR") == "1" else ["--xattrs", "--xattrs-include=*", "--acls"]
+STATUS = KARTE / "status.json"
+AUFTRAG = KARTE / "auftrag.json"
+DISK_RE = re.compile(r"^sd[a-z]{1,2}$")
+GIB = 1024 ** 3
+BOOT_DEFAULT = 512 * 1024 ** 2
+FSCK_TRIES = int(os.environ.get("FESTPOS_KARTE_FSCK_TRIES", "3"))   # Prüfen/Aushängen so oft versuchen
+FSCK_WAIT = float(os.environ.get("FESTPOS_KARTE_FSCK_WAIT", "2"))   # Sekunden zwischen den Versuchen
+STALE_S = 60                                            # Status ohne Lebenszeichen: Dienst läuft nicht mehr
+TOOLS = ("sfdisk", "wipefs", "blockdev", "mkfs.vfat", "fsck.vfat", "mkfs.ext4", "e2fsck", "tar", "blkid", "udevadm",
+         "mount", "umount")
+STICK_FS = {"vfat": "vfat", "exfat": "exfat", "ext4": "ext4", "ext3": "ext3", "ext2": "ext2", "ntfs": "ntfs3"}
+STEPS = ("pruefen", "partitionen", "kopieren", "anpassen", "boot", "kontrolle", "auswerfen")
+
+
+class Fehler(Exception):
+    def __init__(self, code: str, **extra):
+        super().__init__(code)
+        self.code = code
+        self.extra = extra
+
+
+class Abbruch(Exception):
+    pass
+
+
+# -- Kleinkram ----------------------------------------------------------------------------------------------------
+def lies_text(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def schreibe_json(path: Path, obj: dict, mode: int = 0o644) -> None:
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.neu")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def lies_json(path: Path) -> dict | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    with os.fdopen(fd, encoding="utf-8") as f:
+        try:
+            obj = json.load(f)
+        except ValueError:
+            return None
+    return obj if isinstance(obj, dict) else None
+
+
+def run(cmd: list[str], code: str, timeout: float = 600, **kw) -> subprocess.CompletedProcess:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+    except (OSError, subprocess.TimeoutExpired):
+        raise Fehler(code) from None
+    if r.returncode != 0:
+        print(f"{cmd[0]}: {r.stderr.strip()[:300]}", file=sys.stderr)
+        raise Fehler(code)
+    return r
+
+
+def mounts() -> list[tuple[str, str]]:
+    try:
+        with open(MOUNTS, encoding="utf-8") as f:
+            return [(ln.split()[0], ln.split()[1]) for ln in f if len(ln.split()) > 1]
+    except OSError:
+        return []
+
+
+def missing_tools() -> list[str]:
+    return [x for x in TOOLS if not shutil.which(x)]
+
+
+# -- Ausschlussliste (karte-ohne.txt) -----------------------------------------------------------------------------
+def ohne() -> tuple[list[str], list[str], list[str]]:
+    """-> (Muster für /, davon «Ordner bleiben», Muster für die Boot-Partition)."""
+    root, folders, boot = [], [], []
+    try:
+        lines = OHNE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        raise Fehler("ohne") from None
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("boot:"):
+            boot.append(line[5:].strip())
+            continue
+        keep = line.endswith(" ordner")
+        if keep:
+            line = line[: -len(" ordner")].strip()
+        if not line.startswith("/"):
+            raise Fehler("ohne")
+        root.append(line)
+        if keep:
+            folders.append(line)
+    if not root:
+        raise Fehler("ohne")
+    return root, folders, boot
+
+
+def boot_ausgelassen(rel: str, muster: list[str]) -> bool:
+    first = rel.split("/", 1)[0]
+    return any(fnmatch(first, m) or fnmatch(rel, m) for m in muster)
+
+
+# -- Grösse -------------------------------------------------------------------------------------------------------
+def du(path: Path) -> int:
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for n in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, n)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def belegt() -> int:
+    """Belegter Platz auf / ohne die grossen Ausnahmen (Datenbank, Logs)."""
+    if os.environ.get("FESTPOS_KARTE_BELEGT"):
+        return int(os.environ["FESTPOS_KARTE_BELEGT"])
+    st = os.statvfs(QUELLE)
+    used = (st.f_blocks - st.f_bfree) * st.f_frsize
+    for p in ("var/lib/festpos/rqlite", "var/log/journal"):
+        used -= du(QUELLE / p)
+    return max(used, 0)
+
+
+def boot_bytes() -> int:
+    """Grösse der Boot-Partition dieses Pi (meist 512 MB)."""
+    if os.environ.get("FESTPOS_KARTE_BOOT_BYTES"):
+        return int(os.environ["FESTPOS_KARTE_BOOT_BYTES"])
+    src = next((s for s, t in mounts() if t == str(BOOT)), "")
+    name = os.path.basename(src)
+    size = lies_text(Path("/sys/class/block") / name / "size") if name else ""
+    return int(size) * 512 if size.isdigit() and int(size) > 0 else BOOT_DEFAULT
+
+
+def noetig() -> int:
+    return boot_bytes() + int(belegt() * 1.2) + GIB
+
+
+# -- Geräte -------------------------------------------------------------------------------------------------------
+def udev(disk: str) -> dict:
+    try:
+        r = subprocess.run(["udevadm", "info", "--query=property", f"--name={DEV / disk}"], capture_output=True,
+                           text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    return dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+
+
+def blkid(dev: str) -> dict:
+    try:
+        r = subprocess.run(["blkid", "-o", "export", str(DEV / dev)], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    return dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+
+
+def partitions(disk: str) -> list[str]:
+    try:
+        return sorted(e.name for e in os.scandir(SYS_BLOCK / disk) if e.name.startswith(disk) and e.name != disk)
+    except OSError:
+        return []
+
+
+def ist_stick(dev: str, fs: str) -> bool:
+    """Sicherungs- oder Update-Stick? Kurz nur lesend einbinden und nachsehen."""
+    if fs not in STICK_FS:
+        return False
+    mnt = KARTE / f"pruef-{dev}"
+    mnt.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        opts = "ro,nosuid,nodev,noexec" + (",noload" if fs in ("ext3", "ext4") else "")   # Journal nicht abspielen
+        r = subprocess.run(["mount", "-t", STICK_FS[fs], "-o", opts, str(DEV / dev), str(mnt)],
+                           capture_output=True, timeout=30)
+        if r.returncode != 0:
+            return False
+        try:
+            return (mnt / backup.STICK_DIR).is_dir() or (mnt / "festpos.zip").is_file()
+        finally:
+            subprocess.run(["umount", str(mnt)], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    finally:
+        try:
+            mnt.rmdir()
+        except OSError:
+            pass
+
+
+def geraet(disk: str, need: int, mounted: list[tuple[str, str]], tief: bool = True) -> dict:
+    """Ein Gerät mit allem, was die Verwaltung zeigt, und ob es erlaubt ist (reason = warum nicht)."""
+    base = SYS_BLOCK / disk
+    size = int(lies_text(base / "size") or 0) * 512
+    props = udev(disk)
+    d = {"device": disk, "vendor": lies_text(base / "device" / "vendor"), "model": lies_text(base / "device" / "model"),
+         "size": size, "serial": props.get("ID_SERIAL_SHORT") or props.get("ID_SERIAL") or "", "parts": [],
+         "allowed": False, "reason": None, "need": need}
+    usb = "/usb" in os.path.realpath(base) or props.get("ID_BUS") == "usb"
+    parts = partitions(disk)
+    on = {t for s, t in mounted for p in [disk, *parts] if s == str(DEV / p)}
+    for p in parts:
+        info = blkid(p) if size else {}
+        d["parts"].append({"name": p, "label": info.get("LABEL", ""), "fs": info.get("TYPE", "")})
+    if on & {"/", "/boot", "/boot/firmware"} or any(t.startswith("/boot") for t in on):
+        d["reason"] = "system"
+    elif not usb:
+        d["reason"] = "not_usb"
+    elif lies_text(base / "removable") != "1":
+        d["reason"] = "not_removable"
+    elif size == 0:
+        d["reason"] = "no_card"
+    elif on:
+        d["reason"] = "mounted"
+    elif size < need:
+        d["reason"] = "too_small"
+    elif tief and any(ist_stick(p["name"], p["fs"]) for p in d["parts"]):
+        d["reason"] = "stick"
+    else:
+        d["allowed"] = True
+    return d
+
+
+def liste() -> dict:
+    need = noetig()
+    mounted = mounts()
+    try:
+        disks = sorted(e.name for e in os.scandir(SYS_BLOCK) if DISK_RE.match(e.name))
+    except OSError:
+        disks = []
+    return {"devices": [geraet(d, need, mounted) for d in disks], "need": need, "missing": missing_tools(),
+            "small_hint": need < 16 * 10 ** 9}
+
+
+# -- Status -------------------------------------------------------------------------------------------------------
+class Stand:
+    """Fortschritt in status.json; ein Faden schreibt alle 2 s ein Lebenszeichen (at)."""
+
+    def __init__(self, job: dict):
+        self.s = {"id": job["id"], "state": "running", "step": "pruefen", "done": 0, "total": 0, "code": None,
+                  "device": job["device"], "model": job.get("model", ""), "size": job["size"], "letter": job["letter"],
+                  "started": time.time(), "ended": None, "at": time.time()}
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.save()
+        threading.Thread(target=self._tick, daemon=True).start()
+
+    def save(self) -> None:
+        with self.lock:
+            self.s["at"] = time.time()
+            schreibe_json(STATUS, self.s)
+
+    def _tick(self) -> None:
+        while not self.stop.wait(2):
+            self.save()
+
+    def step(self, name: str) -> None:
+        print(f"Schritt: {name}")
+        self.s["step"] = name
+        self.save()
+
+    def end(self, state: str, code: str | None = None) -> None:
+        self.stop.set()
+        self.s.update(state=state, code=code, ended=time.time())
+        self.save()
+
+
+def status() -> dict | None:
+    s = lies_json(STATUS)
+    if s and s.get("state") == "running" and time.time() - float(s.get("at") or 0) > STALE_S:
+        s.update(state="failed", code="stale")
+    return s
+
+
+# -- Auftrag annehmen (über festpos-wiederherstellen) ------------------------------------------------------------
+def auftrag(job: dict) -> dict:
+    letter = str(job.get("letter") or "").lower()
+    if letter not in kartenboot.LETTERS:
+        raise Fehler("letters")
+    disk = str(job.get("device") or "")
+    if not DISK_RE.match(disk):
+        raise Fehler("device")
+    if str(job.get("confirm") or "").lower() != letter:
+        raise Fehler("confirm")
+    s = status()
+    if s and s.get("state") == "running":
+        raise Fehler("busy")
+    if missing_tools():
+        raise Fehler("tools", missing=missing_tools())
+    kartenboot.boot_files(BOOT, ETC, letter)                     # Konfiguration und Schlüssel vorhanden?
+    d = geraet(disk, noetig(), mounts())
+    if not d["allowed"]:
+        raise Fehler(d["reason"] or "device")
+    if d["serial"] != str(job.get("serial") or "") or d["size"] != int(job.get("size") or -1):
+        raise Fehler("changed")
+    jid = secrets.token_hex(6)
+    schreibe_json(AUFTRAG, {"id": jid, "device": disk, "serial": d["serial"], "size": d["size"], "letter": letter,
+                            "model": " ".join(x for x in (d["vendor"], d["model"]) if x)}, 0o600)
+    schreibe_json(STATUS, {"id": jid, "state": "running", "step": "start", "done": 0, "total": 0, "code": None,
+                           "device": disk, "model": d["model"], "size": d["size"], "letter": letter,
+                           "started": time.time(), "ended": None, "at": time.time()})
+    r = subprocess.run([SYSTEMCTL, "start", "--no-block", "festpos-karte.service"], capture_output=True, timeout=30)
+    if r.returncode != 0:
+        schreibe_json(STATUS, {**lies_json(STATUS), "state": "failed", "code": "service", "ended": time.time()})
+        raise Fehler("service")
+    return {"job": jid}
+
+
+def abbrechen() -> dict:
+    s = lies_json(STATUS)
+    if not s or s.get("state") != "running":
+        return {"running": False}
+    subprocess.run([SYSTEMCTL, "stop", "--no-block", "festpos-karte.service"], capture_output=True, timeout=30)
+    return {"running": True}
+
+
+# -- Schreiben ----------------------------------------------------------------------------------------------------
+class Schreiber:
+    def __init__(self, job: dict):
+        self.job = job
+        self.disk = job["device"]
+        self.stand = Stand(job)
+        self.procs: list[subprocess.Popen] = []
+        self.partitioned = False
+        self.mnt_boot = KARTE / "ziel-boot"
+        self.mnt_root = KARTE / "ziel-root"
+        self.disk_id = ""
+
+    def part(self, n: int) -> Path:
+        return DEV / f"{self.disk}{n}"
+
+    # 1. nochmals prüfen
+    def pruefen(self) -> None:
+        if missing_tools():
+            raise Fehler("tools")
+        d = geraet(self.disk, noetig(), mounts())
+        if not d["allowed"]:
+            raise Fehler(d["reason"] or "device")
+        if d["serial"] != self.job["serial"] or d["size"] != self.job["size"]:
+            raise Fehler("changed")
+
+    # 2. Partitionen
+    def partitionen(self) -> None:
+        old = self.alte_disk_id()
+        while True:
+            self.disk_id = secrets.token_hex(4)
+            if self.disk_id != old and self.disk_id != "00000000":
+                break
+        sectors = boot_bytes() // 512
+        script = (f"label: dos\nlabel-id: 0x{self.disk_id}\nunit: sectors\n\n"
+                  f"start=8192, size={sectors}, type=c\nstart={8192 + sectors}, type=83\n")
+        self.partitioned = True
+        run(["wipefs", "-a", str(DEV / self.disk)], "wipefs", 120)
+        run(["sfdisk", "--wipe", "always", "--wipe-partitions", "always", str(DEV / self.disk)], "sfdisk", 120,
+            input=script)
+        subprocess.run(["udevadm", "settle", "--timeout=30"], capture_output=True, timeout=60)
+        for _ in range(40):
+            if self.part(1).exists() and self.part(2).exists():
+                break
+            time.sleep(0.25)
+        else:
+            raise Fehler("partitions")
+        run(["mkfs.vfat", "-F", "32", "-n", "bootfs", str(self.part(1))], "mkfs", 300)
+        run(["mkfs.ext4", "-F", "-q", "-L", "rootfs", str(self.part(2))], "mkfs", 900)
+        for mnt, dev, fs in ((self.mnt_root, self.part(2), "ext4"), (self.mnt_boot, self.part(1), "vfat")):
+            mnt.mkdir(mode=0o700, parents=True, exist_ok=True)
+            run(["mount", "-t", fs, str(dev), str(mnt)], "mount", 60)
+
+    def alte_disk_id(self) -> str:
+        m = re.search(r"root=PARTUUID=([0-9a-fA-F]{8})-0?2\b", lies_text(BOOT / "cmdline.txt"))
+        if not m:
+            raise Fehler("partuuid")
+        return m.group(1).lower()
+
+    # 3. Kopieren
+    def kopieren(self) -> None:
+        root, folders, boot_muster = ohne()
+        excl = KARTE / "ohne.tar"
+        excl.write_text("".join(f".{m}\n" for m in root), encoding="utf-8")
+        boot_files = []
+        for dirpath, dirnames, filenames in os.walk(BOOT):
+            rel_dir = os.path.relpath(dirpath, BOOT)
+            dirnames[:] = [d for d in dirnames
+                           if not boot_ausgelassen(os.path.normpath(os.path.join(rel_dir, d)), boot_muster)]
+            for n in filenames:
+                rel = os.path.normpath(os.path.join(rel_dir, n))
+                if not boot_ausgelassen(rel, boot_muster):
+                    boot_files.append(rel)
+        boot_total = sum(os.lstat(BOOT / r).st_size for r in boot_files)
+        self.stand.s["total"] = belegt() + boot_total
+        self.stand.save()
+        # Boot-Partition (FAT: nur Inhalt, keine Besitzer und Rechte)
+        for rel in boot_files:
+            self.abbruch_pruefen()
+            dst = self.mnt_boot / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(BOOT / rel, dst, follow_symlinks=False)
+            self.stand.s["done"] += os.lstat(BOOT / rel).st_size
+        # Systempartition: tar | tar, die Bytes dazwischen zählen den Fortschritt
+        create = subprocess.Popen(["tar", "-C", str(QUELLE), "--one-file-system", *ATTRS, "--numeric-owner",
+                                   "--anchored", f"--exclude-from={excl}", "-cf", "-", "."],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        extract = subprocess.Popen(["tar", "-C", str(self.mnt_root), *ATTRS, "--numeric-owner", "-xpf", "-"],
+                                   stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.procs = [create, extract]
+        try:
+            while chunk := create.stdout.read(1024 * 1024):
+                self.abbruch_pruefen()
+                extract.stdin.write(chunk)
+                self.stand.s["done"] += len(chunk)
+            extract.stdin.close()
+            rc_c, rc_x = create.wait(), extract.wait()
+        except BrokenPipeError:
+            rc_c, rc_x = create.wait(), extract.wait()
+        if rc_c not in (0, 1):                     # 1: eine Datei hat sich beim Lesen geändert (laufendes System)
+            print(create.stderr.read().decode(errors="replace")[-500:], file=sys.stderr)
+            raise Fehler("copy")
+        if rc_x != 0:
+            print(extract.stderr.read().decode(errors="replace")[-500:], file=sys.stderr)
+            raise Fehler("copy")
+        self.procs = []
+        for pattern in folders:                    # z. B. /var/log: Unterordner leer erhalten
+            self.ordner_erhalten(pattern)
+
+    def ordner_erhalten(self, pattern: str) -> None:
+        base = pattern.rstrip("*").rstrip("/")
+        src = QUELLE / base.lstrip("/")
+        for dirpath, dirnames, _ in os.walk(src):
+            for d in dirnames:
+                s = Path(dirpath) / d
+                if s.is_symlink():
+                    continue
+                dst = self.mnt_root / s.relative_to(QUELLE)
+                st = s.lstat()
+                dst.mkdir(parents=True, exist_ok=True)
+                os.chmod(dst, stat.S_IMODE(st.st_mode))
+                if os.geteuid() == 0:
+                    os.chown(dst, st.st_uid, st.st_gid)
+
+    # 4. Anpassen
+    def anpassen(self) -> None:
+        old = self.alte_disk_id()
+        cmd = self.mnt_boot / "cmdline.txt"
+        text = lies_text(cmd)
+        new = re.sub(rf"PARTUUID={old}-", f"PARTUUID={self.disk_id}-", text, flags=re.I)
+        if f"root=PARTUUID={self.disk_id}-02" not in new:
+            raise Fehler("cmdline")
+        cmd.write_text(new + "\n", encoding="utf-8")
+        fstab = self.mnt_root / "etc" / "fstab"
+        text = fstab.read_text(encoding="utf-8")
+        new = re.sub(rf"PARTUUID={old}-", f"PARTUUID={self.disk_id}-", text, flags=re.I)
+        if re.search(r"^\s*UUID=", new, re.M) or f"PARTUUID={self.disk_id}-02" not in new:
+            raise Fehler("fstab")
+        fstab.write_text(new, encoding="utf-8")
+        for d, mode in (("proc", 0o555), ("sys", 0o555), ("dev", 0o755), ("run", 0o755), ("tmp", 0o1777),
+                        ("mnt", 0o755), ("media", 0o755), ("boot/firmware", 0o755)):
+            p = self.mnt_root / d
+            p.mkdir(parents=True, exist_ok=True)
+            os.chmod(p, mode)
+        mid = self.mnt_root / "etc" / "machine-id"
+        mid.parent.mkdir(parents=True, exist_ok=True)
+        mid.write_text("", encoding="utf-8")       # leer: systemd erzeugt beim ersten Start eine neue
+        os.chmod(mid, 0o444)
+        rq = self.mnt_root / "var" / "lib" / "festpos" / "rqlite"
+        if (QUELLE / "var" / "lib" / "festpos" / "rqlite").is_dir() and not rq.is_dir():
+            rq.mkdir(parents=True)
+
+    # 5. Boot-Dateien für den Buchstaben
+    def boot(self) -> None:
+        try:
+            files = kartenboot.boot_files(BOOT, ETC, self.job["letter"])
+        except kartenboot.KartenFehler as e:
+            raise Fehler(e.code) from None
+        for rel, data in files.items():
+            p = self.mnt_boot / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+
+    # 6. Kontrollieren
+    def kontrolle(self) -> None:
+        os.sync()
+        if f"root=PARTUUID={self.disk_id}-02" not in lies_text(self.mnt_boot / "cmdline.txt"):
+            raise Fehler("verify")
+        if f"PARTUUID={self.disk_id}-02" not in lies_text(self.mnt_root / "etc" / "fstab"):
+            raise Fehler("verify")
+        if (backup.conf_value(lies_text(self.mnt_boot / "node.conf"), "NODE") or "") != self.job["letter"]:
+            raise Fehler("verify")
+        conf = lies_text(self.mnt_boot / "festpos.conf")
+        want = lies_text(BOOT / "festpos.conf")
+        size = (backup.conf_value(conf, "CLUSTER_SIZE") or "1").strip()
+        if self.job["letter"] == kartenboot.own_letter(BOOT) and kartenboot.single(want):
+            if size != "1":
+                raise Fehler("verify")
+        elif size != "3":
+            raise Fehler("verify")
+        rq = self.mnt_root / "var" / "lib" / "festpos" / "rqlite"
+        if rq.is_dir() and any(rq.iterdir()):
+            raise Fehler("verify_db")
+        if lies_text(self.mnt_root / "etc" / "machine-id") or list((self.mnt_root / "etc" / "ssh").glob("ssh_host_*")):
+            raise Fehler("verify")
+        self.aushaengen()
+        self.fs_pruefen(["fsck.vfat", "-n", str(self.part(1))], 300)
+        self.fs_pruefen(["e2fsck", "-fn", str(self.part(2))], 900)
+
+    def fs_pruefen(self, cmd: list[str], timeout: float) -> None:
+        """Dateisystem prüfen (nur lesen). Direkt nach dem Aushängen liest udev die Partition kurz an; findet e2fsck
+        sie dann «in Gebrauch», bricht es ab («e2fsck: aborted»). Darum vorher warten und bei einem Fehler bis zu
+        FSCK_TRIES-mal nochmals – ein echter Fehler im Dateisystem bleibt und lässt das Schreiben scheitern."""
+        for versuch in range(1, FSCK_TRIES + 1):
+            subprocess.run(["udevadm", "settle", "--timeout=30"], capture_output=True, timeout=60)
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            except (OSError, subprocess.TimeoutExpired):
+                raise Fehler("fsck") from None
+            if r.returncode == 0:
+                return
+            print(f"{cmd[0]} (Versuch {versuch}): Code {r.returncode}: {(r.stdout + r.stderr).strip()[-400:]}",
+                  file=sys.stderr)
+            time.sleep(FSCK_WAIT * versuch)
+        raise Fehler("fsck")
+
+    def eingehaengt(self) -> list[Path]:
+        devs = {str(self.part(1)), str(self.part(2))}
+        return [m for m in (self.mnt_boot, self.mnt_root)
+                if any(t == str(m) or d in devs for d, t in mounts())]
+
+    def aushaengen(self, lazy: bool = False) -> None:
+        for mnt in (self.mnt_boot, self.mnt_root):
+            if any(t == str(mnt) for _, t in mounts()) or not lazy:
+                subprocess.run(["umount", *(["-l"] if lazy else []), str(mnt)], capture_output=True, timeout=120)
+        if lazy:
+            return
+        for _ in range(FSCK_TRIES):                # nicht prüfen, solange die Karte noch eingehängt ist
+            subprocess.run(["udevadm", "settle", "--timeout=30"], capture_output=True, timeout=60)
+            noch = self.eingehaengt()
+            if not noch:
+                return
+            for mnt in noch:
+                subprocess.run(["umount", str(mnt)], capture_output=True, timeout=120)
+            time.sleep(FSCK_WAIT)
+        raise Fehler("umount")
+
+    # 7. Auswerfen
+    def auswerfen(self) -> None:
+        subprocess.run(["blockdev", "--flushbufs", str(DEV / self.disk)], capture_output=True, timeout=60)
+        try:
+            (SYS_BLOCK / self.disk / "device" / "delete").write_text("1")
+        except OSError:
+            pass
+
+    def abbruch_pruefen(self) -> None:
+        if ABBRUCH.is_set():
+            raise Abbruch()
+
+    def aufraeumen(self) -> None:
+        for p in self.procs:
+            try:
+                p.kill()
+            except OSError:
+                pass
+        self.aushaengen(lazy=True)
+        if self.partitioned:                       # halbe Karte darf nie starten
+            subprocess.run(["wipefs", "-a", str(DEV / self.disk)], capture_output=True, timeout=120)
+
+    def los(self) -> int:
+        try:
+            with open(LOCK, "a") as lock:
+                for _ in range(60):                # Update oder Sicherung vom Stick läuft gerade: kurz warten
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        time.sleep(1)
+                else:
+                    raise Fehler("usb_busy")
+                for name in STEPS:
+                    self.abbruch_pruefen()
+                    self.stand.step(name)
+                    getattr(self, name)()
+            self.stand.end("done")
+            print("Karte geschrieben")
+            return 0
+        except Abbruch:
+            self.aufraeumen()
+            self.stand.end("cancelled", "cancelled")
+            print("abgebrochen", file=sys.stderr)
+            return 3
+        except Fehler as e:
+            self.aufraeumen()
+            self.stand.end("failed", e.code)
+            print(f"gescheitert: {e.code}", file=sys.stderr)
+            return 2
+        except OSError as e:
+            self.aufraeumen()
+            self.stand.end("failed", "io")
+            print(f"gescheitert: {type(e).__name__}: {e}", file=sys.stderr)
+            return 2
+
+
+ABBRUCH = threading.Event()
+
+
+def schreiben() -> int:
+    job = lies_json(AUFTRAG)
+    AUFTRAG.unlink(missing_ok=True)
+    if not job or not DISK_RE.match(str(job.get("device") or "")) or job.get("letter") not in kartenboot.LETTERS:
+        print("kein gültiger Auftrag", file=sys.stderr)
+        return 2
+    signal.signal(signal.SIGTERM, lambda *_: ABBRUCH.set())
+    signal.signal(signal.SIGINT, lambda *_: ABBRUCH.set())
+    return Schreiber(job).los()
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[1:2]
+    try:
+        if cmd == ["--liste"]:
+            print(json.dumps(liste()))
+            return 0
+        if cmd == ["--auftrag"]:
+            job = json.loads(sys.stdin.read() or "{}")
+            print(json.dumps({"ok": True, **auftrag(job if isinstance(job, dict) else {})}))
+            return 0
+        if cmd == ["--abbrechen"]:
+            print(json.dumps({"ok": True, **abbrechen()}))
+            return 0
+        if cmd == ["--status"]:
+            print(json.dumps(status()))
+            return 0
+        if cmd == ["--schreiben"]:
+            return schreiben()
+    except Fehler as e:
+        print(json.dumps({"ok": False, "code": e.code, **e.extra}))
+        return 2
+    except kartenboot.KartenFehler as e:
+        print(json.dumps({"ok": False, "code": e.code}))
+        return 2
+    except ValueError:
+        print(json.dumps({"ok": False, "code": "job"}))
+        return 2
+    print("Aufruf: festpos-karte --liste | --auftrag | --schreiben | --abbrechen | --status", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

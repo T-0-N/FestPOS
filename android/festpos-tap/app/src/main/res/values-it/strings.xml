@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FestPOS Tap</string>
+    <string name="wait">Pagamento in corso … avvicinare la carta o il telefono al dispositivo.</string>
+    <string name="report">Invio del risultato a FestPOS …</string>
+    <string name="no_payrexx">App Payrexx mancante – installare «Payrexx Tap to Pay» dal Play Store.</string>
+</resources>

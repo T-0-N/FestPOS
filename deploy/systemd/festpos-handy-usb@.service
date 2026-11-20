@@ -1,0 +1,11 @@
+[Unit]
+Description=FestPOS: Handy per USB – Pi als Zeitserver eintragen (%I)
+
+[Service]
+Type=oneshot
+# ADB-Schlüssel dieses Pi (das Handy fragt beim ersten Mal «Zulassen»), nur root
+Environment=HOME=/var/lib/festpos/adb
+EnvironmentFile=-/etc/festpos/env
+ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/festpos/adb
+ExecStart=/usr/local/sbin/festpos-handy-usb %I
+TimeoutStartSec=5min

@@ -1,0 +1,9 @@
+// FestPOS Tap – Begleit-App für die NFC-Zahlung über Payrexx (T13). Bauen: gradle assembleRelease (CI: android.yml)
+pluginManagement {
+    repositories { google(); mavenCentral(); gradlePluginPortal() }
+}
+dependencyResolutionManagement {
+    repositories { google(); mavenCentral() }
+}
+rootProject.name = "festpos-tap"
+include ":app"

@@ -1,0 +1,52 @@
+[Unit]
+Description=FestPOS: Gästedienst für die QR-Bestellung am Tisch (T22)
+Documentation=https://github.com/T-0-N/FestPOS/blob/main/deploy/ANLEITUNG.md
+After=network.target festpos.service
+# Nur, wenn festpos-node die QR-Bestellung eingeschaltet hat (TUNNEL_TOKEN in festpos.conf), nie in der Ersteinrichtung
+ConditionPathExists=/etc/festpos-gast/token
+ConditionPathExists=!/run/festpos/einrichtung
+
+[Service]
+User=festpos-gast
+Group=festpos-gast
+WorkingDirectory=/opt/festpos
+Environment=FESTPOS_STATIC=/opt/festpos/static FESTPOS_GAST_TOKEN_FILE=/etc/festpos-gast/token PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/festpos/venv/bin/python -m uvicorn app.gast_proxy:app --host 127.0.0.1 --port 8090 --no-server-header --no-access-log --timeout-keep-alive 5 --limit-concurrency 200
+Restart=always
+RestartSec=3
+
+# Sandbox: nur 127.0.0.1, keine Rechte, kein Schreiben, nichts von FestPOS ausser Programm und Gästeseite
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+SocketBindAllow=tcp:8090
+SocketBindDeny=any
+InaccessiblePaths=-/var/lib/festpos -/etc/festpos -/boot -/root -/var/log
+UMask=0077
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

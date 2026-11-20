@@ -1,0 +1,3 @@
+# FestPOS – Handy mit USB-Debugging an einem Pi: Pi als Zeitserver des Handys eintragen (T2, festpos-handy-usb).
+# Die ADB-Schnittstelle eines Android-Geräts hat Klasse ff, Unterklasse 42, Protokoll 01.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTR{bInterfaceClass}=="ff", ATTR{bInterfaceSubClass}=="42", ATTR{bInterfaceProtocol}=="01", TAG+="systemd", ENV{SYSTEMD_WANTS}+="festpos-handy-usb@%k.service"

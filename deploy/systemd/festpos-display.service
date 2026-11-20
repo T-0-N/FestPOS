@@ -1,0 +1,11 @@
+[Unit]
+Description=FestPOS: Bildschirm am Pi nach der Verwaltung einrichten
+After=festpos.service local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/festpos-display
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

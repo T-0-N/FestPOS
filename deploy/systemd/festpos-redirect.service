@@ -1,0 +1,18 @@
+[Unit]
+Description=FestPOS: http -> https Weiterleitung
+After=network-online.target festpos-node.service
+# Ersteinrichtung (T11): Port 80 gehört dann festpos-einrichtung.service
+ConditionPathExists=!/run/festpos/einrichtung
+
+[Service]
+User=festpos
+ExecStart=/usr/bin/python3 /usr/local/sbin/festpos-redirect.py
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=always
+
+# Härtung: kein Zugriff auf /home und /root, eigenes /tmp
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

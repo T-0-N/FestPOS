@@ -1,0 +1,258 @@
+#!/usr/bin/python3
+"""FestPOS – Bildschirm am Pi nach den Einstellungen in der Verwaltung einrichten (läuft als root).
+
+Die App (Benutzer festpos) schreibt den Wunsch nach /var/lib/festpos/display.json:
+  {"type": "none|hdmi|dsi7|dsi7v2|dsi5v2|tft35", "reboot": "<token>", "cursor": "auto|on|off",
+   "power": {"action": "reboot|poweroff", "token": "<zeit>-<zufall>", "at": <Zeitpunkt>}}
+Dieses Programm
+  - trägt die passenden Treiberzeilen in /boot/firmware/config.txt ein (eigener Block, Rest bleibt),
+  - schaltet die Statusanzeige (festpos-kiosk) ein oder aus, mit oder ohne Mauszeiger,
+  - startet den Pi neu oder fährt ihn herunter, wenn das in der Verwaltung ausgelöst wurde (alle Pi gemeinsam:
+    gleicher Zeitpunkt «at», damit keiner allein ohne Mehrheit übrig bleibt),
+  - meldet den Zustand nach /run/festpos/display-status.json (zeigt die Verwaltung an).
+Gestartet von festpos-display.path bei jeder Änderung und einmal beim Booten.
+"""
+import glob
+import json
+import os
+import shutil
+import stat
+import subprocess
+import time
+
+WISH = "/var/lib/festpos/display.json"
+STATUS = "/run/festpos/display-status.json"
+STATE = "/var/lib/festpos-display"
+CURSOR = "/etc/festpos-kiosk-cursor"   # "on" / "off" – liest festpos-kiosk-start
+REBOOT_MAX_AGE = 3600           # Sekunden: ältere (oder bei verstellter Uhr «künftige») Aufträge nicht ausführen
+POWER_MAX_AGE = 600             # Herunterfahren/Neustart: nur in den ersten 10 Minuten (danach ist es kein Auftrag mehr)
+CONFIG = "/boot/firmware/config.txt" if os.path.exists("/boot/firmware/config.txt") else "/boot/config.txt"
+BEGIN, END = "# --- FestPOS Bildschirm (Verwaltung) – nicht von Hand ändern ---", "# --- Ende FestPOS Bildschirm ---"
+
+LINES = {                       # Treiber pro Display-Typ
+    "none": [], "hdmi": [], "dsi7": [],          # HDMI und altes 7"-Display: automatisch erkannt
+    "dsi7v2": ["dtoverlay=vc4-kms-dsi-ili9881-7inch"],
+    "dsi5v2": ["dtoverlay=vc4-kms-dsi-ili9881-5inch"],
+    "tft35": ["dtparam=spi=on", "dtoverlay=piscreen,drm,speed=16000000,rotate=270"],
+}
+
+
+MANAGED = ("dtoverlay=piscreen", "dtoverlay=vc4-kms-dsi-ili9881")   # diese Treiber verwaltet nur der Block
+
+
+def sh(*cmd: str) -> int:
+    try:                                          # nie ewig hängen (REV-049)
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60).returncode
+    except subprocess.TimeoutExpired:
+        return 124
+
+
+def read(path: str, default=None):
+    """JSON lesen – die Wunsch-Datei schreibt der Dienstbenutzer festpos: nur eine kleine, normale Datei
+    akzeptieren (kein Symlink auf etwas anderes, keine riesige Datei), REV-049."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return default
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 64 * 1024:
+            return default
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return json.loads(f.read(64 * 1024).decode("utf-8"))
+    except (OSError, ValueError):
+        return default
+    finally:
+        os.close(fd)
+
+
+def write_json(path: str, data) -> None:
+    tmp = path + ".neu"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def set_config(lines: list[str]) -> bool:
+    """Eigenen Block in config.txt ersetzen. True = geändert (Neustart nötig)."""
+    try:
+        with open(CONFIG) as f:
+            text = f.read()
+    except OSError:
+        return False
+    out, skip = [], False
+    for ln in text.splitlines():
+        if ln.strip() == BEGIN:
+            skip = True
+            continue
+        if ln.strip() == END:
+            skip = False
+            continue
+        if not skip and not ln.strip().startswith(MANAGED):   # von Hand eingetragene Display-Treiber ersetzen
+            out.append(ln)
+    while out and not out[-1].strip():
+        out.pop()
+    if lines:
+        out += ["", BEGIN, "[all]", *lines, END]
+    new = "\n".join(out) + "\n"
+    if new == text:
+        return False
+    shutil.copy2(CONFIG, CONFIG + ".festpos-vorher")
+    with open(CONFIG + ".neu", "w") as f:
+        f.write(new)
+        f.flush()
+        os.fsync(f.fileno())                      # FAT: erst wirklich auf der Karte, dann umbenennen (REV-049)
+    os.replace(CONFIG + ".neu", CONFIG)
+    try:
+        dfd = os.open(os.path.dirname(CONFIG), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+    return True
+
+
+def cursor_wanted(kind: str, cursor) -> str:
+    """Mauszeiger der Statusanzeige: «auto» = nur am HDMI-Monitor (dort hängt eher eine Maus);
+    an Touch-Displays würde der Pfeil sonst bei jeder Berührung mitspringen."""
+    if cursor in ("on", "off"):
+        return cursor
+    return "on" if kind == "hdmi" else "off"
+
+
+def set_cursor(value: str) -> bool:
+    """True = geändert (Statusanzeige neu starten)."""
+    try:
+        with open(CURSOR) as f:
+            if f.read().strip() == value:
+                return False
+    except OSError:
+        pass
+    try:
+        with open(CURSOR + ".neu", "w") as f:
+            f.write(value + "\n")
+        os.chmod(CURSOR + ".neu", 0o644)
+        os.replace(CURSOR + ".neu", CURSOR)
+    except OSError:
+        return False
+    return True
+
+
+def connectors() -> list[str]:
+    found = []
+    for c in sorted(glob.glob("/sys/class/drm/card*-*")):
+        try:
+            with open(c + "/status") as f:
+                st = f.read().strip()
+        except OSError:
+            continue
+        name = os.path.basename(c).split("-", 1)[1]
+        if not name.startswith("Writeback") and st != "disconnected":
+            found.append(name)
+    return found
+
+
+def wait_or_cancel(token: str, wait: float) -> bool:
+    """Bis zum gemeinsamen Zeitpunkt warten; jede Sekunde nachsehen, ob der Auftrag in der Verwaltung abgebrochen
+    wurde (T27: «Abbrechen», solange der Countdown läuft). True = ausführen."""
+    left = wait
+    while left > 0:
+        step = min(1.0, left)
+        time.sleep(step)
+        left -= step
+        power = (read(WISH, {}) or {}).get("power")
+        power = power if isinstance(power, dict) else {}
+        if str(power.get("token") or "") != token or power.get("cancelled"):
+            return False
+    return True
+
+
+def main() -> None:
+    os.makedirs(STATE, exist_ok=True)
+    os.makedirs(os.path.dirname(STATUS), exist_ok=True)
+    wish = read(WISH, {}) or {}
+    kind = wish.get("type") if wish.get("type") in LINES else None
+    known = os.path.exists(STATE + "/last.json")       # lief auf dieser Karte schon einmal
+    last = read(STATE + "/last.json", {}) or {}
+    status = {"time": int(time.time()), "type": kind, "error": None}
+
+    if kind is not None:
+        if set_config(LINES[kind]):
+            last["reboot_needed"] = True               # Treiber wirkt erst nach Neustart
+            last["changed_at"] = time.time()
+        kiosk_unit = os.path.exists("/etc/systemd/system/festpos-kiosk.service")
+        if kind == "none":
+            if kiosk_unit:
+                sh("systemctl", "disable", "--now", "festpos-kiosk")
+                sh("systemctl", "enable", "--now", "getty@tty1")
+        elif not kiosk_unit or not shutil.which("cage") or not shutil.which("chromium"):
+            status["error_code"] = "kiosk_missing"     # Text zeigt die Verwaltung (Sprachdatei)
+        else:
+            cursor_changed = set_cursor(cursor_wanted(kind, wish.get("cursor")))
+            sh("systemctl", "enable", "festpos-kiosk")
+            if last.get("type") != kind or cursor_changed or sh("systemctl", "is-active", "--quiet", "festpos-kiosk") != 0:
+                sh("systemctl", "restart", "festpos-kiosk")
+        last["type"] = kind
+
+    power = wish.get("power") if isinstance(wish.get("power"), dict) else {}
+    ptoken, action = str(power.get("token") or ""), power.get("action")
+    if ptoken and power.get("cancelled"):              # in der Verwaltung abgebrochen (T27): nichts tun
+        last["power_done"] = ptoken
+    if ptoken and ptoken != last.get("power_done") and action in ("reboot", "poweroff"):
+        last["power_done"] = ptoken
+        try:
+            age = time.time() - float(ptoken.split("-", 1)[0])
+        except ValueError:
+            age = None
+        if known and age is not None and abs(age) <= POWER_MAX_AGE:   # nur frische Aufträge (nicht aus Sicherung)
+            last["reboot_needed"] = False
+            write_json(STATE + "/last.json", last)
+            status.update(rebooting=action == "reboot", powering_off=action == "poweroff")
+            write_json(STATUS, status)
+            try:
+                wait = float(power.get("at") or 0) - time.time()
+            except (TypeError, ValueError):
+                wait = 0
+            if 0 < wait <= 60 and not wait_or_cancel(ptoken, wait):     # alle Pi zum selben Zeitpunkt
+                status.update(rebooting=False, powering_off=False)       # abgebrochen (T27)
+                write_json(STATUS, status)
+                return
+            sh("systemctl", action)
+            return
+
+    token = str(wish.get("reboot") or "")
+    if token and token != last.get("reboot_done"):
+        last["reboot_done"] = token
+        # Nur einen FRISCHEN Auftrag aus der Verwaltung ausführen. Neue Karte (noch kein last.json),
+        # eingespielte Sicherung oder Auftrag von früher: nur merken, sonst startet der Pi ungewollt neu (REV-024).
+        try:
+            age = time.time() - float(token.split("-", 1)[0])
+        except ValueError:
+            age = None                                 # Auftrag aus einer älteren Version (ohne Zeit)
+        if known and age is not None and abs(age) <= REBOOT_MAX_AGE:
+            last["reboot_needed"] = False
+            write_json(STATE + "/last.json", last)
+            status.update(rebooting=True)
+            write_json(STATUS, status)
+            sh("systemctl", "reboot")
+            return
+
+    # nach einem Neustart ist die neue Treiber-Einstellung aktiv
+    boot = time.time() - float(open("/proc/uptime").read().split()[0])
+    if last.get("reboot_needed") and last.get("changed_at", 0) < boot:
+        last["reboot_needed"] = False
+    if not last.get("reboot_needed"):
+        last.pop("changed_at", None)
+
+    write_json(STATE + "/last.json", last)
+    status.update(reboot_needed=bool(last.get("reboot_needed")), connectors=connectors(),
+                  kiosk=sh("systemctl", "is-active", "--quiet", "festpos-kiosk") == 0,
+                  kiosk_installed=bool(shutil.which("cage") and shutil.which("chromium")))
+    write_json(STATUS, status)
+
+
+if __name__ == "__main__":
+    main()

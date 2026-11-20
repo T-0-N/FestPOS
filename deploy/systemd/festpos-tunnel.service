@@ -1,0 +1,37 @@
+[Unit]
+Description=FestPOS: Cloudflare Tunnel zur Gästeseite der QR-Bestellung (T22)
+Documentation=https://github.com/T-0-N/FestPOS/blob/main/deploy/ANLEITUNG.md
+Wants=network-online.target
+After=network-online.target festpos-gast.service
+# TUNNEL_TOKEN aus festpos.conf (festpos-node schreibt /etc/festpos/tunnel.env, nur für root lesbar)
+ConditionPathExists=/etc/festpos/tunnel.env
+ConditionPathExists=!/run/festpos/einrichtung
+
+[Service]
+# Eigener Benutzer (festpos-node und install-lib.sh legen ihn an): die Firewall (festpos-node.sh) lässt ihn auf diesem
+# Pi nur zum Gästedienst (127.0.0.1:8090) und sonst nur ins Internet und zum DNS – auch wenn im Cloudflare-Konto ein
+# anderes Ziel eingestellt würde (Review 2026-11, S4).
+User=festpos-tunnel
+Group=festpos-tunnel
+EnvironmentFile=/etc/festpos/tunnel.env
+# Weiterleitung nur zu http://localhost:8090 (Gästedienst) – wird im Cloudflare-Konto eingestellt (ANLEITUNG)
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+InaccessiblePaths=-/var/lib/festpos -/etc/festpos -/etc/festpos-gast -/boot -/root
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,129 @@
+#!/bin/bash
+# FestPOS – startet rqlited mit den richtigen Cluster-Argumenten.
+#
+# Regel (verhindert Split-Brain):
+#   * Knoten ist MITGLIED (Markierung .festpos-member, oder Daten/Snapshots vorhanden)
+#                                              -> ohne Join starten; die Mitglieder stehen in den Raft-Daten.
+#     Bei 3 Pi wird vorher gefragt, ob der laufende Cluster diesen Pi noch führt (festpos-rqcheck.py):
+#       - führt ihn nicht mehr (anderer Pi lief im Einzelbetrieb weiter) -> alte Daten beiseite, neu beitreten
+#       - dieser Pi war im Einzelbetrieb und die anderen laufen mit altem Stand -> NICHT starten
+#   * Gründungs-Markierung (festpos-notfall gruenden) -> einmalig neuen Cluster gründen.
+#   * CLUSTER_SIZE=1                           -> Einzel-Cluster (gründet sich selbst, falls neu).
+#   * CLUSTER_SIZE=3, nicht Mitglied           -> NUR beitreten, nie gründen – auch wenn von einem
+#                                                 gescheiterten Beitritt schon raft.db da ist.
+#
+# Wichtig: rqlite legt raft.db schon VOR dem Beitritt an. "raft.db vorhanden" heisst also nicht
+# "ist Mitglied". Früher startete ein Knoten nach gescheitertem Beitritt ohne Join und gründete dann
+# einen eigenen, leeren Cluster (Split-Brain). Deshalb gilt jetzt nur die Markierung, die erst nach
+# einem erfolgreichen Beitritt (Leader bekannt) geschrieben wird.
+#
+# Ein neuer 3er-Cluster entsteht also immer aus Pi A im Einzelbetrieb, zu dem B und C dazustossen.
+set -euo pipefail
+# Pfade überschreibbar nur für die automatischen Tests
+ENVFILE=${FESTPOS_RQ_ENVFILE:-/etc/festpos/env}
+DATA=${FESTPOS_RQ_DATA:-/var/lib/festpos/rqlite}
+FLAG=${FESTPOS_RQ_FLAG:-/var/lib/festpos/gruenden}
+BIN=${FESTPOS_RQ_BIN:-/usr/local/bin/rqlited}
+HTTP=${FESTPOS_RQ_HTTP:-127.0.0.1:4001}
+RAFT_PORT=${FESTPOS_RQ_RAFT_PORT:-4002}
+JOIN_ATTEMPTS=${FESTPOS_RQ_JOIN_ATTEMPTS:-40}          # 40 x 3 s = 2 min, dann Neustart durch systemd
+JOIN_INTERVAL=${FESTPOS_RQ_JOIN_INTERVAL:-3s}
+PEER_WAIT=${FESTPOS_RQ_PEER_WAIT:-30}                   # so lange auf Antworten der anderen Pi warten
+CHECK=${FESTPOS_RQ_CHECK:-$(dirname "$0")/festpos-rqcheck.py}
+
+# shellcheck source=festpos-conf.sh
+source "$(dirname "$0")/festpos-conf.sh"
+festpos_read_conf "$ENVFILE"
+
+ARGS=(-node-id "$FESTPOS_NODE" -http-addr "$HTTP" -raft-addr "$NODE_IP:$RAFT_PORT"
+      -fk -raft-shutdown-stepdown)
+# shellcheck disable=SC2206
+[ -n "${FESTPOS_RQ_EXTRA:-}" ] && ARGS+=($FESTPOS_RQ_EXTRA)      # nur Tests (kürzere Raft-Zeiten)
+# Verschlüsselung zwischen den Pi (RAFT_TLS=1 in festpos.conf): jeder Pi zeigt das Server-Zertifikat vor und
+# nimmt nur Pi mit einem Zertifikat derselben CA an. Ohne das könnte jeder im Netz mit Port 4002 mitlesen.
+if [ "${FESTPOS_RAFT_TLS:-0}" = 1 ]; then
+  ARGS+=(-node-cert "$FESTPOS_TLS_CERT" -node-key "$FESTPOS_TLS_KEY" -node-ca-cert "$FESTPOS_CA" -node-verify-client)
+fi
+
+# Zurückgekehrter Pi: gehören meine Daten noch zum laufenden Cluster? (REV-029)
+if [ "$CLUSTER_SIZE" = 3 ] && festpos_rq_member "$DATA"; then
+  CHECK_ARGS=(--node "$FESTPOS_NODE" --wait "$PEER_WAIT")
+  if [ -n "${FESTPOS_RQ_PEERS:-}" ]; then CHECK_ARGS+=(--peers "$FESTPOS_RQ_PEERS")      # nur Tests
+  else CHECK_ARGS+=(--peers "${FESTPOS_PEERS:-}" --self-ip "$NODE_IP" --cafile "${FESTPOS_CA:-}"); fi
+  # Wer im Einzelbetrieb lief, wartet nicht: er muss zuerst laufen, damit die anderen ihn sehen
+  [ -e "$DATA/.festpos-einzelbetrieb" ] && CHECK_ARGS+=(--einzelbetrieb --wait 0)
+  URTEIL=$(python3 "$CHECK" "${CHECK_ARGS[@]}" 2>&1 | tail -n 1) || true
+  case "${URTEIL%% *}" in
+    veraltet)
+      echo "festpos-rqlited: ${URTEIL#* }."
+      if ! ZIEL=$(festpos_rq_verwerfen "$DATA"); then
+        echo "festpos-rqlited: FEHLER – alte Daten konnten nicht beiseite gelegt werden; starte NICHT (sonst alter Stand)"
+        sleep "${FESTPOS_RQ_REFUSE_SLEEP:-30}"
+        exit 1
+      fi
+      echo "festpos-rqlited: alte Daten beiseite gelegt nach $ZIEL – trete neu bei"
+      ;;
+    fremd|konflikt)
+      echo "festpos-rqlited: ACHTUNG – ${URTEIL#* }."
+      echo "festpos-rqlited: Datenbank wird NICHT gestartet, damit nichts überschrieben wird."
+      echo "festpos-rqlited: Siehe ANLEITUNG «Notfall: nur noch ein Pi» (auf den anderen Pi: festpos-notfall neu-beitreten)."
+      sleep "${FESTPOS_RQ_REFUSE_SLEEP:-30}"
+      exit 1
+      ;;
+    ok) echo "festpos-rqlited: Prüfung: ${URTEIL#* }" ;;
+    *) echo "festpos-rqlited: Prüfung der anderen Pi nicht möglich (${URTEIL:-keine Ausgabe}) – starte normal" ;;
+  esac
+fi
+
+if festpos_rq_member "$DATA"; then
+  echo "festpos-rqlited: Mitglied eines Clusters – Start ohne Join"
+elif [ -e "$FLAG" ]; then
+  echo "festpos-rqlited: Gründungs-Markierung – gründe neuen Cluster"
+  rm -f "$FLAG"
+elif [ "$CLUSTER_SIZE" = 1 ]; then
+  echo "festpos-rqlited: Einzelbetrieb – starte/gründe Einzel-Cluster"
+else
+  echo "festpos-rqlited: noch kein Mitglied – trete bei über $JOIN_OTHERS (gründet nie selbst)"
+  ARGS+=(-join "$JOIN_OTHERS" -join-attempts "$JOIN_ATTEMPTS" -join-interval "$JOIN_INTERVAL")
+fi
+
+# Im Hintergrund, solange rqlited läuft:
+#  - Mitglieds-Markierung schreiben, sobald dieser Knoten in einem Cluster mit Leader ist (Beitritt geklappt)
+#  - Einzelbetrieb: Markierung entfernen, sobald wieder ein zweiter Pi dazugehört (dieser Pi bleibt Leader);
+#    folgt dieser Pi stattdessen einem ANDEREN Leader, hat ein alter Stand die Mehrheit -> sofort stoppen
+if [ ! -e "$DATA/.festpos-member" ] || [ -e "$DATA/.festpos-einzelbetrieb" ]; then
+  (
+    main=$$                        # nach dem exec unten ist das die PID von rqlited
+    while sleep 1; do
+      # rqlited beendet (auch als noch nicht abgeholter Zombie): nicht weiter warten
+      grep -qsE "^State:[[:space:]]+[^Z[:space:]]" "/proc/$main/status" || exit 0
+      st=$(curl -s -m 2 "http://$HTTP/status" 2>/dev/null) || continue
+      lage=$(printf '%s' "$st" | python3 -c '
+import json, sys
+s = json.load(sys.stdin)["store"]
+leader = (s.get("leader") or {}).get("node_id") or "-"
+voters = [str(n["id"]) for n in s.get("nodes") or [] if n.get("suffrage", "voter") == "voter"]
+print(s["raft"]["state"], leader, len(voters), ",".join(voters) or "-")' 2>/dev/null) || continue
+      read -r zustand leader stimmen mitglieder <<< "$lage"
+      if [ "$leader" != - ] && [[ $zustand == Leader || $zustand == Follower ]] && [ ! -e "$DATA/.festpos-member" ]; then
+        date -Is > "$DATA/.festpos-member"
+        echo "festpos-rqlited: Mitgliedschaft bestätigt"
+      fi
+      if [ -e "$DATA/.festpos-einzelbetrieb" ]; then
+        if [ "$zustand" = Leader ] && [ "${stimmen:-0}" -ge 2 ]; then
+          rm -f "$DATA/.festpos-einzelbetrieb"
+          echo "festpos-rqlited: Einzelbetrieb beendet – ein anderer Pi ist wieder im Cluster"
+        elif [ "$zustand" = Follower ] && [ "$leader" != - ] && [[ ",$mitglieder," != *",$leader,"* ]]; then
+          # Leader, der nicht einmal in der eigenen Mitgliederliste steht (also diesem Pi nie beigetreten ist):
+          # ein alter Stand hat die Mehrheit übernommen
+          echo "festpos-rqlited: ACHTUNG – Pi $leader führt mit einem ÄLTEREN Stand. Datenbank wird gestoppt," \
+               "damit die Daten aus dem Einzelbetrieb nicht überschrieben werden."
+          kill "$main" 2>/dev/null
+          exit 0
+        fi
+      fi
+      [ -e "$DATA/.festpos-member" ] && [ ! -e "$DATA/.festpos-einzelbetrieb" ] && exit 0
+    done
+  ) &
+fi
+exec "$BIN" "${ARGS[@]}" "$DATA"

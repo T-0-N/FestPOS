@@ -1,0 +1,11 @@
+[Unit]
+Description=FestPOS: Datenbank auf einen USB-Stick sichern (Ordner «festpos-sicherung»)
+After=local-fs.target rqlited.service
+# keine Startgrenze: Zeitgeber und eingesteckte Sticks starten den Dienst
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/festpos-sicherung
+TimeoutStartSec=10min
+Nice=10

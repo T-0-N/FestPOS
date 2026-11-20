@@ -1,0 +1,416 @@
+#!/opt/festpos/venv/bin/python3 -I
+"""FestPOS – automatisch auf einen USB-Stick sichern (läuft als root).
+
+  festpos-sicherung              vom Zeitgeber festpos-sicherung.timer (alle 15 Minuten) und nach dem Einstecken
+                                 eines Sticks: Stick mit dem Ordner «festpos-sicherung» suchen, eine verschlüsselte
+                                 Sicherung hineinschreiben, die letzten 20 dieses Pi behalten
+  festpos-sicherung --ordner D   stattdessen in den Ordner D sichern (z.B. ein schon eingebundenes Laufwerk)
+  festpos-sicherung --apk-holen  Fully-APK vom Stick (festpos-sicherung/fully.apk) auf diesen Pi holen
+
+Die Sicherung (app/backup.py, T8) enthält alles – Datenbank samt Zugangsdaten, Zertifikate und Schlüssel,
+CLUSTER_SECRET, Notfall-Passwort – und ist mit dem Sicherungs-Passwort verschlüsselt (Einstellung backup_password,
+in der Verwaltung druckbar). Ohne Passwort wird nichts geschrieben, nie unverschlüsselt. Nach dem Schreiben wird die
+Datei einmal zurückgelesen und entschlüsselt. Die Fully-APK legt der Pi, der sie hat, einmal unverschlüsselt daneben
+(öffentliche Datei, nur wenn sie neu ist).
+
+Nur Sticks mit dem Ordner «festpos-sicherung» werden beschrieben – ein Update-Stick oder ein privater Stick bleibt
+unberührt. Der Stick ist nur während des Schreibens eingebunden (rw, nosuid, nodev, noexec) und kann sonst jederzeit
+abgezogen werden. Ergebnis für die App: /var/lib/festpos-sicherung/status.json.
+
+Der Ordner der Fully-APK (/var/lib/festpos/fully) gehört dem Dienstbenutzer festpos. Dieses Programm liest und
+schreibt dort nur mit DESSEN Rechten (als_dienst) und folgt keiner Verknüpfung (Review 2026-11, S3): sonst könnte,
+wer die App übernimmt, root über eine Verknüpfung fremde Dateien lesen, überschreiben oder sich zuteilen lassen.
+"""
+import base64
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+sys.dont_write_bytecode = True                         # nichts als root in /opt/festpos schreiben
+DEST = Path(os.environ.get("FESTPOS_DEST", "/opt/festpos"))
+sys.path.insert(0, os.environ.get("FESTPOS_RELEASE_LIB", str(DEST)))
+from app import backup  # noqa: E402  (gehört root wie dieses Programm)
+from app.version import APP_VERSION  # noqa: E402
+
+QUELLE = os.environ.get("FESTPOS_SICHERUNG_QUELLE", "http://127.0.0.1:4001/db/backup")   # rqlite (nur lokal)
+DATEI = os.environ.get("FESTPOS_SICHERUNG_DATEI", "")       # nur Tests: Datenbank aus dieser Datei statt rqlite
+NODE_ENV = Path(os.environ.get("FESTPOS_NODE_ENV", "/etc/festpos/env"))
+MNT = Path(os.environ.get("FESTPOS_SICHERUNG_MOUNT", "/run/festpos-sicherung"))
+LOCK = Path(os.environ.get("FESTPOS_USB_LOCK", "/run/festpos-usb.lock"))   # gemeinsam mit festpos-update --usb
+SYS_BLOCK = Path(os.environ.get("FESTPOS_SYS_BLOCK", "/sys/block"))
+DEV_RE = re.compile(r"^sd[a-z]{1,3}[0-9]{0,3}$")          # USB-Speicher (sda, sdb1 …)
+_boot = os.environ.get("FESTPOS_BOOT") or ("/boot/firmware" if os.path.isdir("/boot/firmware") else "/boot")
+BOOT = Path(_boot)                                            # Update-Schlüssel (festpos-update*.pub)
+APK_DIR = Path(os.environ.get("FESTPOS_FULLY_DIR", "/var/lib/festpos/fully"))             # wie app/fully.py
+FS_TYPES = {"vfat": "vfat", "exfat": "exfat", "ntfs": "ntfs3", "ext4": "ext4", "ext3": "ext3", "ext2": "ext2"}
+DIENST = os.environ.get("FESTPOS_DIENST_USER", "festpos")      # leer: nur Tests (kein Benutzer festpos)
+
+
+@contextlib.contextmanager
+def als_dienst(aktiv: bool = True):
+    """Als root: vorübergehend mit den Rechten des Dienstbenutzers festpos (ihm gehört der APK-Ordner). Sonst
+    unverändert (Tests laufen als normaler Benutzer). Gibt es den Benutzer nicht: KeyError, nichts wird angefasst."""
+    if not aktiv or not DIENST or os.geteuid() != 0:
+        yield
+        return
+    pw = pwd.getpwnam(DIENST)
+    groups = os.getgroups()
+    os.setgroups([pw.pw_gid])
+    os.setegid(pw.pw_gid)
+    os.seteuid(pw.pw_uid)
+    try:
+        yield
+    finally:
+        os.seteuid(0)
+        os.setegid(0)
+        os.setgroups(groups)
+
+
+class Fehler(Exception):
+    """Sicherung gescheitert. code: db | password | verify | write | full | mount"""
+
+    def __init__(self, code: str, msg: str = ""):
+        super().__init__(msg or code)
+        self.code = code
+
+
+def node() -> str:
+    try:
+        m = re.search(r"^FESTPOS_NODE=['\"]?([a-z0-9]{1,8})", NODE_ENV.read_text(encoding="utf-8"), re.M)
+    except OSError:
+        m = None
+    return m.group(1) if m else "x"
+
+
+def write_status(data: dict) -> None:
+    path = backup.STATUS_FILE
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.neu")
+    tmp.unlink(missing_ok=True)
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644), "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def node_env() -> str:
+    try:
+        return NODE_ENV.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def database() -> bytes:
+    """Vollständige Datenbank vom rqlite dieses Pi (mit Zugangsdaten – sie wird verschlüsselt)."""
+    try:
+        if DATEI:
+            data = Path(DATEI).read_bytes()
+        else:
+            with urllib.request.urlopen(QUELLE, timeout=60) as r:
+                data = r.read()
+    except OSError as e:
+        raise Fehler("db", f"{type(e).__name__}: {e}") from None
+    if not data.startswith(backup.SQLITE_MAGIC):
+        raise Fehler("db", "keine SQLite-Datei")
+    return backup.no_wal(data)
+
+
+def password_of(db: bytes) -> str:
+    con = sqlite3.connect(":memory:")
+    try:
+        con.deserialize(db)
+        row = con.execute("SELECT value FROM settings WHERE key='backup_password'").fetchone()
+    except sqlite3.DatabaseError as e:
+        raise Fehler("db", str(e)) from None
+    finally:
+        con.close()
+    if not row or not row[0]:
+        raise Fehler("password", "kein Sicherungs-Passwort in der Datenbank")
+    return row[0]
+
+
+def conf_now() -> tuple[dict, Path]:
+    """CLUSTER_SECRET und Notfall-Passwort, wie die App sie benutzt (aus /etc/festpos/env), und der Ordner mit den
+    Zertifikaten."""
+    env = node_env()
+    tls = Path(os.environ.get("FESTPOS_SICHERUNG_TLS") or Path(backup.conf_value(env, "FESTPOS_TLS_CERT")
+                                                                 or "/etc/festpos/tls/server.crt").parent)
+    secret = backup.conf_value(env, "FESTPOS_CLUSTER_SECRET") or ""
+    if secret.strip() in backup.PLACEHOLDER_SECRETS:
+        try:
+            secret = backup.derived_secret((tls / "server.key").read_bytes())
+        except OSError:
+            pass
+    return {"cluster_secret": secret, "admin_password": backup.conf_value(env, "FESTPOS_ADMIN_PASSWORD") or ""}, tls
+
+
+def encrypted(now: float) -> tuple[bytes, str]:
+    """Verschlüsselte Sicherung -> (Datei, Passwort)."""
+    db = database()
+    pw = password_of(db)
+    conf, tls = conf_now()
+    return backup.pack(backup.members(db, tls, conf, BOOT), pw, node=node(), app=APP_VERSION, now=now, kind="auto"), pw
+
+
+def open_regular(path: Path, dienst: bool = False) -> int:
+    """Normale Datei zum Lesen öffnen – nie über eine Verknüpfung, kein Gerät. dienst: mit den Rechten von festpos."""
+    with als_dienst(dienst):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"{path}: keine normale Datei")
+    return fd
+
+
+def apk_checksum(path: Path, dienst: bool = False) -> str:
+    """Wie app/fully.apk_checksum: SHA-256, Base64 (URL-sicher, ohne «=»)."""
+    h = hashlib.sha256()
+    with os.fdopen(open_regular(path, dienst), "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return base64.urlsafe_b64encode(h.digest()).decode().rstrip("=")
+
+
+def apk_info(folder: Path, dienst: bool = False) -> dict | None:
+    """fully.json eines Ordners (Stick oder APK-Ordner des Pi), wenn daneben eine normale fully.apk liegt."""
+    try:
+        with os.fdopen(open_regular(folder / "fully.json", dienst), "rb") as f:
+            info = json.loads(f.read(64 * 1024).decode("utf-8"))
+        os.close(open_regular(folder / "fully.apk", dienst))
+    except (OSError, ValueError, KeyError):
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def copy_file(src: Path, dst: Path, src_dienst: bool = False, dst_dienst: bool = False) -> None:
+    """Datei kopieren: erst fertig schreiben (neu angelegt, nie über eine Verknüpfung), dann umbenennen. Die Seite im
+    Ordner des Dienstbenutzers (src_dienst bzw. dst_dienst) nur mit dessen Rechten – so entsteht die Kopie gleich
+    mit dem richtigen Besitzer, ohne chown über einen Pfad."""
+    tmp = dst.with_name(f".{dst.name}.neu")
+    fin = open_regular(src, src_dienst)
+    try:
+        with als_dienst(dst_dienst):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+            fout = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        try:
+            while chunk := os.read(fin, 1 << 20):
+                rest = memoryview(chunk)
+                while rest:                          # os.write darf weniger schreiben als verlangt (Stick voll)
+                    rest = rest[os.write(fout, rest):]
+            with contextlib.suppress(OSError):          # FAT kennt keine Rechte
+                os.fchmod(fout, 0o644)
+            os.fsync(fout)
+        finally:
+            os.close(fout)
+        with als_dienst(dst_dienst):
+            os.replace(tmp, dst)
+    finally:
+        os.close(fin)
+
+
+def apk_to_stick(folder: Path) -> str | None:
+    """Fully-APK einmal auf den Stick legen (nur wenn sie dort fehlt oder anders ist). Fehler sind nicht schlimm:
+    die Sicherung ist dann trotzdem geschrieben."""
+    here = apk_info(APK_DIR, dienst=True)
+    if not here:
+        return None
+    there = apk_info(folder)
+    if there and there.get("checksum") == here.get("checksum"):
+        return here.get("checksum")
+    try:
+        copy_file(APK_DIR / "fully.apk", folder / "fully.apk", src_dienst=True)
+        copy_file(APK_DIR / "fully.json", folder / "fully.json", src_dienst=True)
+    except (OSError, KeyError) as e:
+        print(f"Fully-APK nicht auf den Stick kopiert: {type(e).__name__}", file=sys.stderr)
+        return None
+    return here.get("checksum")
+
+
+def apk_from(folder: Path) -> bool:
+    """Fully-APK vom Stick holen, wenn ihre Prüfsumme stimmt."""
+    info = apk_info(folder)
+    if not info or apk_checksum(folder / "fully.apk") != info.get("checksum"):
+        return False
+    try:
+        with als_dienst():
+            APK_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+        copy_file(folder / "fully.apk", APK_DIR / "fully.apk", dst_dienst=True)
+        copy_file(folder / "fully.json", APK_DIR / "fully.json", dst_dienst=True)
+    except (OSError, KeyError) as e:
+        print(f"Fully-APK nicht geholt: {type(e).__name__}: {e}", file=sys.stderr)
+        return False
+    return True
+
+
+def write_into(folder: Path, data: bytes, now: float, password: str | None = None) -> str:
+    """Sicherung in den Ordner schreiben (erst ganz, dann umbenennen), zurücklesen und entschlüsseln (password),
+    Ältere dieses Pi über KEEP löschen."""
+    st = os.lstat(folder)
+    if not stat.S_ISDIR(st.st_mode):
+        raise Fehler("write", f"{folder} ist kein Ordner")
+    free = os.statvfs(folder)
+    if free.f_bavail * free.f_frsize < 2 * len(data) + 1024 * 1024:
+        raise Fehler("full")
+    name = backup.file_name(node(), now)
+    tmp = folder / f".{name}.neu"
+    try:
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if password is not None:
+            try:
+                ok = tmp.read_bytes() == data and "festpos.sqlite" in backup.unpack(data, password)
+            except (OSError, ValueError):
+                ok = False
+            if not ok:
+                raise Fehler("verify", "zurückgelesen nicht lesbar")
+        os.replace(tmp, folder / name)
+        dfd = os.open(folder, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        for old in backup.to_delete(os.listdir(folder), node()):
+            (folder / old).unlink(missing_ok=True)
+    except (OSError, Fehler) as e:
+        tmp.unlink(missing_ok=True)
+        if isinstance(e, Fehler):
+            raise
+        raise Fehler("write", f"{type(e).__name__}: {e}") from None
+    return name
+
+
+def candidates() -> list[str]:
+    """Partitionen (oder ganze Sticks ohne Partitionstabelle) an USB, die nicht vom System benutzt werden."""
+    try:
+        disks = sorted(e.name for e in os.scandir(SYS_BLOCK) if DEV_RE.match(e.name))
+    except OSError:
+        return []
+    mounted = mounts()
+    out = []
+    for disk in disks:
+        if "/usb" not in os.path.realpath(SYS_BLOCK / disk):
+            continue
+        if any(src.startswith(f"/dev/{disk}") and (target == "/" or target.startswith("/boot")) for src, target in mounted):
+            continue                                       # Pi startet von dieser USB-SSD
+        parts = sorted(e.name for e in os.scandir(SYS_BLOCK / disk) if e.name.startswith(disk) and DEV_RE.match(e.name))
+        out += [p for p in (parts or [disk]) if not any(src == f"/dev/{p}" for src, _ in mounted)]
+    return out
+
+
+def mounts() -> list[tuple[str, str]]:
+    try:
+        with open("/proc/self/mounts", encoding="utf-8") as f:
+            return [(ln.split()[0], ln.split()[1]) for ln in f if len(ln.split()) > 1]
+    except OSError:
+        return []
+
+
+def on_stick(fn) -> dict | None:
+    """Ersten Stick mit dem Ordner suchen, einbinden, fn(Ordner) aufrufen -> dessen Ergebnis (None: kein Stick)."""
+    for dev in candidates():
+        fs = subprocess.run(["blkid", "-o", "value", "-s", "TYPE", f"/dev/{dev}"], capture_output=True, text=True,
+                            timeout=20).stdout.strip()
+        if fs not in FS_TYPES:
+            continue
+        mnt = MNT / dev
+        mnt.mkdir(mode=0o700, parents=True, exist_ok=True)
+        r = subprocess.run(["mount", "-t", FS_TYPES[fs], "-o", "rw,nosuid,nodev,noexec,noatime", f"/dev/{dev}", str(mnt)],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            mnt.rmdir()
+            continue
+        try:
+            folder = mnt / backup.STICK_DIR
+            if not folder.is_dir() or folder.is_symlink():
+                continue
+            res = fn(folder)
+            if res is not None:
+                return {**res, "device": dev}
+        finally:
+            subprocess.run(["umount", str(mnt)], capture_output=True, timeout=60)
+            try:
+                mnt.rmdir()
+            except OSError:
+                subprocess.run(["umount", "-l", str(mnt)], capture_output=True, timeout=20)
+    return None
+
+
+def into(folder: Path, now: float) -> dict:
+    data, pw = encrypted(now)
+    name = write_into(folder, data, now, pw)
+    return {"state": "ok", "file": name, "size": len(data), "apk": apk_to_stick(folder)}
+
+
+def to_stick(now: float) -> dict:
+    """Ersten Stick mit dem Ordner suchen und hineinsichern. -> {state, file, size} (no_stick, wenn keiner da ist)."""
+    return on_stick(lambda folder: into(folder, now)) or {"state": "no_stick"}
+
+
+def apk_holen(target) -> int:
+    """--apk-holen: 0 = geholt, 3 = kein Stick mit einer gültigen fully.apk."""
+    if target is not None:
+        return 0 if apk_from(Path(target)) else 3
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        res = on_stick(lambda folder: {} if apk_from(folder) else None)
+    print("Fully-APK vom Stick geholt" if res is not None else "Keine gültige fully.apk auf einem Stick gefunden")
+    return 0 if res is not None else 3
+
+
+def run(target) -> int:
+    now = time.time()
+    before = backup.read_status() or {}
+    out = {"at": int(now), "last_ok": before.get("last_ok"), "file": before.get("file")}
+    try:
+        if target is None:
+            LOCK.parent.mkdir(parents=True, exist_ok=True)
+            with open(LOCK, "w") as lock:                  # nicht gleichzeitig mit festpos-update --usb
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                res = to_stick(now)
+        else:
+            res = into(Path(target), now)
+    except Fehler as e:
+        out.update(state="failed", code=e.code)
+        print(f"Sicherung gescheitert ({e.code}): {e}", file=sys.stderr)
+        write_status(out)
+        return 2
+    out.update(res)
+    if res["state"] == "ok":
+        out["last_ok"] = int(now)
+        print(f"Sicherung geschrieben: {res['file']} ({res['size'] // 1024} KB)")
+    else:
+        print(f"Kein Stick mit dem Ordner «{backup.STICK_DIR}» – nichts gesichert.")
+    write_status(out)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) == 1:
+        return run(None)
+    if len(argv) == 3 and argv[1] == "--ordner":
+        return run(argv[2])
+    if argv[1:2] == ["--apk-holen"] and len(argv) <= 3:
+        return apk_holen(argv[2] if len(argv) == 3 else None)
+    print(__doc__.split("\n\n")[1], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

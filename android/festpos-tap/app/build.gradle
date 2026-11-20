@@ -1,0 +1,47 @@
+plugins {
+    id "com.android.application"
+}
+
+// Version aus der Datei VERSION von FestPOS (1.2.3 bzw. 1.2.3-rc.4): versionCode steigt mit jeder Version, eine
+// Testversion liegt vor der fertigen (1.2.3-rc.4 -> 1020304, 1.2.3 -> 1020399). Das frühere Format gibt 1.
+def festposVersion = new File(rootDir, "../../VERSION").text.trim()
+def festposMatch = festposVersion =~ /^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$/
+def festposCode = 1
+if (festposMatch.matches()) {
+    festposCode = festposMatch.group(1).toInteger() * 1000000 + festposMatch.group(2).toInteger() * 10000 +
+        festposMatch.group(3).toInteger() * 100 + (festposMatch.group(4) ? festposMatch.group(4).toInteger() : 99)
+}
+
+android {
+    namespace "ch.festpos.tap"
+    compileSdk 34
+    defaultConfig {
+        applicationId "ch.festpos.tap"
+        minSdk 26                  // wie die Payrexx-SDK
+        targetSdk 34
+        versionCode festposCode
+        versionName festposVersion
+    }
+    // Signieren: mit dem Schlüssel aus den Umgebungsvariablen (CI-Secrets), sonst Debug-Schlüssel (nur zum Testen)
+    signingConfigs {
+        release {
+            def ks = System.getenv("FESTPOS_TAP_KEYSTORE")
+            if (ks) {
+                storeFile file(ks)
+                storePassword System.getenv("FESTPOS_TAP_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("FESTPOS_TAP_KEY_ALIAS")
+                keyPassword System.getenv("FESTPOS_TAP_KEY_PASSWORD")
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig System.getenv("FESTPOS_TAP_KEYSTORE") ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

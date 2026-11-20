@@ -1,0 +1,16 @@
+[Unit]
+Description=FestPOS: DHCP für die Handys (feste Zuteilungen aus der Verwaltung)
+After=network-online.target festpos-node.service
+Wants=network-online.target
+# DHCP=1 in festpos.conf: festpos-node schreibt die Datei; sonst bleibt der Dienst aus
+ConditionPathExists=/etc/festpos/dnsmasq.conf
+
+[Service]
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/festpos/dnsmasq.conf --log-facility=-
+# neue feste Zuteilungen (festpos-dhcp-reload): gelöschte und geänderte liest dnsmasq nur so neu
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

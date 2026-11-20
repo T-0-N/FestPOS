@@ -1,0 +1,79 @@
+#!/bin/bash
+# FestPOS – neue Zertifikate (aus make-certs.sh) auf diesem Pi einspielen, ohne die Karte herauszunehmen.
+#
+#   sudo festpos-zertifikate ~/festpos/deploy/festpos-tls
+#
+# Prüft die Dateien (Server-Zertifikat passt zur CA und zum Schlüssel, alle Pi-Adressen enthalten), sichert die
+# bisherigen auf der Boot-Partition (festpos-tls.alt-<Zeit>), kopiert die neuen und wendet sie sofort an.
+# Im Cluster auf JEDEM Pi ausführen (alle Pi brauchen dieselben Dateien). ca.key wird nie kopiert.
+set -euo pipefail
+SRC=${1:-}
+[ -n "$SRC" ] && [ -d "$SRC" ] || { echo "Aufruf: sudo $0 ORDNER   (z.B. ~/festpos/deploy/festpos-tls)"; exit 2; }
+[ "$(id -u)" = 0 ] || { echo "Bitte mit sudo ausführen"; exit 1; }
+BOOT=/boot/firmware; [ -d "$BOOT" ] || BOOT=/boot
+# shellcheck source=festpos-conf.sh
+source "$(dirname "$0")/festpos-conf.sh"
+festpos_read_conf "$BOOT/festpos.conf"
+die() { echo "FEHLER: $*"; echo "Nichts geändert."; exit 1; }
+
+for f in ca.crt server.crt server.key device-ca.crt; do [ -f "$SRC/$f" ] || die "$f fehlt in $SRC"; done
+[ -f "$SRC/ca.key" ] && echo "HINWEIS: $SRC/ca.key wird NICHT kopiert (gehört nicht auf die Karte) – dort löschen."
+openssl verify -CAfile "$SRC/ca.crt" "$SRC/server.crt" >/dev/null 2>&1 || die "server.crt ist nicht von dieser ca.crt ausgestellt"
+[ "$(openssl x509 -in "$SRC/server.crt" -noout -pubkey | sha256sum)" = "$(openssl pkey -in "$SRC/server.key" -pubout | sha256sum)" ] ||
+  die "server.key passt nicht zu server.crt"
+for v in VIP NODE_A_IP NODE_B_IP NODE_C_IP; do
+  openssl x509 -in "$SRC/server.crt" -noout -checkip "${!v}" | grep -q "does match" || die "server.crt gilt nicht für $v=${!v}"
+done
+if [ -f "$BOOT/festpos-tls/ca.crt" ] && ! cmp -s "$SRC/ca.crt" "$BOOT/festpos-tls/ca.crt"; then
+  echo "ACHTUNG: Das ist eine ANDERE Server-CA. Danach kommen Handys und PCs erst wieder auf die App, wenn dort"
+  echo "         die neue ca.crt installiert ist (http://$VIP/ca.crt). Neu: $(openssl x509 -in "$SRC/ca.crt" -noout -subject)"
+  read -r -p "Trotzdem einspielen? 'JA' tippen: " a
+  [ "$a" = JA ] || die "abgebrochen"
+fi
+if [ -f "$BOOT/festpos-tls/device-ca.crt" ] && ! cmp -s "$SRC/device-ca.crt" "$BOOT/festpos-tls/device-ca.crt"; then
+  echo "ACHTUNG: Das ist eine ANDERE Geräte-CA. Danach kommen alle Handys erst wieder mit neuen Gerätezertifikaten auf die App."
+  read -r -p "Trotzdem einspielen? 'JA' tippen: " a
+  [ "$a" = JA ] || die "abgebrochen"
+fi
+
+# Neuer Server-Schlüssel und CLUSTER_SECRET noch der Platzhalter: das bisher abgeleitete Geheimnis festschreiben
+# (jeder Pi rechnet es aus demselben alten Schlüssel) – sonst wären die Prüfsummen im Kassenbuch nicht mehr prüfbar
+if [ -f "$BOOT/festpos-tls/server.key" ] && ! cmp -s "$SRC/server.key" "$BOOT/festpos-tls/server.key" &&
+    festpos_secret_fix "$BOOT/festpos.conf" "$BOOT/festpos-tls/server.key"; then
+  (festpos_read_conf "$BOOT/festpos.conf" >/dev/null 2>&1
+   tmp=$(mktemp /etc/festpos/env.XXXXXX)
+   grep -v '^FESTPOS_CLUSTER_SECRET=' /etc/festpos/env > "$tmp" || true
+   festpos_env_line FESTPOS_CLUSTER_SECRET "$CLUSTER_SECRET" >> "$tmp"
+   chown root:festpos "$tmp"; chmod 0640 "$tmp"; mv "$tmp" /etc/festpos/env)
+  echo "CLUSTER_SECRET in festpos.conf festgeschrieben (aus dem bisherigen Schlüssel, Prüfsummen bleiben prüfbar)."
+fi
+
+if [ -d "$BOOT/festpos-tls" ]; then
+  ALT="$BOOT/festpos-tls.alt-$(date +%Y%m%d-%H%M%S)"
+  cp -a "$BOOT/festpos-tls" "$ALT"
+  echo "Bisherige Zertifikate gesichert: $ALT"
+fi
+install -d "$BOOT/festpos-tls"
+for f in ca.crt server.crt server.key device-ca.crt device-ca.key; do
+  [ -f "$SRC/$f" ] && install -m 0600 "$SRC/$f" "$BOOT/festpos-tls/$f"
+done
+rm -f "$BOOT/festpos-tls/ca.key"
+sync
+
+echo "==> Anwenden"
+# Nur die Zertifikate (wie festpos-node beim Start) – nicht das ganze festpos-node, das z.B. die Datenbank
+# beiseite legen könnte, während sie läuft
+ETC=/etc/festpos/tls
+install -d -m 0750 -o root -g festpos "$ETC"
+install -m 0644 "$BOOT/festpos-tls/server.crt" "$BOOT/festpos-tls/ca.crt" "$BOOT/festpos-tls/device-ca.crt" "$ETC/"
+install -m 0640 -o root -g festpos "$BOOT/festpos-tls/server.key" "$ETC/"
+if [ -f "$BOOT/festpos-tls/device-ca.key" ]; then
+  install -m 0640 -o root -g festpos "$BOOT/festpos-tls/device-ca.key" "$ETC/"
+else
+  rm -f "$ETC/device-ca.key"
+fi
+systemctl restart festpos festpos-redirect
+grep -q '^FESTPOS_PHONE_CERTS="0"' /etc/festpos/env 2>/dev/null &&
+  echo "HINWEIS: Gerätezertifikate waren aus (device-ca fehlte) – einmal neu starten, damit sie wieder geprüft werden."
+echo "Fertig. Server-CA auf diesem Pi:"
+openssl x509 -in "$BOOT/festpos-tls/ca.crt" -noout -subject -fingerprint -sha256

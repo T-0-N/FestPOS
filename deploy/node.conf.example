@@ -1,0 +1,5 @@
+# FestPOS – Rolle dieser Karte. Liegt auf der Boot-Partition (/boot/firmware/node.conf).
+# Einziger Unterschied zwischen den Karten: a, b oder c.
+NODE=a
+# Nur falls dieser Pi eine andere RTC-Batterie hat als in festpos.conf angegeben (1 = aufladbare SC1163, 0 = keine/CR2032):
+# RTC_AKKU=0

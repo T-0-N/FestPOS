@@ -1,0 +1,6 @@
+﻿name;preis;kategorie;drucker;einzelbon;sort;aktiv;optionen;freitext;farbe;lieferzeit
+Bier 5dl;6.50;Getränke;Getränkeausgabe;0;1;1;;0;#e0a800;
+Mineral 5dl;4.00;Getränke;Getränkeausgabe;0;2;1;;0;;
+Kaffee;3.50;Getränke;Getränkeausgabe;0;3;1;"Zucker*: ohne|1 Zucker|2 Zucker; Milch: mit Milch|ohne Milch";1;#8a6d3b;ja
+Bratwurst mit Bürli;8.00;Essen;Küche;1;1;1;"Sauce+: Senf|Ketchup|ohne Sauce";0;;Pflicht
+Pommes;5.00;Essen;Küche;0;2;1;;1;;Pause|Schluss

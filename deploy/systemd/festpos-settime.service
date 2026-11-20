@@ -1,0 +1,9 @@
+[Unit]
+Description=FestPOS: Uhrzeit nach Auftrag der App setzen
+# keine Startgrenze: sonst schaltet systemd den Zeit-Dienst nach vielen Aufträgen bis zum Neustart ab
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/festpos-settime --anfrage
+TimeoutStartSec=30

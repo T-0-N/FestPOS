@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FestPOS Tap</string>
+    <string name="wait">Zahlung läuft … Karte oder Handy an das Gerät halten.</string>
+    <string name="report">Ergebnis wird an FestPOS gemeldet …</string>
+    <string name="no_payrexx">Payrexx-App fehlt – im Play Store «Payrexx Tap to Pay» installieren.</string>
+</resources>

@@ -1,0 +1,15 @@
+[Unit]
+Description=FestPOS: Drucker-Netz (VLAN-Schnittstelle der Drucker) einrichten
+# bei jedem Start einmal (NODE_IP kann sich mit der Karte geändert haben) und nach jeder Änderung in der Verwaltung
+After=festpos-node.service NetworkManager.service
+Wants=NetworkManager.service
+# keine Startgrenze: sonst schaltet systemd das Übernehmen nach vielen Änderungen bis zum Neustart ab
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/festpos-druckernetz
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=FestPOS: Update vom USB-Stick (%I)
+After=dev-%i.device local-fs.target
+
+[Service]
+Type=oneshot
+# Stick nur lesend einbinden, festpos.zip + festpos.zip.sig kopieren, wieder lösen, Signatur prüfen
+ExecStart=/usr/local/sbin/festpos-update --usb %I
+# Stick mit dem Ordner «festpos-sicherung»: gleich jetzt sichern, nicht erst beim nächsten Zeitgeber
+ExecStartPost=-/bin/systemctl start --no-block festpos-sicherung.service
+TimeoutStartSec=50min

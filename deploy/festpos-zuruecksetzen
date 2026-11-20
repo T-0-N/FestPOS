@@ -1,0 +1,116 @@
+#!/bin/bash
+# FestPOS – Konfiguration und Zertifikate auf Werkszustand zurücksetzen.
+#
+#   * festpos.conf wird aus festpos.conf.example neu erstellt.
+#     Übernommen werden ADMIN_PASSWORD, CLUSTER_SECRET und die Netzwerkeinstellungen
+#     (NET_PREFIX, NET_CIDR, IFACE, VIP, NODE_*_IP, VRRP_ID, CLUSTER_SIZE, SSH_FROM, ADMIN_FROM) – Zeilen 1:1 aus der alten Datei.
+#   * Alle Zertifikate werden neu erzeugt (Server-CA, Geräte-CA, Server-Zertifikat, je 30 Jahre).
+#     -> Alle bisherigen Geräte (Handys, PC) sind damit draussen und brauchen ein neues Zertifikat.
+#   * Die Geräteliste in der Verwaltung wird geleert.
+#   * Produkte, Kategorien, Drucker, Tische, Bestellungen und Einstellungen bleiben.
+#   * Vorher wird alles nach /root/festpos-backup-DATUM/ gesichert.
+#
+# Aufruf auf dem Pi, im Ordner mit make-certs.sh:
+#   cd ~/festpos-neu/deploy && sudo bash festpos-zuruecksetzen
+set -euo pipefail
+
+BOOT=${BOOT:-/boot/firmware}
+HERE=$(cd "$(dirname "$0")" && pwd)
+RQLITE=${RQLITE:-http://127.0.0.1:4001}
+BACKUP=${BACKUP:-/root/festpos-backup-$(date +%Y%m%d-%H%M%S)}
+
+[ "$(id -u)" = 0 ] || { echo "Bitte mit sudo ausführen."; exit 1; }
+[ -f "$HERE/festpos.conf.example" ] && [ -f "$HERE/make-certs.sh" ] \
+  || { echo "festpos.conf.example / make-certs.sh nicht gefunden in $HERE"; exit 1; }
+[ -f "$BOOT/festpos.conf" ] || { echo "$BOOT/festpos.conf fehlt – nichts zu übernehmen."; exit 1; }
+
+OLD=$BOOT/festpos.conf
+KEEP='ADMIN_PASSWORD|CLUSTER_SECRET|NET_PREFIX|NET_CIDR|IFACE|VIP|NODE_A_IP|NODE_B_IP|NODE_C_IP|VRRP_ID|CLUSTER_SIZE|SSH_FROM|ADMIN_FROM|RAFT_TLS'
+KEPT=$(tr -d '\r' < "$OLD" | grep -E "^($KEEP)=" || true)
+for k in ADMIN_PASSWORD CLUSTER_SECRET; do
+  grep -q "^$k=" <<<"$KEPT" || { echo "$k fehlt in $OLD – Abbruch."; exit 1; }
+done
+case "$KEPT" in
+  *bitte-aendern*) echo "WARNUNG: Passwort/Geheimnis steht noch auf 'bitte-aendern'." ;;
+esac
+
+cat <<TXT
+
+FestPOS zurücksetzen:
+  - festpos.conf  -> Standard, Passwort, Geheimnis und Netzwerk/IPs werden übernommen
+  - Zertifikate   -> alle neu (alle Handys und der PC brauchen danach neue Zertifikate
+                     und die neue ca.crt)
+  - Geräteliste   -> geleert
+  - Daten (Produkte, Bestellungen, Einstellungen) bleiben
+  - Sicherung     -> $BACKUP
+
+TXT
+read -r -p "Wirklich zurücksetzen? Tippe JA: " ok
+[ "$ok" = "JA" ] || { echo "Abgebrochen."; exit 1; }
+
+echo "== Sicherung nach $BACKUP"
+install -d -m 0700 "$BACKUP"
+cp -a "$OLD" "$BACKUP/festpos.conf"
+[ -d "$BOOT/festpos-tls" ] && cp -a "$BOOT/festpos-tls" "$BACKUP/boot-festpos-tls"
+[ -d "$HERE/festpos-tls" ] && mv "$HERE/festpos-tls" "$BACKUP/deploy-festpos-tls"
+if curl -sf -o "$BACKUP/datenbank.sqlite" "$RQLITE/db/backup"; then
+  echo "   Datenbank gesichert"
+else
+  echo "   WARNUNG: Datenbank nicht erreichbar – keine DB-Sicherung"
+fi
+
+echo "== Neue festpos.conf"
+NEW=$(mktemp)
+KEPT=$KEPT awk '
+  BEGIN { n = split(ENVIRON["KEPT"], l, "\n"); for (i = 1; i <= n; i++) { k = l[i]; sub(/=.*/, "", k); keep[k] = l[i] } }
+  { k = $0; sub(/=.*/, "", k); if (k in keep) { print keep[k]; next } print }' "$HERE/festpos.conf.example" > "$NEW"
+install -m 0644 "$NEW" "$OLD"
+rm -f "$NEW"
+echo "   Unterschiede zur alten Datei (ausser Kommentaren):"
+diff <(tr -d '\r' < "$BACKUP/festpos.conf" | grep -vE '^\s*(#|$)') <(grep -vE '^\s*(#|$)' "$OLD") \
+  | sed 's/^/     /' || true
+
+# Prüfsummen und Anmeldungen hängen sonst am alten server.key (Platzhalter bei CLUSTER_SECRET): festschreiben
+# shellcheck source=festpos-conf.sh
+source "$HERE/festpos-conf.sh"
+if festpos_secret_fix "$OLD" "$BOOT/festpos-tls/server.key"; then
+  echo "   CLUSTER_SECRET festgeschrieben (aus dem bisherigen Schlüssel) – bei 3 Pi diese festpos.conf auf alle Karten"
+fi
+
+echo "== Neue Zertifikate"
+cd "$HERE"
+SUDO_USER_HOME=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)
+CA_DIR="$SUDO_USER_HOME/festpos-ca"                  # ca.key ausserhalb des Projektordners (REV-026)
+FESTPOS_CA_DIR="$CA_DIR" bash make-certs.sh "$OLD" --neue-ca | sed 's/^/   /'
+install -d "$BOOT/festpos-tls"
+for f in ca.crt server.crt server.key device-ca.crt device-ca.key; do
+  install -m 0600 "festpos-tls/$f" "$BOOT/festpos-tls/"
+done
+rm -f "$BOOT/festpos-tls/ca.key"
+chown -R "${SUDO_USER:-root}:" "festpos-tls" "$CA_DIR"
+cp festpos-tls/ca.crt "$SUDO_USER_HOME/festpos-ca.crt"
+chown "${SUDO_USER:-root}:" "$SUDO_USER_HOME/festpos-ca.crt"
+
+echo "== Geräteliste leeren"
+if curl -sf -XPOST "$RQLITE/db/execute" -H 'Content-Type: application/json' \
+     -d '["DELETE FROM device_certs"]' >/dev/null; then
+  echo "   erledigt"
+else
+  echo "   WARNUNG: Datenbank nicht erreichbar – Geräte in der Verwaltung von Hand entfernen"
+fi
+
+cat <<TXT
+
+Fertig. Jetzt:
+  1. sudo reboot
+  2. Neue CA auf den PC holen:  scp pi@<IP>:~/festpos-ca.crt .
+     und auf jedem Handy/PC die alte "FestPOS Lokale CA" entfernen, die neue installieren.
+  3. Alte Gerätezertifikate auf Handys/PC löschen, in der Verwaltung neue ausstellen.
+
+  4. Bei 3 Pi: den Ordner $HERE/festpos-tls auf die anderen Pi kopieren und dort
+     sudo festpos-zertifikate <Ordner>  ausführen (alle Pi brauchen dieselben Zertifikate).
+
+  ca.key liegt in $CA_DIR – auf einen USB-Stick kopieren und vom Pi löschen.
+  Die neue CA ist auch unter http://<VIP>/ca.crt abrufbar (zum Installieren auf den Handys).
+  Alles Alte liegt in $BACKUP.
+TXT

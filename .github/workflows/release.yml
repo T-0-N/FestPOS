@@ -1,0 +1,90 @@
+# FestPOS – Release zu einem Tag vX.Y.Z (Testversion: vX.Y.Z-rc.N): alles prüfen, dann Update-Paket, Image und
+# Android-App bauen und einen Release-ENTWURF mit allen Dateien anlegen. Veröffentlicht wird von Hand, erst nachdem
+# festpos.zip signiert und festpos.zip.sig angehängt ist (die CI hat keinen Update-Schlüssel). Testversionen werden
+# als «Pre-release» angelegt: «Update aus dem Internet» und der Imager (releases/latest) nehmen sie nie.
+
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+# Actions sind auf Commit-Nummern festgelegt (Review 2026-11, D4): ein verschobenes Tag «v4» bringt so keinen fremden
+# Code in den Bau. Erneuern: git ls-remote https://github.com/<action> 'refs/tags/v4' 'refs/tags/v4^{}'
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  pruefen:
+    uses: ./.github/workflows/ci.yml
+
+  zip:
+    needs: pruefen
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.13"
+      - name: Tag und VERSION stimmen überein, Format gültig
+        run: |
+          v=$(tr -d '[:space:]' < VERSION)
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "::error::Tag $GITHUB_REF_NAME, VERSION $v"; exit 1; }
+          python3 -c "import sys; sys.path.insert(0, '.'); from app.release import version_key; sys.exit(0 if version_key('$v') and version_key('$v')[0] == 1 else 1)"
+      - name: Projekt-Schlüssel vorhanden (sonst nähmen Pi aus dem Image keine Updates an)
+        run: |
+          python3 -c "import sys; sys.path.insert(0, '.'); from app.release import parse_key_line; \
+          k = parse_key_line(open('deploy/festpos-update-projekt.pub').read()); print('Projekt-Schlüssel', k.fp)"
+      - name: festpos.zip bauen (Python-Pakete und rqlite mit Prüfsumme)
+        run: python tools/build_zip.py
+      - name: Aufbau wie auf dem Pi prüfen
+        run: python -c "import sys; sys.path.insert(0, '.'); from app.release import inspect_zip; print(inspect_zip('dist/festpos.zip'))"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: festpos-zip
+          path: dist/festpos.zip
+          retention-days: 14
+
+  apk:
+    needs: pruefen
+    uses: ./.github/workflows/android.yml
+    with:
+      release: true
+    secrets: inherit
+
+  image:
+    needs: pruefen
+    uses: ./.github/workflows/image.yml
+
+  entwurf:
+    needs: [zip, apk, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Prüfsummen und Release-Text
+        run: |
+          (cd out && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          python3 tools/release_notes.py "$GITHUB_REF_NAME" > notes.md
+      - name: Release-Entwurf anlegen (veröffentlicht wird von Hand, nach dem Signieren)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          pre=""
+          case "$TAG" in *-rc.*) pre="--prerelease" ;; esac
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft $pre --verify-tag --title "FestPOS ${TAG#v}" --notes-file notes.md
+          fi
+          gh release upload "$TAG" out/* --clobber
+          echo "::notice::Entwurf $TAG angelegt: festpos.zip herunterladen, signieren, festpos.zip.sig anhängen, dann veröffentlichen"

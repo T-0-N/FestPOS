@@ -1,0 +1,13 @@
+# Nur Werkzeug-Einstellungen (FestPOS wird nicht als Paket installiert).
+[tool.ruff]
+line-length = 130
+target-version = "py313"
+extend-exclude = ["deploy/wheels"]
+
+[tool.ruff.lint]
+# Pyflakes (unbenutzte/undefinierte Namen), Syntaxfehler, einige Bugbear-Regeln
+select = ["F", "E9", "B006", "B007", "B012", "B023", "B904"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"

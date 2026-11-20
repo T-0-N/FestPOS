@@ -1,0 +1,13 @@
+[Unit]
+Description=FestPOS: SD-Karte im USB-Kartenleser schreiben (Verwaltung › Pi & Netz, T10)
+
+[Service]
+Type=oneshot
+# Auftrag legt festpos-karte --auftrag ab (über festpos-wiederherstellen); Abbrechen = systemctl stop
+ExecStart=/usr/local/sbin/festpos-karte --schreiben
+TimeoutStartSec=60min
+TimeoutStopSec=90
+KillMode=mixed
+# Pi A arbeitet weiter: niedrigste Priorität für Rechnen und Lesen/Schreiben
+Nice=19
+IOSchedulingClass=idle

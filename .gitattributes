@@ -1,0 +1,16 @@
+# Zeilenenden: im Repository und beim Auschecken immer LF – auch unter Windows (core.autocrlf=true).
+# Sonst landen CRLF im Update-Paket, und auf dem Pi laufen Shell-Skripte und systemd-Dateien nicht mehr
+# («set: pipefail\r: invalid option name»). tools/build_zip.py und der Pi lehnen solche Pakete ab.
+* text=auto eol=lf
+
+# Preisliste-Vorlagen für Excel: bleiben genau so (CRLF)
+*.csv -text
+
+# Binärdateien
+*.png binary
+*.webp binary
+*.woff2 binary
+*.whl binary
+*.docx binary
+*.zip binary
+*.deb binary

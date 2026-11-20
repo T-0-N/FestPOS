@@ -1,0 +1,21 @@
+[Unit]
+Description=FestPOS: rqlite (replizierte Datenbank, Raft)
+After=festpos-node.service network-online.target
+Wants=network-online.target
+Requires=festpos-node.service
+ConditionPathExists=!/run/festpos/einrichtung
+
+[Service]
+User=festpos
+Group=festpos
+EnvironmentFile=/etc/festpos/env
+# HTTP-API nur lokal; Raft (inkl. Weiterleitung an den Leader) über die Knoten-IP.
+# festpos-rqlited entscheidet: bestehende Daten -> normal starten; leere Karte -> gründen
+# (nur Einzelbetrieb) oder beitreten (Cluster). Siehe Kommentar im Skript.
+ExecStart=/usr/local/sbin/festpos-rqlited
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

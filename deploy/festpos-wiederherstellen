@@ -1,0 +1,474 @@
+#!/opt/festpos/venv/bin/python3 -I
+"""FestPOS – Aufträge der Verwaltung, die root brauchen (T8): Schlüssel aus einer Sicherung zurückschreiben,
+Kartenpaket bauen, Pi A auf 3 Pi umstellen, Fully-APK vom USB-Stick holen.
+
+  festpos-wiederherstellen --anfrage    vom Dienst festpos-wiederherstellen.path: Aufträge der App ausführen
+
+Die App legt pro Auftrag «auftrag-<id>.json» in /run/festpos/wiederherstellen ab (app/cards.py); systemd startet
+dieses Programm, solange dort etwas liegt (DirectoryNotEmpty). Die Antwort steht in
+/run/festpos/wiederherstellen-ergebnis/<id>.json, ein Kartenpaket daneben als <id>.zip (nur root und Gruppe festpos).
+
+Aufträge:
+  keys        Zertifikate/Schlüssel (festpos-tls), CLUSTER_SECRET und Notfall-Passwort aus einer Sicherung auf die
+              Boot-Partition schreiben (nur Einzelbetrieb), die bisherigen daneben behalten, dann neu starten –
+              festpos-node übernimmt sie beim Start wie bei jeder Karte. Update-Schlüssel (festpos-update*.pub) kommen
+              so NIE auf den Pi: sonst brächte ein gestohlenes Admin-Passwort eigenen Code als root auf die Pi
+              (Review 2026-11, S2). Sie kommen nur bei der Ersteinrichtung oder von Hand auf die Boot-Partition.
+  kartenpaket ZIP mit einem Ordner pro Karte (festpos.conf mit CLUSTER_SIZE=3, node.conf, festpos-tls, Update-Schlüssel)
+  cluster3    CLUSTER_SIZE=3 in festpos.conf (nur aus dem Einzelbetrieb), dann neu starten
+  apk         Fully-APK vom USB-Stick holen (festpos-sicherung --apk-holen)
+  karten, karte_schreiben, karte_abbrechen
+              SD-Karte im USB-Kartenleser (T10): an festpos-karte weitergeben (Liste, Auftrag, Abbrechen)
+  einrichtung, einrichtung_neustart
+              Ersteinrichtung im Browser (T11), nur ohne festpos.conf: festpos.conf, node.conf und festpos-tls/
+              schreiben (neu, aus einer Sicherung oder aus dem Kartenpaket), dann neu starten
+Jede Datei wird geprüft, bevor etwas ersetzt wird.
+"""
+import io
+import json
+import os
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+sys.dont_write_bytecode = True                         # nichts als root in /opt/festpos schreiben
+DEST = Path(os.environ.get("FESTPOS_DEST", "/opt/festpos"))
+sys.path.insert(0, os.environ.get("FESTPOS_RELEASE_LIB", str(DEST)))
+from app import backup, kartenboot  # noqa: E402  (gehört root wie dieses Programm)
+
+ANFRAGEN = Path(os.environ.get("FESTPOS_WH_DIR", "/run/festpos/wiederherstellen"))
+ERGEBNISSE = Path(os.environ.get("FESTPOS_WH_ERGEBNIS", "/run/festpos/wiederherstellen-ergebnis"))
+_boot = os.environ.get("FESTPOS_BOOT") or ("/boot/firmware" if os.path.isdir("/boot/firmware") else "/boot")
+BOOT = Path(_boot)
+ETC = Path(os.environ.get("FESTPOS_ETC", "/etc/festpos"))
+SICHERUNG = os.environ.get("FESTPOS_SICHERUNG_BIN", "/usr/local/sbin/festpos-sicherung")
+KARTE_BIN = os.environ.get("FESTPOS_KARTE_BIN", "/usr/local/sbin/festpos-karte")
+TROCKEN = os.environ.get("FESTPOS_WH_TROCKEN") == "1"          # nur Tests: nicht neu starten, nicht chown
+NAME_RE = re.compile(r"auftrag-([0-9a-f]{16})\.json")
+MAX_JOB = 2 * 1024 * 1024
+
+
+class Fehler(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+# -- Dateien ------------------------------------------------------------------------------------------------------
+def lies(path: str) -> dict | None:
+    """Kleine, normale Datei (kein Symlink) mit einem JSON-Objekt."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_JOB:
+            return None
+        data = b""
+        while chunk := os.read(fd, 65536):
+            data += chunk
+    finally:
+        os.close(fd)
+    try:
+        job = json.loads(data)
+    except ValueError:
+        return None
+    return job if isinstance(job, dict) else None
+
+
+def schreibe(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Erst fertig schreiben, dann in einem Schritt ersetzen (auch auf FAT der Boot-Partition)."""
+    tmp = path.with_name(f".{path.name}.neu")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def conf_text() -> str:
+    try:
+        return (BOOT / "festpos.conf").read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        raise Fehler("conf") from None
+
+
+def conf_schreiben(text: str) -> None:
+    schreibe(BOOT / "festpos.conf", text.encode("utf-8", errors="surrogateescape"))
+
+
+def wirksames_geheimnis(text: str) -> str:
+    try:
+        return kartenboot.effective_secret(text, BOOT, ETC)
+    except kartenboot.KartenFehler as e:
+        raise Fehler(e.code) from None
+
+
+def alt_behalten(stamp: str) -> None:
+    """Bisherige festpos-tls/ und festpos.conf daneben legen (festpos-tls.alt-DATUM)."""
+    tls = BOOT / "festpos-tls"
+    if tls.is_dir():
+        shutil.copytree(tls, BOOT / f"festpos-tls.alt-{stamp}", dirs_exist_ok=True)
+    conf = BOOT / "festpos.conf"
+    if conf.is_file():
+        shutil.copy2(conf, BOOT / f"festpos.conf.alt-{stamp}")
+
+
+def neu_starten() -> None:
+    if TROCKEN:
+        return
+    r = subprocess.run(["systemd-run", "--on-active=5", "--unit=festpos-wiederherstellen-neustart",
+                        "systemctl", "reboot"], capture_output=True, timeout=20)
+    if r.returncode != 0:
+        subprocess.run(["shutdown", "-r", "+0"], capture_output=True, timeout=20)
+
+
+def einzelbetrieb(text: str) -> bool:
+    return (backup.conf_value(text, "CLUSTER_SIZE") or "1").strip() == "1"
+
+
+# -- Prüfen ---------------------------------------------------------------------------------------------------------
+def pruefe_tls(files: dict[str, bytes]) -> None:
+    """Nur bekannte Namen, gültiges PEM, Schlüssel passt zum Zertifikat, Server-Zertifikat von der Server-CA."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+    if not set(files) <= set(backup.TLS_FILES) or not {"ca.crt", "server.crt", "server.key"} <= set(files):
+        raise Fehler("tls_files")
+    certs, keys = {}, {}
+    try:
+        for name, data in files.items():
+            if name.endswith(".crt"):
+                certs[name] = x509.load_pem_x509_certificate(data)
+            else:
+                keys[name] = serialization.load_pem_private_key(data, password=None)
+    except (ValueError, TypeError):
+        raise Fehler("tls_pem") from None
+
+    def pub(o):
+        return o.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    if pub(certs["server.crt"]) != pub(keys["server.key"]):
+        raise Fehler("tls_pair")
+    if certs["server.crt"].issuer != certs["ca.crt"].subject:
+        raise Fehler("tls_issuer")
+    if "device-ca.key" in keys and ("device-ca.crt" not in certs or pub(certs["device-ca.crt"]) != pub(keys["device-ca.key"])):
+        raise Fehler("tls_pair")
+
+
+# -- Aufträge -------------------------------------------------------------------------------------------------------
+def auftrag_keys(job: dict) -> dict:
+    text = conf_text()
+    if not einzelbetrieb(text):
+        raise Fehler("cluster")                       # im Cluster müssten alle Karten gleich ersetzt werden
+    try:
+        files = {n: str(v).encode("latin-1") for n, v in (job.get("tls") or {}).items()}
+        update_keys = sorted(str(n) for n in (job.get("update_keys") or {}))
+    except (AttributeError, UnicodeEncodeError):
+        raise Fehler("job") from None
+    pruefe_tls(files)
+    conf = job.get("conf") or {}
+    if not isinstance(conf, dict):
+        raise Fehler("job")
+    # festpos.conf fertig rechnen, BEVOR etwas ersetzt wird (ein Wert mit Zeilenumbruch wird abgewiesen)
+    secret, pw = str(conf.get("cluster_secret") or ""), str(conf.get("admin_password") or "")
+    try:
+        if secret.strip() not in backup.PLACEHOLDER_SECRETS:
+            text = backup.conf_set(text, "CLUSTER_SECRET", secret)
+        if pw.strip() not in {"", "admin", "bitte-aendern"}:
+            text = backup.conf_set(text, "ADMIN_PASSWORD", pw)
+    except ValueError:
+        raise Fehler("conf_value") from None
+    alt_behalten(time.strftime("%Y%m%d-%H%M%S"))
+    tls = BOOT / "festpos-tls"
+    tls.mkdir(exist_ok=True)
+    for name, data in files.items():
+        schreibe(tls / name, data, 0o600 if name.endswith(".key") else 0o644)
+    conf_schreiben(text)
+    # Update-Schlüssel der Sicherung, die hier fehlen: nur melden (Prüfliste), nie schreiben
+    skipped = [n for n in update_keys if backup.UPDATE_KEY_RE.match(n) and not (BOOT / n).exists()]
+    return {"restart": True, "files": sorted(files), "update_keys_skipped": skipped}
+
+
+def auftrag_kartenpaket(job: dict) -> dict:
+    letters = job.get("letters") or []
+    if not letters or not all(x in ("a", "b", "c") for x in letters):
+        raise Fehler("letters")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("LIESMICH.txt", str(job.get("readme") or ""))
+        for x in letters:
+            try:
+                files = kartenboot.boot_files(BOOT, ETC, x)          # gleich wie «SD-Karte schreiben» (T10)
+            except kartenboot.KartenFehler as e:
+                raise Fehler(e.code) from None
+            for name, data in files.items():
+                z.writestr(f"karte-{x}/{name}", data)
+    return {"zip": buf.getvalue(), "letters": letters}
+
+
+def auftrag_cluster3(_job: dict) -> dict:
+    text = conf_text()
+    if not einzelbetrieb(text):
+        raise Fehler("not_single")
+    secret = wirksames_geheimnis(text)                 # festschreiben: B und C bekommen dasselbe (Kartenpaket)
+    alt_behalten(time.strftime("%Y%m%d-%H%M%S"))
+    conf_schreiben(backup.conf_set(backup.conf_set(text, "CLUSTER_SIZE", "3"), "CLUSTER_SECRET", secret))
+    return {"restart": True}
+
+
+def auftrag_apk(_job: dict) -> dict:
+    r = subprocess.run([SICHERUNG, "--apk-holen"], capture_output=True, text=True, timeout=120)
+    if r.returncode == 3:
+        raise Fehler("no_apk")                         # kein Stick mit festpos-sicherung/fully.apk
+    if r.returncode != 0:
+        raise Fehler("apk")
+    return {}
+
+
+# -- Ersteinrichtung über das Web (T11) ---------------------------------------------------------------------------
+# Nur solange es KEINE festpos.conf gibt (dann läuft festpos-einrichtung.service statt der App). Danach ist der Modus
+# endgültig aus: jeder weitere Auftrag «einrichtung» wird abgewiesen.
+EINRICHTUNG_RUN = Path(os.environ.get("FESTPOS_EINRICHTUNG_RUN", "/run/festpos/einrichtung"))
+EINRICHTUNG_DATA = Path(os.environ.get("FESTPOS_EINRICHTUNG_DATA", "/var/lib/festpos/einrichtung"))
+CONF_EXAMPLE = DEST / "deploy" / "festpos.conf.example"
+IP_RE = re.compile(r"^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$")
+PREFIX_RE = re.compile(r"^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){2}$")
+TZ_RE = re.compile(r"^[A-Za-z0-9_/+-]{1,40}$")
+CONF_KEYS = ("CLUSTER_SIZE", "NET_PREFIX", "VIP", "NODE_A_IP", "NODE_B_IP", "NODE_C_IP", "TZ", "RTC_AKKU", "DHCP")
+
+
+def einrichtung_werte(v: dict) -> dict:
+    """Werte aus dem Browser prüfen -> Einträge für festpos.conf (und Buchstabe, Netz für die Zertifikate)."""
+    prefix = str(v.get("prefix") or "")
+    if not PREFIX_RE.match(prefix):
+        raise Fehler("prefix")
+    ips = {k: str(v.get(k) or "") for k in ("vip", "a", "b", "c")}
+    if not all(IP_RE.match(x) and x.rsplit(".", 1)[0] == prefix for x in ips.values()) or len(set(ips.values())) != 4:
+        raise Fehler("ips")
+    size, node = str(v.get("cluster_size") or "1"), str(v.get("node") or "a").lower()
+    if size not in ("1", "3") or node not in ("a", "b", "c") or (size == "1" and node != "a"):
+        raise Fehler("node")
+    tz = str(v.get("tz") or "Europe/Zurich")
+    if not TZ_RE.match(tz) or not Path("/usr/share/zoneinfo", tz).exists() and not TROCKEN:
+        raise Fehler("tz")
+    return {"node": node, "prefix": prefix, "ips": [ips["vip"], ips["a"], ips["b"], ips["c"]],
+            "conf": {"CLUSTER_SIZE": size, "NET_PREFIX": prefix, "NET_CIDR": "24", "VIP": ips["vip"],
+                     "NODE_A_IP": ips["a"], "NODE_B_IP": ips["b"], "NODE_C_IP": ips["c"], "TZ": tz,
+                     "RTC_AKKU": "1" if v.get("rtc_akku") else "0", "DHCP": "0" if v.get("dhcp") is False else "1",
+                     "SSH_FROM": f"{prefix}.200-{prefix}.254"}}
+
+
+def einrichtung_vorlage() -> str:
+    try:
+        return CONF_EXAMPLE.read_text(encoding="utf-8")
+    except OSError:
+        return "# FestPOS – erstellt von der Ersteinrichtung im Browser\nIFACE=eth0\nVRRP_ID=55\nRAFT_TLS=1\nPHONE_CERTS=1\n"
+
+
+def auftrag_einrichtung(job: dict) -> dict:
+    """Ersteinrichtung: festpos.conf, node.conf und festpos-tls/ auf die Boot-Partition, Uhr stellen.
+    mode neu: Zertifikate hier erzeugen (ca.key geht EINMAL an die App zurück, nicht auf die Karte);
+    sicherung: Schlüssel, CLUSTER_SECRET und Notfall-Passwort aus einer Sicherung (Ersatz-Pi);
+    karte: Inhalt eines Ordners «karte-x» aus dem Kartenpaket (Pi B/C zu einem bestehenden Pi A)."""
+    if (BOOT / "festpos.conf").exists():
+        raise Fehler("configured")                     # eingerichtet: Modus endgültig aus
+    if not EINRICHTUNG_RUN.exists():
+        raise Fehler("not_setup")
+    mode = job.get("mode")
+    tls: dict[str, bytes] = {}
+    out: dict = {}
+    if mode == "karte":
+        conf = str(job.get("conf_text") or "")
+        node = str(job.get("letter") or "").lower()
+        if node not in ("a", "b", "c") or not backup.conf_value(conf, "VIP") or not backup.conf_value(conf, "NODE_A_IP"):
+            raise Fehler("karte")
+        if (backup.conf_value(conf, "CLUSTER_SIZE") or "").strip() != "3":
+            raise Fehler("karte")
+        try:
+            tls = {n: str(x).encode("latin-1") for n, x in (job.get("tls") or {}).items()}
+        except (AttributeError, UnicodeEncodeError):
+            raise Fehler("job") from None
+        pruefe_tls(tls)
+    else:
+        w = einrichtung_werte(job.get("values") or {})
+        node, conf = w["node"], einrichtung_vorlage()
+        for k, x in w["conf"].items():
+            conf = backup.conf_set(conf, k, x)
+        for k in ("admin_password", "cluster_secret"):       # aus der Sicherung: kein Zeilenumbruch in festpos.conf
+            if any(ord(ch) < 32 or ord(ch) == 127 for ch in str(job.get(k) or "")):
+                raise Fehler("password")
+        if mode == "neu":
+            pw = str((job.get("values") or {}).get("admin_password") or "")
+            if len(pw) < 10 or len(pw) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in pw):
+                raise Fehler("password")
+            from app import zertifikate
+            try:
+                made = zertifikate.make_all(w["prefix"], 24, w["ips"])
+            except ValueError:
+                raise Fehler("ips") from None
+            out["ca_key"] = made.pop("ca.key").decode()
+            out["ca_crt"] = made["ca.crt"].decode()
+            tls = made
+            conf = backup.conf_set(conf, "ADMIN_PASSWORD", pw)
+            conf = backup.conf_set(conf, "CLUSTER_SECRET", secrets.token_urlsafe(32))
+        elif mode == "sicherung":
+            try:
+                tls = {n: str(x).encode("latin-1") for n, x in (job.get("tls") or {}).items()}
+            except (AttributeError, UnicodeEncodeError):
+                raise Fehler("job") from None
+            pruefe_tls(tls)
+            secret, pw = str(job.get("cluster_secret") or ""), str(job.get("admin_password") or "")
+            if not pw.strip() or pw in ("admin", "bitte-aendern"):
+                raise Fehler("password")
+            conf = backup.conf_set(conf, "ADMIN_PASSWORD", pw)
+            if secret.strip() and secret.strip() not in backup.PLACEHOLDER_SECRETS:
+                conf = backup.conf_set(conf, "CLUSTER_SECRET", secret)
+        else:
+            raise Fehler("job")
+    t_ms = job.get("time_ms")
+    if isinstance(t_ms, (int, float)) and t_ms > 1_700_000_000_000 and not TROCKEN:
+        subprocess.run(["date", "-s", f"@{int(t_ms) // 1000}"], capture_output=True, timeout=20)
+        subprocess.run(["hwclock", "-w"], capture_output=True, timeout=20)
+    d = BOOT / "festpos-tls"
+    d.mkdir(exist_ok=True)
+    for name, data in tls.items():
+        if name in backup.TLS_FILES:
+            schreibe(d / name, data, 0o600 if name.endswith(".key") else 0o644)
+    for name, data in (job.get("update_keys") or {}).items():
+        if backup.UPDATE_KEY_RE.match(str(name)) and not (BOOT / name).exists():
+            schreibe(BOOT / name, str(data).encode("latin-1", errors="replace"))
+    schreibe(BOOT / "node.conf", f"NODE={node}\n".encode())
+    schreibe(BOOT / "festpos.conf", conf.encode("utf-8", errors="surrogateescape"))   # zuletzt: ab jetzt eingerichtet
+    EINRICHTUNG_DATA.mkdir(mode=0o750, parents=True, exist_ok=True)
+    lang = str(job.get("lang") or "")
+    if re.fullmatch(r"[a-z]{2}(-[a-z]+)?", lang):
+        schreibe(EINRICHTUNG_DATA / "start.json", json.dumps({"lang": lang}).encode(), 0o644)
+    return {**out, "node": node}
+
+
+def auftrag_einrichtung_neustart(_job: dict) -> dict:
+    if not (BOOT / "festpos.conf").exists() or not EINRICHTUNG_RUN.exists():
+        raise Fehler("not_setup")
+    return {"restart": True}
+
+
+def karte(arg: str, job: dict | None = None, timeout: float = 60) -> dict:
+    """festpos-karte aufrufen (T10: SD-Karte im USB-Kartenleser schreiben) -> seine Antwort (JSON)."""
+    try:
+        r = subprocess.run(([sys.executable, "-I"] if os.environ.get("FESTPOS_KARTE_PYTHON") else []) + [KARTE_BIN, arg],
+                           input=json.dumps(job or {}), capture_output=True, text=True, timeout=timeout)
+        res = json.loads(r.stdout or "null")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise Fehler("karte") from None
+    if isinstance(res, dict) and res.get("ok") is False:
+        raise Fehler(str(res.get("code") or "karte"))
+    return res if isinstance(res, dict) else {}
+
+
+def auftrag_karten(_job: dict) -> dict:
+    return {"liste": karte("--liste"), "status": karte("--status") or None}
+
+
+def auftrag_karte_schreiben(job: dict) -> dict:
+    return karte("--auftrag", {k: job.get(k) for k in ("device", "serial", "size", "letter", "confirm")})
+
+
+def auftrag_karte_abbrechen(_job: dict) -> dict:
+    return karte("--abbrechen")
+
+
+AUFTRAEGE = {"keys": auftrag_keys, "kartenpaket": auftrag_kartenpaket, "cluster3": auftrag_cluster3,
+             "apk": auftrag_apk, "karten": auftrag_karten, "karte_schreiben": auftrag_karte_schreiben,
+             "karte_abbrechen": auftrag_karte_abbrechen, "einrichtung": auftrag_einrichtung,
+             "einrichtung_neustart": auftrag_einrichtung_neustart}
+
+
+def melde(job_id: str, res: dict) -> None:
+    ERGEBNISSE.mkdir(mode=0o755, parents=True, exist_ok=True)
+    data = res.pop("zip", None)
+    if data is not None:
+        schreibe(ERGEBNISSE / f"{job_id}.zip", data, 0o640)
+        if not TROCKEN:
+            try:
+                shutil.chown(ERGEBNISSE / f"{job_id}.zip", "root", "festpos")
+            except (LookupError, OSError):
+                pass
+    schreibe(ERGEBNISSE / f"{job_id}.json", json.dumps(res).encode(), 0o644)
+
+
+def aufraeumen() -> None:
+    """Alte Antworten (älter als 5 Minuten) löschen – /run ist im Arbeitsspeicher, ein Kartenpaket enthält Schlüssel."""
+    grenze = time.time() - 300
+    try:
+        for e in os.scandir(ERGEBNISSE):
+            if e.is_file(follow_symlinks=False) and e.stat(follow_symlinks=False).st_mtime < grenze:
+                os.unlink(e.path)
+    except OSError:
+        pass
+
+
+def anfragen() -> int:
+    jobs = []
+    try:
+        eintraege = list(os.scandir(ANFRAGEN))
+    except OSError:
+        return 0
+    for e in eintraege:
+        m = NAME_RE.fullmatch(e.name)
+        if m:
+            jobs.append((e.stat(follow_symlinks=False).st_mtime, m.group(1), lies(e.path)))
+        # ALLES entfernen (auch Fremdes), sonst startet systemd den Dienst immer wieder (DirectoryNotEmpty)
+        try:
+            if e.is_dir(follow_symlinks=False):
+                shutil.rmtree(e.path)
+            else:
+                os.unlink(e.path)
+        except OSError:
+            pass
+    rc, restart = 0, False
+    for _, job_id, job in sorted(jobs, key=lambda j: j[0]):
+        fn = AUFTRAEGE.get((job or {}).get("kind"))
+        try:
+            if not fn:
+                raise Fehler("job")
+            res = fn(job)
+            restart = restart or bool(res.get("restart"))
+            print(f"Auftrag {job['kind']} ausgeführt")
+            melde(job_id, {"ok": True, **res})
+        except Fehler as e:
+            print(f"Auftrag {(job or {}).get('kind')} abgelehnt: {e.code}", file=sys.stderr)
+            melde(job_id, {"ok": False, "code": e.code})
+            rc = 2
+        except ValueError as e:                              # z.B. Steuerzeichen in einem Wert für festpos.conf
+            print(f"Auftrag {(job or {}).get('kind')} abgelehnt: {e}", file=sys.stderr)
+            melde(job_id, {"ok": False, "code": "job"})
+            rc = 2
+        except OSError as e:
+            print(f"Auftrag {(job or {}).get('kind')} gescheitert: {type(e).__name__}", file=sys.stderr)
+            melde(job_id, {"ok": False, "code": "io"})
+            rc = 2
+    aufraeumen()
+    if restart:
+        print("Pi startet neu")
+        neu_starten()
+    return rc
+
+
+def main(argv: list[str]) -> int:
+    if argv[1:2] == ["--anfrage"]:
+        return anfragen()
+    print("Aufruf: festpos-wiederherstellen --anfrage", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

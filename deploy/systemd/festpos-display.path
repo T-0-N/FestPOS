@@ -1,0 +1,9 @@
+[Unit]
+Description=FestPOS: Änderungen am Bildschirm aus der Verwaltung übernehmen
+
+[Path]
+PathChanged=/var/lib/festpos/display.json
+Unit=festpos-display.service
+
+[Install]
+WantedBy=multi-user.target

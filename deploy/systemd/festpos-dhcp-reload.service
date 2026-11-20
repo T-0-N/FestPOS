@@ -1,0 +1,9 @@
+[Unit]
+Description=FestPOS: DHCP neu laden, Leases von umgeteilten Adressen löschen
+# keine Startgrenze: sonst schaltet systemd das Neuladen nach vielen Änderungen bis zum Neustart ab
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/festpos-dhcp-reload
+TimeoutStartSec=30

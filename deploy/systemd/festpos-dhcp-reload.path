@@ -1,0 +1,10 @@
+[Unit]
+Description=FestPOS: geänderte feste DHCP-Zuteilungen und das Gateway der Handhelds übernehmen (schreibt die App, app/dhcp.py)
+
+[Path]
+PathChanged=/var/lib/festpos/dhcp
+PathChanged=/var/lib/festpos/dhcp-opts
+Unit=festpos-dhcp-reload.service
+
+[Install]
+WantedBy=multi-user.target

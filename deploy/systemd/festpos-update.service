@@ -1,0 +1,15 @@
+[Unit]
+Description=FestPOS: signiertes Update prüfen und einspielen (Auftrag der App)
+After=local-fs.target systemd-tmpfiles-setup.service
+# keine Startgrenze: jeder Auftrag startet den Dienst einmal
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+# Läuft auch bei jedem Start einmal: meldet der App die Update-Schlüssel der Boot-Partition
+ExecStart=/usr/local/sbin/festpos-update --anfrage
+# update.sh: Python-Pakete, Probelauf, Warten auf den Server, evtl. Rückfall
+TimeoutStartSec=50min
+
+[Install]
+WantedBy=multi-user.target
