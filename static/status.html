@@ -91,9 +91,14 @@ h2 { font-size: calc(var(--u) * 2); color: var(--muted); font-weight: 600; lette
 .lamp.kiosk::before { background: var(--kiosk); }
 .lamp.bad::before { background: var(--bad); animation: blink 1s steps(2) infinite; }
 .list { display: grid; gap: calc(var(--u) * .5); }
-.item { display: grid; grid-template-columns: 1fr auto; gap: calc(var(--u) * 1); align-items: baseline; font-size: calc(var(--u) * 2.6); }
+.item { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, max-content); gap: calc(var(--u) * 1); align-items: baseline;
+  font-size: calc(var(--u) * 2.6); }
 .item .lamp { overflow: hidden; text-overflow: ellipsis; }
-.item .note { color: var(--muted); font-size: calc(var(--u) * 2.1); white-space: nowrap; }
+/* IP, Akku und Zustand bleiben je für sich ganz; ist es zu schmal (Handy, z.B. «wird geprüft»), brechen sie in eine
+   zweite Zeile um statt über den Rand */
+.item .note { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; align-items: baseline; min-width: 0;
+  color: var(--muted); font-size: calc(var(--u) * 2.1); }
+.item .note > span { white-space: nowrap; }
 .item .note.bad { color: var(--bad); } .item .note.wait { color: var(--wait); } .item .note.kiosk { color: var(--kiosk); }
 .item.off .lamp { color: var(--muted); }
 .chips { display: flex; flex-wrap: wrap; gap: calc(var(--u) * .5) calc(var(--u) * 1.8); font-size: calc(var(--u) * 2.3); }

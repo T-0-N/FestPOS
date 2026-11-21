@@ -16,6 +16,17 @@ from tests.test_browser_p4 import AUTH, _start, _watch, browser  # noqa: E402,F4
 from tests.test_browser_receipt import _until  # noqa: E402
 
 
+
+def _zu_breit(page, width: int) -> str:
+    """Für die Fehlermeldung: welche Elemente ragen über den rechten Rand (Tag, Klasse, rechter Rand, Text)?"""
+    rows = page.evaluate("""(w) => [...document.querySelectorAll('body *')].map((el) => {
+        const r = el.getBoundingClientRect();
+        return [Math.round(r.right), el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +
+          (typeof el.className === 'string' && el.className ? '.' + el.className.trim().replace(/\\s+/g, '.') : ''),
+          (el.innerText || '').replace(/\\s+/g, ' ').slice(0, 60)];
+      }).filter((x) => x[0] > w).sort((a, b) => b[0] - a[0]).slice(0, 8)""", width)
+    return f"zu breit (> {width} px): {rows}"
+
 @pytest.fixture(scope="module")
 def server(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("status")
@@ -332,7 +343,7 @@ def test_internet_row_red_only_when_needed_and_never_twice(server, browser):  # 
     page.wait_for_selector("#detail-sheet .panel")
     sheet = page.inner_text("#detail-sheet")
     assert "über Router" in sheet and "Karte/TWINT" in sheet and "gibt weiter" in sheet and "nicht erreichbar" in sheet
-    assert page.evaluate("document.documentElement.scrollWidth") <= 412
+    assert page.evaluate("document.documentElement.scrollWidth") <= 412, _zu_breit(page, 412)
     assert not errs, errs
     ctx.close()
 
@@ -373,7 +384,7 @@ def test_recent_orders_card_opens_list_and_order(server, browser, width, ansicht
     assert "Positionen" in sheet and "Zahlart" in sheet and "#00" in page.inner_text("#detail-sheet .head")
     page.click('#detail-sheet [data-act="orders-back"]')
     page.wait_for_selector("#detail-sheet .ol-row")
-    assert page.evaluate("document.documentElement.scrollWidth") <= width
+    assert page.evaluate("document.documentElement.scrollWidth") <= width, _zu_breit(page, width)
     assert page.evaluate("(() => { const p = document.querySelector('#detail-sheet .panel'); return p.scrollWidth <= p.clientWidth + 1; })()")
     assert not errs, errs
     ctx.close()
