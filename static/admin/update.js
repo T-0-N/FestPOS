@@ -91,7 +91,7 @@ function updKeys(u) {
 function updBack(u) {
   const r = u.rollback;
   if (!r || r.from === r.to) return "";
-  const older = String(r.to).localeCompare(String(r.from), undefined, { numeric: true }) < 0;
+  const older = r.older !== false;                     // vergleicht der Server (beide Versionsformate)
   return `<div class="card" id="upd-back"><h3>${th("admin.update.back_title")}</h3>
     <p class="hint">${th(older ? "admin.update.back_hint" : "admin.update.forward_hint", { from: r.from, to: r.to })}</p>
     <button type="button" class="btn danger" id="upd-rollback" ${updActive(u) ? "disabled" : ""}>${th(older ? "admin.update.back" : "admin.update.forward", { version: r.to })}</button>

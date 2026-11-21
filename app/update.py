@@ -592,7 +592,9 @@ def _rollback_option(view: dict) -> dict | None:
     versions = {i.get("version") for i in infos}
     backups = {(i.get("upd") or {}).get("backup") for i in infos}
     if len(versions) == 1 and len(backups) == 1 and None not in versions | backups:
-        return {"from": versions.pop(), "to": backups.pop()}
+        frm, to = versions.pop(), backups.pop()
+        # zurück (älter) oder wieder vor? Der Server vergleicht, er kennt beide Versionsformate (1.0.0 > 2026.10.10-103)
+        return {"from": frm, "to": to, "older": not release.newer(to, frm)}
     return None
 
 

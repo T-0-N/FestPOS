@@ -254,9 +254,14 @@ def test_fsck_nach_dem_aushaengen_wartet_und_versucht_nochmals(pi):
     assert st["state"] == "done", st
     lg = log(pi)
     assert lg.count("e2fsck -fn") == 2 and "udevadm settle" in lg[lg.index("umount"):]
+
+
+def test_fsck_bleibender_fehler_scheitert(pi):
+    """Findet e2fsck bei jedem Versuch einen Fehler, scheitert das Schreiben mit «fsck» (die Karte wird gelöscht)."""
     (pi["fake"] / "fail-e2fsck").touch()
     st = schreiben(pi, "a")
     assert st["state"] == "failed" and st["code"] == "fsck"
+    assert log(pi).count("e2fsck -fn") == 3
 
 
 def test_karte_gewechselt_nichts_geschrieben(pi):

@@ -345,6 +345,7 @@ def test_reboot_handheld_from_app(phone_server, browser):  # noqa: F811
         return lambda: page.remove_listener("dialog", on)
 
     def more():
+        page.wait_for_load_state("networkidle")                  # App fertig geladen: sonst zeichnet sie das Fenster neu
         page.click('[data-act="settings"]')
         page.click('[data-act="settings-more"]')
         page.wait_for_selector('.fully-box [data-act="fully-reboot"]')

@@ -375,7 +375,7 @@ def test_rollback_all(upd, monkeypatch):
     from app.core import APP_VERSION
     (u["alt"] / "VERSION").write_text("2026.10.10-25\n")
     ov = u["c"].get("/api/admin/update", auth=AUTH).json()
-    assert ov["rollback"] == {"from": APP_VERSION, "to": "2026.10.10-25"}
+    assert ov["rollback"] == {"from": APP_VERSION, "to": "2026.10.10-25", "older": True}   # vom Server verglichen (auch ab 1.0)
     r = u["c"].post("/api/admin/update/rollback", auth=AUTH, json={"confirm": True}).json()
     assert r["started"] and r["plan"]["kind"] == "rollback"
     m.step()
