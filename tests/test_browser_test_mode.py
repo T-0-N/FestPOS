@@ -45,13 +45,26 @@ def _tour_to_end(page):
 
 
 def _audit(c, action):
-    return [r for r in c.get("/api/admin/audit", auth=AUTH).json()["entries"] if r["action"] == action]
+    # gefiltert: ohne Filter kommen nur die neusten 300 Einträge – auf einer langsamen CI sind es mehr
+    r = c.get("/api/admin/audit", params={"q": action, "limit": 2000}, auth=AUTH)
+    return [e for e in r.json()["entries"] if e["action"] == action]
+
+
+def _wait_audit(c, action, count, timeout=10.0):
+    """Die App meldet den Testmodus im Hintergrund; warten, bis der Server ihn protokolliert hat (sonst bricht ein
+    sofortiges Neuladen die Meldung auf einer langsamen CI ab)."""
+    import time
+    end = time.time() + timeout
+    while time.time() < end and len(_audit(c, action)) < count:
+        time.sleep(0.1)
+    assert len(_audit(c, action)) >= count, f"{action} nicht protokolliert"
 
 
 def test_tour_asks_for_test_mode_yes_is_default(server, browser):  # noqa: F811
     base, c = server
     c.put("/api/admin/settings", auth=AUTH, json={"test_enabled": True, "test_pin_required": False, "test_print": False})
-    for width in (412, 360):
+    before = len(_audit(c, "test_on"))
+    for n, width in enumerate((412, 360), 1):
         ctx, page, errs = _phone(browser, base, width=width)
         _tour_to_end(page)
         assert page.inner_text(".tour-bubble h2") == "Testmodus einschalten?"
@@ -64,6 +77,7 @@ def test_tour_asks_for_test_mode_yes_is_default(server, browser):  # noqa: F811
         assert page.evaluate("document.documentElement.scrollWidth") <= width
         page.click('[data-act="tour-test"][data-v="1"]')
         page.wait_for_selector("body.testmode .testbar")                            # ohne PIN sofort an
+        _wait_audit(c, "test_on", before + n)
         assert page.locator("#tour").count() == 0 and page.locator(".sheet").count() == 0
         # Neuladen = Start der App: Testmodus aus, mit Hinweis; Übungs-Warenkorb weg
         page.reload()
