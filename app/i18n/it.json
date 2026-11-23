@@ -4129,6 +4129,7 @@
   "one": ", {count} comanda in attesa",
   "other": ", {count} comande in attesa"
  },
+ "status.simple.offline": "Nessuna connessione al server – visualizzazione non aggiornata",
  "status.simple.updated": "Stato alle {time}, aggiornato ogni {sec} s",
  "status.srv.backup": "salvato {min} min fa",
  "status.srv.backup_h": "salvato {h} h fa",

@@ -4129,6 +4129,7 @@
   "one": ", {count} ticket en attente",
   "other": ", {count} tickets en attente"
  },
+ "status.simple.offline": "Pas de connexion au serveur – affichage non actualisé",
  "status.simple.updated": "État à {time}, actualisé toutes les {sec} s",
  "status.srv.backup": "sauvegardé il y a {min} min",
  "status.srv.backup_h": "sauvegardé il y a {h} h",

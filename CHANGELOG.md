@@ -8,6 +8,12 @@ Neue Einträge zuerst unter «Unveröffentlicht» sammeln; beim Release wird dar
 
 ## [Unveröffentlicht]
 
+### Geändert
+- **Einfache Statusanzeige** (`/status-einfach`, iPad mini mit iOS 9): aktualisiert sich ohne weisses Aufblitzen –
+  ein kleines Skript (ES5, für Safari 9) holt alle 10 s nur den Inhalt und tauscht ihn aus, statt die ganze Seite neu
+  zu laden. Ohne Verbindung zum Server erscheint ein Hinweis und die Anzeige wird abgedunkelt; nach einem Update lädt
+  sie sich selbst neu. Ohne JavaScript wie bisher mit Neuladen.
+
 ## [1.0.0]
 
 Erste öffentliche Version.

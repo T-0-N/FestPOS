@@ -1,8 +1,10 @@
 """Einfache Statusanzeige für alte Geräte (z.B. iPad mini mit iOS 9): /status-einfach.
 
 Die normale Statusanzeige (status.html) braucht einen neuen Browser (ES2017, fetch, Pointer-Events, CSS min()).
-Diese Seite baut der Server fertig als HTML – ohne JavaScript, mit schlichtem CSS (status-einfach.css) – und der
-Browser lädt sie alle REFRESH Sekunden neu (<meta http-equiv="refresh">). Nur anschauen, keine Knöpfe.
+Diese Seite baut der Server fertig als HTML, mit schlichtem CSS (status-einfach.css). Ein kleines Skript in ES5
+(status-einfach.js) holt alle REFRESH Sekunden nur den Inhalt (?teil=1) und tauscht ihn aus – ohne Neuladen der
+ganzen Seite, also ohne weisses Aufblitzen. Ohne JavaScript lädt <noscript><meta http-equiv="refresh"></noscript>
+die Seite wie bisher neu. Nur anschauen, keine Knöpfe.
 Gleiche Daten und gleicher Zugang wie /api/status (am Pi frei, Handheld mit Zertifikat, sonst Anmeldung der
 Verwaltung – auf dem iPad fragt Safari nach Benutzer und Passwort)."""
 from __future__ import annotations
@@ -18,7 +20,7 @@ from .i18n import t
 from .status import _status_data, status_access
 
 router = APIRouter()
-REFRESH = 10                                          # Sekunden bis zum Neuladen
+REFRESH = 10                                          # Sekunden bis zum nächsten Abruf
 MAX_ORDERS = 8
 
 _SVC = {"rqlited": "status.svc.rqlited", "festpos-redirect": "status.svc.redirect", "chrony": "status.svc.chrony",
@@ -270,7 +272,8 @@ def _notice(n: dict | None) -> str:
     return f'<div class="notice">{_e(text)}</div>'
 
 
-def render(s: dict) -> str:
+def content(s: dict) -> str:
+    """Nur der Inhalt (Hinweis, Kopf, Spalten, Fuss) – für den Rahmen aus render() und den Teil-Abruf (?teil=1)."""
     problems: list[str] = []
     waits: list[str] = []
     printers = _printers(s, problems, waits)
@@ -304,18 +307,7 @@ def render(s: dict) -> str:
         ver = t("status.foot.ver_single", version=s.get("version"))
     banner = _notice(s.get("notice"))
     net_card = f'<section><h2>{_e(t("status.card.network"))}</h2><div class="chips">{network}</div></section>' if network else ""
-    return f"""<!doctype html>
-<html lang="de-CH" translate="no">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="{REFRESH}">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<title>{_e(t("status.head.title"))}</title>
-<link rel="stylesheet" href="/status-einfach.css">
-</head>
-<body>
-{banner}
+    return f"""{banner}
 <header class="{pill}">
   <div class="top"><span class="brand">FestPOS</span> <span class="event">{_e(s.get("event_name"))}</span><span class="clock">{now}</span></div>
   <div class="pill"><b>{_e(state)}</b> <span>{_e(detail)}</span></div>
@@ -336,13 +328,38 @@ def render(s: dict) -> str:
   <span><b>{_e(tot.get("last_hour") or 0)}</b> {_e(t("status.foot.last_hour"))}</span>
   <span><b>{money(tot.get("total_cents") or 0)}</b> {_e(s.get("currency") or "CHF")}</span>
   <span class="ver">{_e(ver)} · {_e(t("status.simple.updated", time=time.strftime("%H:%M:%S"), sec=REFRESH))}</span>
-</footer>
+</footer>"""
+
+
+def render(s: dict) -> str:
+    """Die ganze Seite: Rahmen mit dem Inhalt in #s. data-v ist die Version – ändert sie sich (Update), lädt das
+    Skript die ganze Seite neu (neues CSS und Skript)."""
+    return f"""<!doctype html>
+<html lang="de-CH" translate="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<noscript><meta http-equiv="refresh" content="{REFRESH}"></noscript>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>{_e(t("status.head.title"))}</title>
+<link rel="stylesheet" href="/status-einfach.css">
+</head>
+<body>
+<div class="offline">{_e(t("status.simple.offline"))}</div>
+<div id="s" data-sec="{REFRESH}" data-v="{_e(s.get("version"))}">
+{content(s)}
+</div>
+<script src="/status-einfach.js"></script>
 </body>
 </html>"""
 
 
 @router.get("/status-einfach", dependencies=[Depends(status_access)])
-async def status_simple(request: Request):
+async def status_simple(request: Request, teil: bool = False):
+    """teil=1: nur der Inhalt für status-einfach.js, mit der Version in X-FestPOS-Version."""
     local = bool(request.client and request.client.host in LOCAL_HOSTS)
     data = await db(_status_data, local, current_user(request))
+    if teil:
+        return HTMLResponse(content(data), headers={"Cache-Control": "no-store",
+                                                    "X-FestPOS-Version": str(data.get("version") or "")})
     return HTMLResponse(render(data), headers={"Cache-Control": "no-store"})

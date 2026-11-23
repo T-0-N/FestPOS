@@ -4129,6 +4129,7 @@
   "one": ", {count} Bon wartet",
   "other": ", {count} Bons warten"
  },
+ "status.simple.offline": "Keine Verbindung zum Server – Anzeige nicht aktuell",
  "status.simple.updated": "Stand {time}, alle {sec} s neu",
  "status.srv.backup": "gesichert vor {min} Min.",
  "status.srv.backup_h": "gesichert vor {h} Std.",

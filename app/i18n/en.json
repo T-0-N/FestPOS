@@ -4129,6 +4129,7 @@
   "one": ", {count} ticket waiting",
   "other": ", {count} tickets waiting"
  },
+ "status.simple.offline": "No connection to the server – display not up to date",
  "status.simple.updated": "As of {time}, refreshes every {sec} s",
  "status.srv.backup": "backed up {min} min ago",
  "status.srv.backup_h": "backed up {h} h ago",

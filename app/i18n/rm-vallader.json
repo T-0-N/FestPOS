@@ -4129,6 +4129,7 @@
   "one": ", {count} bon spetta",
   "other": ", {count} bons spettan"
  },
+ "status.simple.offline": "Ingüna connexiun cul server – l'indicaziun nun es actuala",
  "status.simple.updated": "Stadi {time}, actualisà mincha {sec} s",
  "status.srv.backup": "copchà avant {min} min.",
  "status.srv.backup_h": "salvà avant {h} uras",

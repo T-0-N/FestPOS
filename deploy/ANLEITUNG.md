@@ -1389,7 +1389,10 @@ eingetragen, wird weder geprüft noch angezeigt); ebenso der Mobilfunk-Router un
 leer. Für solche Geräte gibt es die **einfache Statusanzeige**: `https://<Pi>:8443/status-einfach` (bzw. die Adresse,
 unter der die Verwaltung läuft). Safari fragt nach Benutzer und Passwort der Verwaltung (Rolle **Anzeige** genügt) –
 «Kennwort sichern» erspart das erneute Eintippen. Die Seite zeigt Gesamtlampe, Drucker, letzte Bestellungen,
-Handhelds, Netzwerk und Server, lädt sich alle 10 Sekunden neu und kommt ohne JavaScript aus. Nur anschauen: keine
+Handhelds, Netzwerk und Server und aktualisiert sich alle 10 Sekunden, ohne dass der Bildschirm kurz weiss aufblitzt.
+Erreicht das iPad den Server nicht, erscheint oben rot «Keine Verbindung zum Server – Anzeige nicht aktuell» und die
+Anzeige wird abgedunkelt; sobald der Server wieder antwortet, verschwindet der Hinweis von selbst. Nach einem Update
+lädt sich die Seite selbst ganz neu. Nur anschauen: keine
 Knöpfe, keine Details beim Antippen, kein Internet- und Update-Stand. Die Zertifizierungsstelle der Pi muss auf dem
 iPad als Profil installiert sein (wie bei den anderen Geräten). Für den Vollbildmodus: in Safari **Teilen ›
 Zum Home-Bildschirm**, dann von dort öffnen.

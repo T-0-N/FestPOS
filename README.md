@@ -217,9 +217,13 @@ Links zur Bestell-App und Verwaltung (nie am Bildschirm des Pi).
 
 **Einfache Statusanzeige** (`/status-einfach`, `app/status_simple.py`) für alte Browser wie Safari 9 (iPad mini,
 iOS 9.3.5): der Server baut die Seite fertig als HTML aus denselben Daten wie `/api/status` (Gesamtlampe, Drucker,
-Bestellungen, Handhelds, Netzwerk, Server), ohne JavaScript, schlichtes CSS (`static/status-einfach.css`: kein Grid,
-`gap`, `min()`, `color-mix()`), Neuladen alle 10 s per `<meta http-equiv="refresh">`. Gleicher Zugang wie
-`/api/status` (Anmeldung mit Basic Auth genügt, Rolle Anzeige). Nur anschauen.
+Bestellungen, Handhelds, Netzwerk, Server), schlichtes CSS (`static/status-einfach.css`: kein Grid, `gap`, `min()`,
+`color-mix()`). Ein kleines Skript in ES5 (`static/status-einfach.js`: XMLHttpRequest, kein `fetch`, keine Promises)
+holt alle 10 s nur den Inhalt (`/status-einfach?teil=1`, Version in `X-FestPOS-Version`) und tauscht ihn aus – ohne
+Neuladen, also ohne weisses Aufblitzen. Nach zwei Fehlschlägen erscheint «Keine Verbindung zum Server» und der Inhalt
+wird abgedunkelt; versucht wird immer weiter. Bei neuer Version (Update) oder abgelaufener Anmeldung (401) lädt die
+Seite ganz neu. Ohne JavaScript lädt sie wie bisher alle 10 s neu (`<noscript><meta http-equiv="refresh">`).
+Gleicher Zugang wie `/api/status` (Anmeldung mit Basic Auth genügt, Rolle Anzeige). Nur anschauen.
 
 ## Übersetzung (i18n)
 
@@ -354,7 +358,7 @@ app/
   update.py         Verwaltung › Update, Plan im Cluster (wer ist dran, Sperre, Mehrheit), Nachziehen, USB-Stick
   update_net.py     Update aus dem Internet: GitHub-Release suchen/herunterladen, Internet kurz ein (festpos-update)
   status.py         Statusanzeige (ein Aufruf mit allem)
-  status_simple.py  Einfache Statusanzeige als fertiges HTML für alte Browser (/status-einfach, iOS 9)
+  status_simple.py  Einfache Statusanzeige als fertiges HTML für alte Browser (/status-einfach, iOS 9; ?teil=1 nur Inhalt)
   ledger.py (T45)   Korrekturen früherer Tage (Tabelle corrections): Rückerstattung einer schon abgeschlossenen
                     Bestellung bucht der nächste Abschluss; offene Kartenzahlung sperrt den Abschluss; T46: spät
                     bestätigte Kartenzahlung – extern bezahlt = zu viel, bar = Verwaltung entscheidet (zurück/nachbuchen)

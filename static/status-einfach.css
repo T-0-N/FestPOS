@@ -12,6 +12,12 @@ body { font: 600 18px/1.2 "Barlow Condensed", "Arial Narrow", "Helvetica Neue", 
 @media (min-width: 900px) { body { font-size: 20px; } }
 small { font-size: .78em; font-weight: 400; color: var(--muted); }
 
+/* Keine Verbindung (status-einfach.js setzt body.off nach zwei Fehlschlägen): Hinweis oben, alter Inhalt abgedunkelt */
+.offline { display: none; background: var(--bad); color: var(--on-color); text-align: center; font-size: 1.2em; font-weight: 700;
+  padding: 8px 10px; border-radius: 8px; margin-bottom: 10px; }
+body.off .offline { display: block; }
+body.off #s { opacity: .45; }
+
 .notice { background: var(--bad); color: var(--on-color); text-align: center; font-size: 1.6em; font-weight: 700;
   padding: 10px; border-radius: 8px; margin-bottom: 10px; }
 
