@@ -292,6 +292,32 @@ def conf_set(text: str, key: str, value: str) -> str:
     return text.rstrip("\n") + "\n" + conf_line(key, value) + "\n"
 
 
+# Werte aus festpos.conf, die eine Sicherung mitnimmt (für einen Ersatz-Pi): Notfall-Passwort als Prüfwert
+# (T-0-N/FestPOS#15) oder – ältere Sicherung – im Klartext
+CONF_KEYS = ("cluster_secret", "admin_password", "admin_password_hash", "admin_password_len")
+HASH_RE = re.compile(r"^scrypt\$\d+\$\d+\$\d+\$[0-9a-f]+\$[0-9a-f]+$")
+
+
+def conf_admin(text: str, conf: dict) -> str:
+    """Notfall-Passwort aus einer Sicherung in festpos.conf: Prüfwert (ohne Klartext) oder ältere Sicherung im
+    Klartext (festpos-node wandelt ihn beim Start um). Platzhalter und Leeres ändern nichts."""
+    h, n = str(conf.get("admin_password_hash") or ""), str(conf.get("admin_password_len") or "0")
+    if HASH_RE.match(h):
+        text = conf_set(text, "ADMIN_PASSWORD_HASH", h)
+        text = conf_set(text, "ADMIN_PASSWORD_LAENGE", n if n.isdigit() else "0")
+        return conf_remove(text, "ADMIN_PASSWORD")
+    pw = str(conf.get("admin_password") or "")
+    if pw.strip() not in PLACEHOLDER_SECRETS:
+        text = conf_remove(conf_remove(text, "ADMIN_PASSWORD_HASH"), "ADMIN_PASSWORD_LAENGE")   # alter Prüfwert gilt nicht
+        text = conf_set(text, "ADMIN_PASSWORD", pw)
+    return text
+
+
+def conf_remove(text: str, key: str) -> str:
+    """Alle Zeilen «KEY=…» entfernen (z.B. das Notfall-Passwort im Klartext, wenn der Prüfwert da ist)."""
+    return "\n".join(line for line in text.split("\n") if not re.match(rf"^\s*{key}\s*=", line))
+
+
 def to_delete(names: list[str], node: str, keep: int = KEEP) -> list[str]:
     """Ältere Sicherungen dieses Pi, die über die letzten «keep» hinausgehen (andere Dateien bleiben unberührt)."""
     mine = sorted((n for n in names if (m := FILE_RE.match(n)) and m.group(1) == node), reverse=True)

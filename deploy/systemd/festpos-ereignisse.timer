@@ -1,0 +1,10 @@
+[Unit]
+Description=FestPOS: Sicherheitsereignisse alle 20 Sekunden sammeln
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=20s
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target

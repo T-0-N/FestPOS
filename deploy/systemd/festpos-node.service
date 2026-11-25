@@ -1,6 +1,8 @@
 [Unit]
 Description=FestPOS: Rolle aus node.conf anwenden (IP, Hostname, Konfiguration)
-After=local-fs.target NetworkManager.service
+After=local-fs.target NetworkManager.service festpos-krypt.service
+# Daten verschlüsselt (T-0-N/FestPOS#3): erst, wenn der Container offen ist
+Requires=festpos-krypt.service
 Wants=NetworkManager.service
 # NICHT Before=nftables.service: nftables läuft vor network-pre.target, NetworkManager danach ->
 # Abhängigkeitskreis, systemd wirft dann NetworkManager raus (Pi ohne Netz). Firewall lädt das Skript selbst.

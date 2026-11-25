@@ -488,8 +488,8 @@ class StartIn(BaseModel):
 
 def _server() -> str:
     """Adresse, unter der «FestPOS Tap» den Pi erreicht: Verwaltungs-Port der VIP (ohne Gerätezertifikat)."""
-    import os
-    host = os.environ.get("FESTPOS_VIP") or "192.168.55.10"
+    from . import netz
+    host = netz.vip()
     port = Config.admin_port or 8443
     return f"https://{host}:{port}"
 

@@ -36,11 +36,14 @@ from . import auth, catalog, certs, cluster as cluster_mod, device_ids, devices,
     cards, mac_change, maintenance, options as options_mod, payrexx, print_service as ps, printer_net, printers, receipts, settings_admin, \
     status as status_mod, status_simple, \
     stock as stock_mod, system as system_mod, tables, test_mode, time_admin, tunnel, update as update_mod, update_net, uplink_admin, \
-    restore_check, timesync, users as users_mod
+    restore_check, secretbox, sicherheit, timesync, twofa, users as users_mod, firewall, saison
+from . import release as release_mod
+from . import krypt as krypt_mod
+from . import umzug as umzug_mod
 from . import ledger_base as lb
 from .core import (APP_VERSION, LOGIN_MAX_FAILS, LOGIN_WINDOW_S, PW_WARN_LEN, Config, RequestGate, Throttle,  # noqa: F401
                    admin, admin_allowed_from, cluster_info, db, current_user, emergency_problem,
-                   security_warnings as core_warnings, issue_session, log, login_name,
+                   security_warnings as core_warnings, idle_seconds, issue_session, log, login_name,
                    login_throttle, login_user, logo_info, rt, admin_cert_needed)
 from .devices import revoked_serials  # noqa: F401 – für Tests und Werkzeuge
 from .display import _display_cfg, _display_sync, _display_update  # noqa: F401
@@ -71,9 +74,66 @@ def _tick() -> None:
     _payrexx_tick()                              # offene Payrexx-Zahlungen nach 24 h abschliessen (T13)
     _keep_tick()                                 # Internet dauerhaft (Seite «Internet», Schalter c) – jeder Pi
     _tunnel_tick()                               # Tunnel zur QR-Bestellung nach der Verwaltung einrichten – jeder Pi
+    _secrets_tick()                              # Geheimnisse verschlüsseln, sobald alle Pi diese Version haben (#8)
+    try:                                         # Netz umziehen (#2): vorbereiten, umstellen, bestätigen – jeder Pi
+        umzug_mod.tick()
+    except Exception:  # noqa: BLE001 – Monitor darf nie stehen bleiben
+        log.exception("Netz umziehen: Takt gescheitert")
 
 
 _payrexx_last = [0.0]
+_secrets_last = [0.0]
+
+
+def all_pis_current() -> bool:
+    """Laufen alle Pi mindestens diese Version (laut ihren Infos in der Datenbank)? Einzelbetrieb: ja.
+    FESTPOS_PEERS nennt alle Pi (auch diesen): im Cluster a, b, c – jeder braucht einen Eintrag mit aktueller Version;
+    Einträge anderer Buchstaben (z.B. von einem früheren Versuch) zählen nicht."""
+    if len(Config.peers) <= 1:
+        return True
+    expected = ("a", "b", "c")[:len(Config.peers)]
+    for node in expected:
+        try:
+            v = json.loads(store.scalar("SELECT value FROM settings WHERE key=?", (f"node_info.{node}",)) or "{}") \
+                .get("version")
+        except (ValueError, AttributeError):
+            return False
+        if not v or release_mod.newer(APP_VERSION, v):
+            return False
+    return True
+
+
+_current = {"at": 0.0, "ok": False}
+
+
+def _pis_current_cached() -> bool:
+    """all_pis_current für jedes Schreiben eines Geheimnisses (secretbox.gate). Nur «nein» gilt eine Minute weiter
+    (vorsichtig: im Klartext wie bisher); «ja» wird jedes Mal frisch geprüft – meldet ein Pi inzwischen eine ältere
+    Version, wird nicht mehr versiegelt."""
+    if not _current["ok"] and time.time() - _current["at"] <= 60:
+        return False
+    try:
+        _current["ok"] = all_pis_current()
+    except Exception:                            # noqa: BLE001 – im Zweifel wie bisher im Klartext
+        _current["ok"] = False
+    _current["at"] = time.time()
+    return _current["ok"]
+
+
+secretbox.gate(_pis_current_cached)
+
+
+def _secrets_tick() -> None:
+    """Alle 10 Minuten: Geheimnisse, die noch im Klartext (oder im alten Verfahren) in der Datenbank stehen,
+    verschlüsseln – erst wenn alle Pi diese Version haben (ein älterer Pi läse sonst den verschlüsselten Text)."""
+    if time.time() - _secrets_last[0] < 600:
+        return
+    _secrets_last[0] = time.time()
+    try:
+        if all_pis_current() and (n := secretbox.migrate(store)):
+            log.info("Geheimnisse: %d verschlüsselt", n)
+    except Exception:                            # noqa: BLE001 – Monitor darf nie stehen bleiben
+        log.exception("Geheimnisse verschlüsseln gescheitert")
 _keep_last = [0.0]
 _tunnel_last = [0.0]
 
@@ -148,6 +208,8 @@ async def _start_services() -> None:
                   peers=_ask_peers if len(Config.peers) > 1 else None,
                   printers_legacy=status_mod.printer_state_get)
     update_mod.start()                                       # Updates: bin ich an der Reihe? (update.py)
+    sicherheit.start()                                       # Sicherheitsereignisse ins Protokoll (#11)
+    firewall.start()                                         # Modus der Firewall an festpos-firewall (#10)
     rt.ready = True
     log.info("Datenbank bereit – FestPOS läuft")
     asyncio.create_task(maintenance.after_setup())           # T11: Sprache, Sicherung aus der Ersteinrichtung
@@ -185,7 +247,8 @@ async def lifespan(_app: FastAPI):
     if emergency_problem() == "placeholder":
         log.warning("Notfall-Passwort (ADMIN_PASSWORD) ist ein Platzhalter – Notfall-Login gesperrt, in festpos.conf ändern!")
     elif emergency_problem() == "short":
-        log.warning("Notfall-Passwort (ADMIN_PASSWORD) ist kürzer als %d Zeichen – in festpos.conf ändern", PW_WARN_LEN)
+        log.warning("Notfall-Passwort ist kürzer als %d Zeichen – in festpos.conf ein längeres als ADMIN_PASSWORD "
+                    "eintragen (gesperrt, sobald es einen eigenen Admin-Benutzer gibt)", PW_WARN_LEN)
     waiter = None
     try:
         await asyncio.to_thread(store.init_schema)          # Datenbank schon da (Neustart der App, Tests)
@@ -198,6 +261,8 @@ async def lifespan(_app: FastAPI):
         waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
     await update_mod.stop()
+    await sicherheit.stop()
+    await firewall.stop()
     await monitor.stop()
     await spooler.stop()
 
@@ -677,16 +742,55 @@ async def admin_login(body: LoginIn, request: Request):
     login_throttle.check(ip)
     name = login_name(body.name)
     login_throttle.check_name(ip, name)                  # zu viele Fehlversuche für diesen Namen (alle Adressen, S6)
-    user = await asyncio.to_thread(login_user, body.name, body.password)     # scrypt: nicht im Event-Loop
+    user = await asyncio.to_thread(login_user, body.name, body.password, ip)     # scrypt: nicht im Event-Loop
     if not user:
         login_throttle.fail(ip, name)
-        if name == auth.EMERGENCY_NAME and emergency_problem() == "placeholder":
-            raise HTTPException(401, t("err.login.emergency_placeholder"))
+        if name == auth.EMERGENCY_NAME:
+            from . import emergency
+            if not emergency.local_ok(ip):
+                raise HTTPException(401, t("err.login.emergency_remote"))
+            problem = emergency_problem()
+            if problem == "placeholder":
+                raise HTTPException(401, t("err.login.emergency_placeholder"))
+            if problem == "short_locked":
+                raise HTTPException(401, t("err.login.emergency_short"))
         raise HTTPException(401, t("err.login.wrong"))
+    if user.get("totp_on"):                              # zweiter Faktor: zweiter Schritt (T-0-N/FestPOS#9)
+        from . import twofa
+        return {"second_step": True, "pending": twofa.pending_token(user), "name": user["name"]}
     login_throttle.ok(ip, name)
+    if user.get("emergency"):                            # jede Notfall-Anmeldung im Protokoll (T-0-N/FestPOS#15)
+        await db(lb.audit, store, auth.EMERGENCY_NAME, "emergency_login", ip=ip, node=Config.node)
     if user["id"]:
         await db(store.execute, "UPDATE users SET last_login=? WHERE id=?", (time.strftime("%Y-%m-%dT%H:%M:%S"), user["id"]))
-    return {**issue_session(user["id"], user["gen"]), **await db(users_mod.me_info, user)}
+    idle_s = await db(idle_seconds, user)
+    return {**issue_session(user["id"], user["gen"], idle_s), **await db(users_mod.me_info, user)}
+
+
+class LoginTotpIn(BaseModel):
+    pending: str = Field(max_length=200)
+    code: str = Field(max_length=20)
+
+
+@app.post("/api/admin/login/totp")
+async def admin_login_totp(body: LoginTotpIn, request: Request):
+    """Zweiter Schritt der Anmeldung: Code aus der App oder Wiederherstellungs-Code -> Sitzungs-Token."""
+    from . import twofa
+    ip = request.client.host if request.client else "?"
+    login_throttle.check(ip)
+    user = await db(twofa.pending_user, body.pending)
+    if not user:
+        raise HTTPException(409, t("err.totp.pending_expired"))   # zurück zum Passwort
+    name = login_name(user["name"])
+    login_throttle.check_name(ip, name)
+    state = await db(twofa.verify_code, user["id"], body.code, user["name"])
+    if state != "ok":
+        login_throttle.fail(ip, name)
+        raise twofa.code_error(state, 401)
+    login_throttle.ok(ip, name)
+    await db(store.execute, "UPDATE users SET last_login=? WHERE id=?", (time.strftime("%Y-%m-%dT%H:%M:%S"), user["id"]))
+    idle_s = await db(idle_seconds, user)
+    return {**issue_session(user["id"], user["gen"], idle_s), **await db(users_mod.me_info, user)}
 
 
 @app.get("/api/logo")
@@ -737,7 +841,8 @@ async def stats():
     row["restore"] = await db(restore_check.overview_state)      # Sicherung eingespielt, Prüfliste offen (T8)
     pw = await db(maintenance.password_info)
     unprinted = ["backup_pw_unprinted"] if pw["set"] and not pw["printed"] else []
-    return {**row, "warnings": await db(core_warnings) + warn + dup + unprinted, "backup": newest}
+    season = ["season_due"] if await db(saison.due) else []      # Quittungen älter als 3 Monate auf dem Pi (#12)
+    return {**row, "warnings": await db(core_warnings) + warn + dup + unprinted + season, "backup": newest}
 
 
 app.include_router(adm)
@@ -762,6 +867,9 @@ app.include_router(tabs_mod.admin_router)
 app.include_router(maintenance.admin_router)
 app.include_router(restore_check.admin_router)
 app.include_router(cards.admin_router)
+app.include_router(krypt_mod.router)
+app.include_router(krypt_mod.admin_router)
+app.include_router(umzug_mod.admin_router)
 app.include_router(ledger.router)
 app.include_router(ledger.admin_router)
 app.include_router(stock_mod.router)
@@ -778,6 +886,10 @@ app.include_router(update_mod.router)
 app.include_router(update_mod.internal)
 app.include_router(update_net.router)
 app.include_router(users_mod.admin_router)
+app.include_router(saison.admin_router)                   # Saison abschliessen: Archiv, Gastdaten löschen (#12)
+app.include_router(firewall.admin_router)                 # Firewall: Verbindungen ins Internet (#10)
+app.include_router(sicherheit.admin_router)               # Sicherheitsereignisse in der Übersicht (#11)
+app.include_router(twofa.admin_router)                    # zweiter Faktor, kritische Aktionen bestätigen (#9)
 app.include_router(system_mod.router)
 app.include_router(system_mod.admin_router)
 app.include_router(status_mod.router)

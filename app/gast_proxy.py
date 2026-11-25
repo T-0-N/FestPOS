@@ -2,7 +2,7 @@
 
 Läuft als eigener Benutzer «festpos-gast» in einer Sandbox (deploy/systemd/festpos-gast.service) nur auf 127.0.0.1:8090.
 Er kennt weder Datenbank noch Payrexx-Schlüssel: Er liefert die Gästeseite aus und reicht genau diese Anfragen an
-FestPOS weiter (Verwaltungs-Port auf 127.0.0.1, mit dem Schlüssel aus /etc/festpos-gast/token):
+FestPOS weiter (Verwaltungs-Port auf 127.0.0.1, mit dem Schlüssel aus /run/festpos-gast/token):
 
     GET  /api/gast/menu, /api/gast/order/<token>     POST /api/gast/order, /api/gast/order/<token>/cancel, /webhook
     GET  /i18n/<sprache>.json, /media/<bild>, /api/logo   (Texte, Produktbilder, Logo)
@@ -33,7 +33,7 @@ STATIC = Path(os.environ.get("FESTPOS_STATIC", Path(__file__).resolve().parent.p
 UPSTREAM_HOST = os.environ.get("FESTPOS_GAST_UPSTREAM_HOST", "127.0.0.1")
 UPSTREAM_PORT = int(os.environ.get("FESTPOS_GAST_UPSTREAM_PORT", "8443"))
 UPSTREAM_TLS = os.environ.get("FESTPOS_GAST_UPSTREAM_TLS", "1") == "1"
-TOKEN_FILE = Path(os.environ.get("FESTPOS_GAST_TOKEN_FILE", "/etc/festpos-gast/token"))
+TOKEN_FILE = Path(os.environ.get("FESTPOS_GAST_TOKEN_FILE", "/run/festpos-gast/token"))
 BODY_MAX = 32 * 1024
 REPLY_MAX = 2 * 1024 * 1024
 RATE = {"get": (120, 60.0), "post": (12, 60.0),           # Anfragen pro Zeitfenster und Gast

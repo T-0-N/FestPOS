@@ -54,6 +54,7 @@ def tun(netz, tmp_path):  # noqa: F811
     etc.mkdir()
     cf = tmp_path / "cloudflared"
     n["env"] = {**n["env"], "FESTPOS_TUNNEL_DIR": str(etc), "FESTPOS_GAST_DIR": str(gast),
+                "FESTPOS_TUNNEL_RUN": str(etc), "FESTPOS_KRYPT_GEHEIM": str(tmp_path / "keiner"),
                 "FESTPOS_GAST_GROUP": grp.getgrgid(os.getgid()).gr_name, "FESTPOS_CLOUDFLARED": str(cf)}
     return {**n, "etc": etc, "gast": gast, "cf": cf}
 
@@ -86,6 +87,23 @@ def test_helper_sets_token_and_starts_services(tun):
     assert "systemctl disable --now festpos-tunnel.service festpos-gast.service" in netlog(t)
 
 
+def test_helper_keeps_admin_token_encrypted_and_runtime_copy_in_ram(tun, tmp_path):
+    """Daten verschlüsselt (T-0-N/FestPOS#3): Token der Verwaltung im Container, tunnel.env nur im Arbeitsspeicher."""
+    t = tun
+    geheim, ram = tmp_path / "krypt-geheim", tmp_path / "run-geheim"
+    geheim.mkdir()
+    ram.mkdir()
+    (t["etc"] / "tunnel-app.env").write_text("TUNNEL_TOKEN=alt\n")          # früher auf der Karte
+    t["env"] = {**t["env"], "FESTPOS_KRYPT_GEHEIM": str(geheim), "FESTPOS_TUNNEL_RUN": str(ram)}
+    _, out = request(t, "k1", action="tunnel", token=TOK)
+    assert out["ok"], out
+    assert (geheim / "tunnel-app.env").read_text() == f"TUNNEL_TOKEN={TOK}\n" and not (t["etc"] / "tunnel-app.env").exists()
+    assert (ram / "tunnel.env").read_text() == f"TUNNEL_TOKEN={TOK}\n"
+    assert (t["etc"] / "tunnel.env").is_symlink() and (t["etc"] / "tunnel.env").read_text() == f"TUNNEL_TOKEN={TOK}\n"
+    _, out = request(t, "k2", action="tunnel", off=True)
+    assert out["ok"] and not (geheim / "tunnel-app.env").exists() and not (ram / "tunnel.env").exists()
+
+
 def test_helper_refuses_bad_token_and_respects_festpos_conf(tun):
     t = tun
     for bad in ("x" * 80, TOK + "\nExecStart=/bin/sh", 42):
@@ -105,8 +123,8 @@ def test_helper_refuses_bad_token_and_respects_festpos_conf(tun):
 def test_node_script_takes_conf_first_then_admin_token():
     node = (ROOT / "deploy/festpos-node.sh").read_text()
     sec = node[node.index("# --- QR-Bestellung am Tisch (T22)"):node.index("# --- Firewall")]
-    assert sec.index('if [ -n "${TUNNEL_TOKEN:-}" ]') < sec.index('"$ETC/tunnel-app.env"')
-    assert 'cp "$ETC/tunnel-app.env" "$ETC/tunnel.env"' in sec and 'touch "$ETC/tunnel-conf"' in sec
+    assert sec.index('if [ -n "${TUNNEL_TOKEN:-}" ]') < sec.index('TUNNEL_APP=$ETC/tunnel-app.env')
+    assert 'cp "$TUNNEL_APP" "$GRUN/tunnel.env"' in sec and 'touch "$ETC/tunnel-conf"' in sec
     # Benutzer, Gruppe und Firewall immer – sonst liesse sich der Tunnel nicht ohne Neustart einschalten
     assert sec.index("useradd --system") < sec.index("TUNNEL_SRC=") and "GAST_RULES=" in sec.split("if [ -n \"$TUNNEL_SRC\" ]")[0]
 

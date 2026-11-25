@@ -15,7 +15,8 @@ Damit die Quittung als Kassenbeleg taugt:
     sonst stünde derselbe Umsatz zweimal auf Quittungen. Pro Person ein Original, danach Kopien.
   * MWST nur, wenn sie in der Verwaltung eingeschaltet ist (nicht jeder Verein ist MWST-pflichtig): dann mit
     MWST-Nummer, Satz pro Position und MWST-Betrag pro Satz (Preise inkl. MWST). Über CHF 400 braucht eine
-    MWST-Quittung zusätzlich Name und Adresse des Empfängers (Art. 57 MWSTV) – das geht in der Verwaltung.
+    MWST-Quittung zusätzlich Name und Ort des Empfängers (Art. 26 MWSTG; Entscheid: nicht die ganze Adresse,
+    datenschutzfreundlich) – das geht in der Verwaltung. Saison abschliessen (saison.py) verschiebt sie ins Archiv.
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ from . import ledger_base as lb
 from .i18n import t
 from .store import Store, StoreError, now_iso
 
-RECIPIENT_LIMIT = 40000          # Rappen: darüber braucht eine MWST-Quittung Name und Adresse des Empfängers
+RECIPIENT_LIMIT = 40000          # Rappen: darüber braucht eine MWST-Quittung Name und Ort des Empfängers
 MAX_HEADER_LINES = 6
 MAX_FOOTER_LINES = 3
 
@@ -344,7 +345,7 @@ def issue(store: Store, *, order_id: int | None = None, tab_id: int | None = Non
                 ln["order_uuid"], ln["order_no"] = it["order_uuid"], it["order_id"]
             rlines.append(ln)
         total = sum(x["amount"] for x in rlines)
-        # Über CHF 400 mit MWST gehören Name und Adresse des Gastes auf die Quittung (Art. 57 MWSTV): am Handy gar nicht
+        # Über CHF 400 mit MWST gehören Name und Ort des Gastes auf die Quittung (Art. 26 MWSTG): am Handy gar nicht
         # erst drucken (dort gibt es kein Feld dafür), in der Verwaltung nur mit Empfänger
         if total > RECIPIENT_LIMIT and lb.vat_enabled(store) and not recipient_lines:
             if by_user:

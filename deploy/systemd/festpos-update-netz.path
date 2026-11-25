@@ -1,0 +1,10 @@
+[Unit]
+Description=FestPOS: Internet-Aufträge der App übernehmen (festpos-update, eigener Dienst)
+
+[Path]
+# Eigener Dienst für net_up/net_down/net_share: wartet nicht hinter einem Update (update.sh), das gerade läuft
+DirectoryNotEmpty=/run/festpos/update-netz
+Unit=festpos-update-netz.service
+
+[Install]
+WantedBy=multi-user.target

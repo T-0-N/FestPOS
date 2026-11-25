@@ -1,5 +1,7 @@
 [Unit]
 Description=FestPOS: Web-App, API und Druck-Spooler
+After=festpos-krypt.service
+Requires=festpos-krypt.service
 After=rqlited.service festpos-node.service
 Requires=festpos-node.service
 Wants=rqlited.service

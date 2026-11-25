@@ -181,6 +181,17 @@ def test_cluster3_only_from_single(pi):
     assert run_job(pi, "cluster3") == {"ok": False, "code": "not_single"}
 
 
+def test_cluster3_restarts_even_if_moving_secrets_fails(pi, tmp_path):
+    """Verschlüsselt und festpos-krypt --einziehen scheitert: festpos.conf ist geschrieben, also trotzdem neu starten
+    (festpos-krypt verschiebt beim Start) – sonst bliebe die Erweiterung halb."""
+    krypt = tmp_path / "krypt"
+    krypt.write_text("#!/bin/sh\nexit 1\n")
+    krypt.chmod(0o755)
+    pi["env"]["FESTPOS_KRYPT_BIN"] = str(krypt)
+    assert run_job(pi, "cluster3") == {"ok": True, "restart": True}
+    assert backup.conf_value((pi["boot"] / "festpos.conf").read_text(), "CLUSTER_SIZE") == "3"
+
+
 def test_unknown_or_broken_job(pi):
     (pi["jobs"] / "fremd.txt").write_text("x")
     assert run_job(pi, "rm-rf") == {"ok": False, "code": "job"}

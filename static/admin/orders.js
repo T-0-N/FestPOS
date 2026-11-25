@@ -151,7 +151,7 @@ async function openOrder(id) {
 }
 
 // Quittungen einer Bestellung: Liste (Nummer, Zeit, von wem, Kopien) und drucken – was noch nicht quittiert ist (sonst
-// Kopien). Über CHF 400 mit MWST: Name und Adresse des Empfängers eintragen (steht dann auf der Quittung).
+// Kopien). Über CHF 400 mit MWST: Name und Ort des Gastes eintragen (steht dann auf der Quittung, #12).
 function receiptBox(o) {
   const list = o.receipts || [];
   const can_ = can("orders_edit") && o.receipt_enabled;
@@ -162,10 +162,12 @@ function receiptBox(o) {
       <span class="muted">(${esc(r.by_user || t("ledger.who.device", { name: r.by_device || "?" }))}${r.copies ? `, ${th("admin.receipt.copies", { count: r.copies })}` : ""})</span>
       ${can_ ? `<button type="button" class="btn sm" data-rcopy="${r.id}">${th("admin.receipt.copy_btn")}</button>` : ""}</li>`).join("")}</ul>` : ""}
     ${can_ ? `<div class="form" style="align-items:flex-end">
-      <label>${th("admin.receipt.recipient")}<textarea id="rcpt-to" rows="2" maxlength="300" style="width:300px"
-        placeholder="${th("admin.receipt.recipient_placeholder")}"></textarea></label>
+      <label>${th("admin.receipt.r_name")}<input id="rcpt-name" maxlength="48" autocomplete="off" style="width:220px"
+        placeholder="${th("admin.receipt.r_name_ph")}"></label>
+      <label>${th("admin.receipt.r_place")}<input id="rcpt-place" maxlength="48" autocomplete="off" style="width:180px"
+        placeholder="${th("admin.receipt.r_place_ph")}"></label>
       <button type="button" class="btn" id="rcpt-go">${th("admin.receipt.print_btn")}</button></div>
-      <p class="hint">${th("admin.receipt.dialog_hint")}</p>` : ""}`;
+      <p class="hint">${th("admin.receipt.r_hint")} ${th("admin.receipt.dialog_hint")}</p>` : ""}`;
 }
 function bindReceiptBox(dlg, o, refresh) {
   const done = (r) => {
@@ -177,7 +179,8 @@ function bindReceiptBox(dlg, o, refresh) {
   const rid = newId();                                   // gleiche Nummer bei Wiederholung: nur eine Quittung
   $("#rcpt-go", dlg)?.addEventListener("click", async (e) => {
     e.target.disabled = true;
-    done(await guard(() => api("POST", `/orders/${o.id}/receipt`, { request_id: rid, recipient: $("#rcpt-to", dlg).value })));
+    done(await guard(() => api("POST", `/orders/${o.id}/receipt`, { request_id: rid,
+      recipient_name: $("#rcpt-name", dlg).value, recipient_place: $("#rcpt-place", dlg).value })));
     e.target.disabled = false;
   });
   dlg.querySelectorAll("[data-rcopy]").forEach((b) => b.addEventListener("click", async () => {

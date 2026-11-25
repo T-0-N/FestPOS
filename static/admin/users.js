@@ -1,7 +1,7 @@
 /* FestPOS – Verwaltung › Seite «Benutzer» (nur Admin). T28 Stufe 2: kompakte Liste, «Aktiv» schaltet sofort,
    Rolle, Passwort und Löschen im Fenster (dlg.js), «+ Benutzer» oben rechts. Rollen und Rechte: feste
    Rollen Anzeige, Festleitung, Admin (nicht änderbar) und eigene Rollen aus einzelnen Rechten. */
-import { $, api, esc, fmtTime, guard, ME, roleName } from "./core.js";
+import { $, api, esc, fmtTime, guard, ME, roleName, toast } from "./core.js";
 import { page, RENDER } from "./shell.js";
 import { editDialog } from "./dlg.js";
 
@@ -52,14 +52,28 @@ function roleDialog(d, r) {
 // ------------------------------------------------------------------ Benutzer (nur Admin)
 // Zugriff (Punkt 3): «Verwaltung nur mit Gerätezertifikat». Einschalten geht nur, wenn diese Verbindung
 // selbst ein gültiges Zertifikat zeigt (sonst sperrte man sich aus); der Server prüft das ebenso.
-function accessCard(st, me) {
+function accessCard(st, me, roles) {
   const on = st?.admin_cert_only === "1", cert = me?.cert, ok = !!cert?.ok;
   return `<div class="card" id="access-card"><h3>${th("admin.access.title")}</h3>
     <label class="sw"><input type="checkbox" id="cert-only" ${on ? "checked" : ""} ${!on && !ok ? "disabled" : ""}><i aria-hidden="true"></i>
       <span class="sw-txt">${th("admin.access.cert_only")}</span></label>
     <p class="hint">${th("admin.access.hint")}</p>
     <p class="${ok ? "okmsg" : "hint"}">${ok ? th("admin.access.this_ok", { name: cert.name }) : cert ? th("admin.access.this_bad", { name: cert.name })
-      : th("admin.access.this_none")}</p></div>`;
+      : th("admin.access.this_none")}</p>
+    <h4>${th("admin.access.idle_h")}</h4>
+    <form class="form" id="idle-form"><label>${th("admin.access.idle_label")}<span class="inline"><input type="number" name="minutes" id="idle-min"
+      min="10" max="120" step="1" required value="${esc(st?.admin_idle_minutes || "30")}" style="width:90px"> ${th("admin.access.idle_unit")}</span></label>
+      <button type="submit" class="btn pri">${th("admin.common.save")}</button></form>
+    <p class="hint">${th("admin.access.idle_hint")}</p>
+    <h4>${th("admin.totp.required_h")}</h4>
+    <form class="form" id="totp-form">${roles.map((r) => `<label class="check"><input type="checkbox" name="role" value="${esc(r.id)}"
+      ${totpRoles(st).includes(r.id) ? "checked" : ""}> ${esc(roleName(r.id, roles))}</label>`).join("")}
+      <button type="submit" class="btn pri">${th("admin.common.save")}</button></form>
+    <p class="hint">${th("admin.totp.required_hint")}</p></div>`;
+}
+// Rollen mit zweitem Faktor als Pflicht (Einstellung totp_required_roles, JSON; ohne Eintrag: Admin)
+function totpRoles(st) {
+  try { const v = JSON.parse(st?.totp_required_roles ?? '["admin"]'); return Array.isArray(v) ? v : ["admin"]; } catch { return ["admin"]; }
 }
 
 RENDER.users = async () => {
@@ -76,11 +90,12 @@ RENDER.users = async () => {
       <button type="button" class="btn pri" id="user-add">${th("admin.users.add_btn")}</button></div>
     <div class="card"><h3>${th("admin.users.list", { count: d.users.length })}</h3>
       ${d.users.length ? `<div class="scroll"><table class="tbl"><thead><tr><th>${th("admin.users.name")}</th><th>${th("admin.users.role")}</th>
-        <th>${th("admin.users.active")}</th><th>${th("admin.users.last_login")}</th><th></th></tr></thead><tbody>
+        <th>${th("admin.users.active")}</th><th>${th("admin.totp.col")}</th><th>${th("admin.users.last_login")}</th><th></th></tr></thead><tbody>
         ${d.users.map((u) => `<tr data-uid="${u.id}" class="${u.active ? "" : "inactive"}"><td><b>${esc(u.name)}</b>${isSelf(u) ? ` <span class="hint">${th("admin.users.you")}</span>` : ""}</td>
           <td>${esc(nameOf(u.role))}</td>
           <td><label class="sw"><input type="checkbox" class="u-active" ${u.active ? "checked" : ""} ${isSelf(u) ? "disabled" : ""}><i aria-hidden="true"></i>
             <span class="sw-txt">${th("admin.users.active")}</span></label></td>
+          <td>${u.totp_on ? `<span class="status ok">${th("admin.totp.col_on")}</span>` : "–"}</td>
           <td>${u.last_login ? esc(fmtTime(u.last_login)) : "–"}</td>
           <td class="acts"><button class="btn sm u-edit">${th("admin.common.edit")}</button></td></tr>`).join("")}</tbody></table></div>`
         : `<p class="hint">${th("admin.users.none")}</p>`}
@@ -94,12 +109,23 @@ RENDER.users = async () => {
       </tbody></table></div>
       <p class="hint">${th("admin.roles.protect")}</p>
       <p class="hint">${th("admin.users.emergency")}</p></div>
-    ${accessCard(st, me)}`;
+    ${accessCard(st, me, d.roles)}`;
   $("#cert-only").addEventListener("change", async (e) => {
     const want = e.target.checked;
     if (want && !confirm(t("admin.access.on_confirm"))) { e.target.checked = false; return; }
     if (await guard(() => api("PUT", "/settings", { admin_cert_only: want }), t(want ? "admin.access.on_done" : "admin.access.off_done"))) RENDER.users();
     else e.target.checked = !want;
+  });
+  $("#idle-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const minutes = Math.round(Number($("#idle-min").value));
+    if (!(minutes >= 10 && minutes <= 120)) return toast(t("admin.access.idle_range"), true);
+    await guard(() => api("PUT", "/settings", { admin_idle_minutes: minutes }), t("admin.access.idle_saved", { minutes }));
+  });
+  $("#totp-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const roles = [...e.target.querySelectorAll('input[name="role"]:checked')].map((x) => x.value);
+    await guard(() => api("PUT", "/settings", { totp_required_roles: roles }), t("admin.totp.required_saved"));
   });
   $("#role-add").addEventListener("click", () => roleDialog(d, null));
   $("#main").querySelectorAll("tr[data-rid] .r-edit").forEach((b) => b.addEventListener("click", () =>
@@ -131,7 +157,8 @@ RENDER.users = async () => {
       body: `<div class="form u-form"><label>${th("admin.users.role")}${roleSel(u.role, self)}</label>
           <label>${th("admin.users.new_password")}<input name="password" type="password" minlength="8" maxlength="128"
             autocomplete="new-password" style="width:200px"></label></div>
-        <p class="hint">${th("admin.users.pw_keep")} ${th("admin.users.pw_rule")}</p>`,
+        <p class="hint">${th("admin.users.pw_keep")} ${th("admin.users.pw_rule")}</p>
+        ${u.totp_on ? `<label class="check"><input type="checkbox" name="totp_reset"> ${th("admin.totp.reset")}</label>` : ""}`,
       extra: self ? "" : `<button type="button" class="btn danger u-del">${th("admin.common.delete")}</button>`,
       onOpen: (dlg) => dlg.querySelector(".u-del")?.addEventListener("click", async () => {
         if (!confirm(t("admin.users.delete_confirm", { name: u.name }))) return;
@@ -141,9 +168,11 @@ RENDER.users = async () => {
         const body = {};
         if (!self && f.role.value !== u.role) body.role = f.role.value;
         if (f.password.value) body.password = f.password.value;
+        if (f.totp_reset?.checked) body.totp_reset = true;
         if (!Object.keys(body).length) return true;
         const ok = await guard(() => api("PUT", `/users/${uid}`, body),
-          body.password ? t("admin.users.pw_set", { name: u.name }) : t("admin.common.saved"));
+          body.password ? t("admin.users.pw_set", { name: u.name }) : body.totp_reset ? t("admin.totp.reset_done", { name: u.name })
+            : t("admin.common.saved"));
         if (ok) RENDER.users();
         return !!ok;
       },

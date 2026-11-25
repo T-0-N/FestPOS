@@ -57,6 +57,7 @@ def test_placeholder_password_blocks_emergency_login(client, monkeypatch):
 
 def test_warnings_for_admin_password(client, monkeypatch):
     from app import core
+    monkeypatch.setattr(core, "PW_WARN_LEN", 16)                        # Regel wie auf dem Pi (Tests: 6, conftest)
     assert "admin_pw_short" in client.get("/api/admin/stats", auth=AUTH).json()["warnings"]     # «geheim»: 6 Zeichen
     assert "admin_pw_short" in client.get("/api/status", auth=AUTH).json()["warnings"]
     monkeypatch.setattr(core.Config, "admin_password", "ein-langes-geheimnis")

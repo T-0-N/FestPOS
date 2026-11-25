@@ -28,7 +28,8 @@ CHROOT=${FESTPOS_CHROOT:-}                  # 1: im Image-Bau (pi-gen), kein lau
 step "Pakete installieren"
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  python3-venv python3-pip keepalived chrony nftables curl openssl fake-hwclock dnsmasq-base dosfstools e2fsprogs
+  python3-venv python3-pip keepalived chrony nftables curl openssl fake-hwclock dnsmasq-base dosfstools e2fsprogs \
+  cryptsetup-bin   # Daten verschlüsselt (T-0-N/FestPOS#3)
 # hwclock (RTC des Pi 5 prüfen: sudo hwclock -r); ältere Pi OS haben es ohne dieses Paket
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends util-linux-extra 2>/dev/null || true
 # adb: Handy per USB am Pi bekommt den Pi als Zeitserver (T2, festpos-handy-usb); fehlt es, zeigt die Verwaltung das
@@ -123,8 +124,8 @@ festpos_fstab_private /etc/fstab "$BOOT" && echo "fstab angepasst (fmask=0077,dm
 step "Dienste aktivieren (starten beim nächsten Boot)"
 [ -n "$CHROOT" ] || systemctl daemon-reload
 systemctl enable festpos-node rqlited festpos festpos-redirect keepalived chrony nftables festpos-settime.path \
-  festpos-update.service festpos-update.path festpos-dhcp-reload.path festpos-wiederherstellen.path festpos-einrichtung \
-  festpos-druckernetz.service festpos-druckernetz.path
+  festpos-update.service festpos-update.path festpos-update-netz.path festpos-dhcp-reload.path festpos-wiederherstellen.path festpos-einrichtung \
+  festpos-druckernetz.service festpos-druckernetz.path festpos-krypt.service festpos-krypt-pruefen.service festpos-netz.timer
 systemctl enable festpos-display.service festpos-display.path
 # Statusanzeige vorbereiten (Pakete jetzt, solange Internet da ist). Ein- und ausschalten: Verwaltung › Bildschirm am Pi
 bash "$SRC/deploy/festpos-kiosk.sh" --vorbereiten || echo "WARNUNG: Statusanzeige nicht vorbereitet (später: sudo festpos-kiosk --vorbereiten)"

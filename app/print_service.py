@@ -766,7 +766,7 @@ def _r_info(c: _Ctx, k: dict) -> None:
 
 
 def _r_guest(c: _Ctx, k: dict) -> None:
-    """Name und Adresse des Gastes (über CHF 400 mit MWST, app/receipts.py)."""
+    """Name und Ort des Gastes (über CHF 400 mit MWST, app/receipts.py; ältere Quittungen: Name und Adresse)."""
     if c.d.get("recipient"):
         _al(c, "left")
         c.b.line(t("bon.receipt.recipient", c.lang))

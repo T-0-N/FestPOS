@@ -42,5 +42,7 @@ IMG=$(find "$WORK/deploy" -name '*festpos*.img.xz' | head -1)
 [ -n "$IMG" ] || { echo "kein Image gebaut"; exit 1; }
 cp "$IMG" "$OUT/festpos-$VERSION.img.xz"
 (cd "$OUT" && sha256sum "festpos-$VERSION.img.xz" > "festpos-$VERSION.img.xz.sha256")
+PAKETE=$(find "$WORK/deploy" -name 'festpos-pakete.txt' | head -1)    # Debian-Pakete des Images (für die SBOM)
+[ -n "$PAKETE" ] && cp "$PAKETE" "$OUT/festpos-pakete.txt"
 python3 "$HERE/os_list.py" "$OUT/festpos-$VERSION.img.xz" "$VERSION" "" "${FESTPOS_TAG:-v$VERSION}" > "$OUT/festpos-os-list.json"
 echo "Fertig: $OUT/festpos-$VERSION.img.xz"

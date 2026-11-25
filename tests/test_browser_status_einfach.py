@@ -61,9 +61,11 @@ def test_updates_in_place_offline_hint_and_reload_on_new_version(server, browser
     def new_version(route):
         r = route.fetch()
         route.fulfill(response=r, headers={**r.headers, "x-festpos-version": "99.0.0"})
-    page.route(base + "/status-einfach?teil=1", new_version)
-    _until(page, "window.festposMarke === undefined")
+    with page.expect_navigation(timeout=30000):                           # neu laden (nicht abfragen, solange es lädt)
+        page.route(base + "/status-einfach?teil=1", new_version)
     page.unroute(base + "/status-einfach?teil=1")
+    page.wait_for_load_state()
+    assert page.evaluate("window.festposMarke") is None
     page.wait_for_selector("#s header")
     assert all(e == "console: Failed to load resource: net::ERR_FAILED" for e in errs), errs   # nur die abgebrochenen
     ctx.close()

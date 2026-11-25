@@ -21,6 +21,9 @@ RQLITED = os.environ.get("RQLITED") or shutil.which("rqlited") or "/nonexistent/
 # Unabhängig vom Testrechner: kein Ping ins echte Netz, keine Abfrage seiner Dienste (app/monitor.py, host_checks).
 # Gilt auch für die Testserver, die die Tests als eigene Prozesse starten (sie erben die Umgebung).
 os.environ.setdefault("FESTPOS_HOST_CHECKS", "0")
+# Notfall-Passwort der Tests ist «geheim» (tests.test_api.AUTH): Mindestlänge dafür herabsetzen. Die Regel selbst
+# (16 Zeichen, T-0-N/FestPOS#15) prüft tests/test_emergency.py mit core.PW_WARN_LEN = 16.
+os.environ.setdefault("FESTPOS_ADMIN_PASSWORD_MIN", "6")
 
 # Uhrzeit (T2): nie RTC, chrony, Zeit-Stand oder USB-Ergebnisse des Testrechners lesen. Feste Testordner: RTC, beim
 # Start daraus gestellt (die Uhr gilt als sicher), Batteriespannung unbekannt (kein Protokolleintrag), chronyc fehlt.
@@ -29,7 +32,19 @@ _ZEIT = Path(tempfile.mkdtemp(prefix="festpos-zeit-"))
 (_ZEIT / "rtc" / "hctosys").write_text("1\n")
 for _k, _v in (("FESTPOS_RTC_DIR", _ZEIT / "rtc"), ("FESTPOS_CHRONYC", "/nonexistent/chronyc"),
                ("FESTPOS_ZEIT_STAND", _ZEIT / "zeit-stand"), ("FESTPOS_RTC_NEUSTART", _ZEIT / "rtc-neustart"),
-               ("FESTPOS_HANDY_USB_DIR", _ZEIT / "handy-usb")):
+               ("FESTPOS_HANDY_USB_DIR", _ZEIT / "handy-usb"),
+               ("FESTPOS_HAERTUNG_STATE", _ZEIT / "haertung.json"),    # nie den Stand des Testrechners
+               ("FESTPOS_UPDATE_REQ_NETZ", _ZEIT / "update-netz"),       # Internet-Aufträge: wie ohne eigenen Dienst
+               ("FESTPOS_EREIGNISSE_DIR", _ZEIT / "ereignisse"),          # Sicherheitsereignisse (#11): nie /var/lib
+               ("FESTPOS_FW_WISH", _ZEIT / "firewall" / "modus.json"),    # Firewall (#10): nie /run/festpos
+               ("FESTPOS_FW_STAND", _ZEIT / "firewall-stand.json"),
+               ("FESTPOS_ARCHIV_DIR", _ZEIT / "archiv"),                   # Saison-Archiv (#12): nie /var/lib
+               ("FESTPOS_OS_STAND", _ZEIT / "os-stand.json"),              # Betriebssystem (#5): nie der Testrechner
+               ("FESTPOS_DPKG_STATUS", "/nonexistent/dpkg-status"),
+               ("FESTPOS_REBOOT_FLAG", _ZEIT / "reboot-required"),
+               ("FESTPOS_KRYPT_STAND", _ZEIT / "krypt-stand.json"),          # Daten verschlüsselt (#3): nie /run
+               ("FESTPOS_KRYPT_OFFEN", _ZEIT / "krypt-offen"),
+               ("FESTPOS_GEHEIM_RUN", _ZEIT / "geheim-quelle")):
     os.environ.setdefault(_k, str(_v))
 
 
@@ -154,10 +169,10 @@ def load_app():
 
     from app import (cards, catalog, core, devices, dhcp, display, fully, fully_apk, gast, ledger, mac_change, main,
                      maintenance, payrexx, payrexx_api, plan, bon_design, printer_net, printers, restore_check, tabs, settings_admin, status, status_simple, stock, system, tables, test_mode, time_admin,
-                     tunnel, update, update_net, uplink_admin, users, web)
-    for mod in (core, devices, dhcp, mac_change, display, fully, fully_apk, uplink_admin, update, update_net, users, printer_net, system, ledger,
+                     sicherheit, firewall, saison, krypt, umzug, tunnel, twofa, update, update_net, uplink_admin, users, web)
+    for mod in (core, devices, dhcp, mac_change, display, fully, fully_apk, uplink_admin, update, update_net, users, twofa, sicherheit, firewall, saison, printer_net, system, ledger,
                 test_mode, status, status_simple, stock, settings_admin, printers, catalog, tables, plan, cards, maintenance, restore_check,
-                time_admin, payrexx, payrexx_api, tunnel, web, gast, tabs, bon_design, main):
+                time_admin, payrexx, payrexx_api, tunnel, web, gast, tabs, bon_design, krypt, umzug, main):
         importlib.reload(mod)
     return main
 

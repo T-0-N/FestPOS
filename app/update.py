@@ -48,6 +48,7 @@ internal = APIRouter()
 UPDATE_DIR = Path(os.environ.get("FESTPOS_UPDATE_DIR", "/var/lib/festpos/update"))       # Pakete (gehört festpos)
 REQ_DIR = Path(os.environ.get("FESTPOS_UPDATE_REQ", "/run/festpos/update"))              # Aufträge an festpos-update
 REQ_NEU = Path(os.environ.get("FESTPOS_UPDATE_REQ_NEU", "/run/festpos/update-neu"))      # (erst fertig schreiben)
+REQ_NETZ = Path(os.environ.get("FESTPOS_UPDATE_REQ_NETZ", "/run/festpos/update-netz"))    # nur Internet-Aufträge
 STATUS_DIR = Path(os.environ.get("FESTPOS_UPDATE_STATUS", "/run/festpos/update-status"))  # Antworten (gehört root)
 ALT_DIR = Path(os.environ.get("FESTPOS_ALT", "/opt/festpos.alt"))                        # Sicherung (update.sh)
 
@@ -354,13 +355,16 @@ def fetch(plan: dict) -> str:
 
 
 # -- Aufträge an festpos-update --------------------------------------------------------------------------------------
-def place_request(req: dict, rid: str) -> None:
-    """Auftrag ablegen: erst fertig schreiben, dann in einem Schritt in den Auftragsordner (festpos-update.path)."""
-    if not REQ_DIR.is_dir() or not REQ_NEU.is_dir():
+def place_request(req: dict, rid: str, netz: bool = False) -> None:
+    """Auftrag ablegen: erst fertig schreiben, dann in einem Schritt in den Auftragsordner (festpos-update.path).
+    netz: Internet-Aufträge in den eigenen Ordner (festpos-update-netz.path) – sie warten so nicht hinter einem Update;
+    fehlt er (Helfer noch älter), in den gemeinsamen."""
+    target = REQ_NETZ if netz and REQ_NETZ.is_dir() else REQ_DIR
+    if not target.is_dir() or not REQ_NEU.is_dir():
         raise release.ReleaseError("no_helper")
     tmp = REQ_NEU / rid
     tmp.write_text(json.dumps({**req, "id": rid}), encoding="utf-8")
-    os.replace(tmp, REQ_DIR / f"anfrage-{rid}")
+    os.replace(tmp, target / f"anfrage-{rid}")
 
 
 def _result(rid: str) -> dict | None:

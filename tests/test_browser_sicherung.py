@@ -7,7 +7,7 @@ import pytest
 
 pytest.importorskip("playwright.sync_api")
 
-from tests.test_browser_p4 import _start, _watch, browser  # noqa: E402,F401  (browser = Fixture)
+from tests.test_browser_p4 import browser, _preconfirm, _start, _watch  # noqa: E402,F401  (browser = Fixture)
 from tests.test_browser_receipt import _until  # noqa: E402
 
 PW = "Theater-Sicherung-2026"
@@ -31,6 +31,7 @@ def _admin(browser, base, width=1300, height=900):  # noqa: F811
     page.fill("#pw", "geheim")
     page.press("#pw", "Enter")
     page.wait_for_selector(".side")
+    _preconfirm(page)                                    # kritische Aktionen: schon bestätigt (#9)
     return ctx, page, errs
 
 

@@ -285,8 +285,10 @@ def test_pi_setup_units_and_firewall():
     tunnel = (root / "deploy/systemd/festpos-tunnel.service").read_text()
     assert "User=festpos-gast" in gast and "--host 127.0.0.1 --port 8090" in gast
     for line in ("NoNewPrivileges=yes", "ProtectSystem=strict", "IPAddressDeny=any", "IPAddressAllow=localhost",
-                 "SocketBindAllow=tcp:8090", "CapabilityBoundingSet=", "InaccessiblePaths=-/var/lib/festpos -/etc/festpos"):
+                 "SocketBindAllow=tcp:8090", "CapabilityBoundingSet="):
         assert line in gast, line
+    hidden = next(x for x in gast.splitlines() if x.startswith("InaccessiblePaths=")).split("=", 1)[1].split()
+    assert {"-/var/lib/festpos", "-/etc/festpos", "-/run/festpos-geheim", "-/var/lib/festpos-krypt"} <= set(hidden)
     assert "User=festpos-tunnel" in tunnel and "DynamicUser" not in tunnel.replace("statt DynamicUser", "")
     assert "EnvironmentFile=/etc/festpos/tunnel.env" in tunnel
     # Review 2026-11, S4: cloudflared erreicht auf dem Pi nur den Gästedienst, nicht rqlite und nicht das Festnetz

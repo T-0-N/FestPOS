@@ -1,7 +1,7 @@
 /* FestPOS – Verwaltung › Seite «Wartung»: Update (signierte Pakete auf alle Pi), Update aus dem Internet, Sicherung
    (backup.js).
    Die Internet-Verbindung selbst: Seite «Internet» (internet.js). */
-import { $, $$, api, esc, fmtDate, guard, piName, toast } from "./core.js";
+import { $, $$, api, esc, fmtDate, guard, netEx, piName, toast } from "./core.js";
 import { applyTabs, page, RENDER, tabBar } from "./shell.js";
 import { backupCards, backupInit } from "./backup.js";
 
@@ -158,7 +158,7 @@ export function netConnForm(n) {
   return `<form id="net-form">
     <p class="net-title"><b>${th("admin.update.net_via")}</b> ${th("admin.update.net_on_pi", { pi: piName(n.node) })}</p>
     <div class="net-ways">
-      ${way("lan", `<div class="form"><label>${th("admin.update.net_gateway")}<input name="gateway" value="${esc(c.gateway)}" placeholder="192.168.55.1" inputmode="decimal" style="width:150px"></label>
+      ${way("lan", `<div class="form"><label>${th("admin.update.net_gateway")}<input name="gateway" value="${esc(c.gateway)}" placeholder="${esc(netEx("router"))}" inputmode="decimal" style="width:150px"></label>
         <label>${th("admin.update.net_dns")}<input name="dns" value="${esc(c.dns)}" placeholder="1.1.1.1" inputmode="decimal" style="width:150px"></label></div>`)}
       ${way("wlan", `<div class="form"><label>${th("admin.update.net_ssid")}<input name="ssid" value="${esc(c.ssid)}" autocomplete="off" style="width:180px"></label>
         <label>${th("admin.update.net_psk")}<input name="psk" type="password" autocomplete="new-password" placeholder="${c.psk_set ? th("admin.update.net_saved", { value: "••••" }) : ""}" style="width:180px"></label></div>`)}
@@ -237,6 +237,46 @@ async function updConfirm(path, body, question) {
   return r;
 }
 // Wartung: Reiter Update und Sicherung (Sicherung herunterladen/einspielen, Bestellungen löschen)
+// Betriebssystem (T-0-N/FestPOS#5): Stand pro Pi (festpos-os-update), Updates kommen mit dem Update-Paket
+const OS_RESULT = { ok: ["ok", "admin.os.r_ok"], repaired: ["pending", "admin.os.r_repaired"], failed: ["bad", "admin.os.r_failed"] };
+export const osOld = (n) => {
+  const d = n.info?.osup?.date;
+  return !!d && (Date.now() - new Date(d + "T12:00:00").getTime()) / 86400000 > 183;
+};
+const osState = (sys) => JSON.stringify((sys?.nodes || []).map((n) => [n.id, n.info?.osup || null]));
+// nach «Aus dem Internet»: warten, bis ein Pi einen neuen Stand meldet (info.osup), höchstens 30 Minuten
+async function osWait(before, until = Date.now() + 30 * 60000) {
+  await new Promise((r) => setTimeout(r, 10000));
+  if (!$("#os-card")?.isConnected) return;
+  const sys = await api("GET", "/system").catch(() => null);
+  if (sys && osState(sys) !== before) return osDraw(sys);
+  if (Date.now() < until) return osWait(before, until);
+  osDraw();
+}
+async function osDraw(known = null) {
+  const box = $("#os-card");
+  const sys = known || await api("GET", "/system").catch(() => null);
+  if (!box || !box.isConnected) return;
+  const nodes = (sys?.nodes || []).filter((n) => n.info?.osup);
+  const row = (n) => {
+    const o = n.info.osup, r = OS_RESULT[o.result];
+    return `<tr><td><b>${esc(piName(n.id))}</b></td><td>${esc(fmtDate(o.date))}${osOld(n) ? ` <span class="status pending">${th("admin.os.old")}</span>` : ""}</td>
+      <td>${r ? `<span class="status ${r[0]}">${th(r[1])}</span>` : "–"}</td>
+      <td>${esc(o.kernel || "–")}${o.reboot ? ` <span class="status pending">${th("admin.os.reboot")}</span>` : ""}</td></tr>`;
+  };
+  box.innerHTML = `<h3>${th("admin.os.title")}</h3><p class="hint">${th("admin.os.hint")}</p>
+    ${nodes.length ? `<div class="scroll"><table class="tbl"><thead><tr><th>${th("admin.sec.pi")}</th><th>${th("admin.os.date")}</th>
+      <th>${th("admin.os.result")}</th><th>${th("admin.os.kernel")}</th></tr></thead><tbody>${nodes.map(row).join("")}</tbody></table></div>`
+      : `<p class="hint">${th("admin.os.unknown")}</p>`}
+    ${nodes.some((n) => n.info.osup.reboot) ? `<p class="warnbox">${th("admin.os.reboot_hint")}</p>` : ""}
+    <div class="form"><button type="button" class="btn" id="os-online">${th("admin.os.online")}</button></div>
+    <p class="hint">${th("admin.os.online_hint")}</p>`;
+  $("#os-online").addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    if (await guard(() => api("POST", "/os/online"), t("admin.os.online_started"))) osWait(osState(sys));
+    else e.target.disabled = false;
+  });
+}
 RENDER.maint = async (refresh = false) => {
   let u;
   try { [u, NET] = await Promise.all([api("GET", "/update"), api("GET", "/update/net")]); updLost = false; }
@@ -248,7 +288,7 @@ RENDER.maint = async (refresh = false) => {
   }
   if (page !== "maint") return;
   UPD = u;
-  if (refresh && $("#upd-status")) return updDraw();
+  if (refresh && $("#upd-status")) { osDraw(); return updDraw(); }
   $("#main").innerHTML = `<h2>${th("admin.nav.maint")}</h2>${tabBar("maint")}<div id="upd-page" data-in="update">
     <div id="upd-status"></div>
     <div class="card" id="upd-net"><h3>${th("admin.update.net_title")}</h3>
@@ -266,6 +306,7 @@ RENDER.maint = async (refresh = false) => {
       <div id="upd-upload"></div>
     </div>
     <div class="card"><h3>${th("admin.update.usb_title")}</h3><p class="hint">${th("admin.update.usb_hint")}</p><div id="upd-usb"></div></div>
+    <div class="card" id="os-card"></div>
   </div>
   ${backupCards()}
   <div class="card" data-in="backup"><h3>${th("admin.reset.title")}</h3>
@@ -278,6 +319,7 @@ RENDER.maint = async (refresh = false) => {
   applyTabs();
   updDraw();
   backupInit();
+  osDraw();
   $("#reset").addEventListener("submit", async (e) => {
     e.preventDefault();
     if (e.target.c.value.trim().toUpperCase() !== t("admin.reset.word").toUpperCase()) return toast(t("admin.reset.type_word", { word: t("admin.reset.word") }), true);

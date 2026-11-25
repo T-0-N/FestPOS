@@ -10,8 +10,18 @@
 #      weg, sobald dieser Benutzer ein Passwort hat; ohne Passwort bleibt es (sonst gäbe es gar kein sudo mehr) und die
 #      Warnung steht im Journal.
 #
-#   festpos-haertung            alles anwenden (still, Meldungen ins Journal)
-#   festpos-haertung --stand    nur zeigen, wie es steht (JSON)
+#   4. Start nur von der SD-Karte: Bootloader (EEPROM) BOOT_ORDER=0xf1 und keine Netzwerk-Installation – sonst startet
+#      jemand mit kurzem Zugang ein fremdes System von USB oder über das Netz und liest die SD-Karte. Geschrieben wird
+#      mit rpi-eeprom-config --apply; wirksam nach dem nächsten Neustart. Rückgängig: Wiederherstellungs-Karte
+#      (Raspberry Pi Imager › Misc utility images › Bootloader), siehe ANLEITUNG.
+#   5. Bluetooth aus (dtoverlay=disable-bt in config.txt, Dienste aus).
+#   6. Keine Anmeldung an der Konsole: am Bildschirm zeigt tty1 weiter den Hinweistext (z.B. den Einrichtungscode),
+#      nimmt aber keinen Benutzer an; keine weiteren Konsolen (logind), keine serielle Konsole.
+#   Ergebnis für die App (Verwaltung › Pi): /run/festpos-haertung.json.
+#
+#   festpos-haertung              alles anwenden (still, Meldungen ins Journal)
+#   festpos-haertung --stand      nur zeigen, wie es steht (JSON)
+#   festpos-haertung --kein-login an der Konsole statt der Anmeldung (getty@tty1): Hinweis zeigen und warten
 #
 # Tests: FESTPOS_TEST_ROOT (alle Systempfade darunter), FESTPOS_BOOT (Boot-Partition).
 set -uo pipefail
@@ -21,6 +31,13 @@ BOOT=${FESTPOS_BOOT:-$R/boot/firmware}
 SSHD_DROP=$R/etc/ssh/sshd_config.d/10-festpos.conf
 SUDO_DROP=$R/etc/sudoers.d/festpos-haertung
 KEYFILE=festpos-ssh.pub
+STATE=${FESTPOS_HAERTUNG_STATE:-$R/run/festpos-haertung.json}
+UNITS=$R/etc/systemd/system
+GETTY_DROP=$UNITS/getty@tty1.service.d/zz-festpos-kein-login.conf
+LOGIND_DROP=$R/etc/systemd/logind.conf.d/festpos-konsole.conf
+SERIAL_GETTYS="serial-getty@ttyAMA10.service serial-getty@ttyAMA0.service serial-getty@ttyS0.service"
+BOOT_ORDER_WANT=0xf1               # 1 = SD-Karte, f = von vorne (nie USB, NVMe oder Netz)
+SELF=/usr/local/sbin/festpos-haertung
 
 log() { if [ -n "$R" ]; then echo "festpos-haertung: $*" >&2; else logger -t festpos-haertung -- "$*" 2>/dev/null || echo "$*" >&2; fi; }
 
@@ -140,19 +157,163 @@ EOF
   done
 }
 
+# -- Bootloader: Start nur von der SD-Karte ---------------------------------------------------------------------
+BL=unknown                         # ok | open | pending (wirkt nach Neustart) | failed | no_tool | unreadable
+CUR_EEPROM=""
+# Wert aus der EEPROM-Konfiguration – nur aus Abschnitten, die für diesen Pi gelten (ohne, [all], [pi5] …). Steht der
+# Schlüssel in einem anderen Abschnitt ([pi4], [0x…] …), gilt «?»: nicht sicher (write_bootloader räumt das auf).
+eeprom_model() {
+  case "$(tr -d '\0' < "$R/proc/device-tree/model" 2>/dev/null)" in
+    *"Compute Module 5"*) echo cm5 ;; *"Raspberry Pi 5"*) echo pi5 ;;
+    *"Compute Module 4"*) echo cm4 ;; *"Raspberry Pi 4"*) echo pi4 ;; *) echo "" ;;
+  esac
+}
+eeprom_get() {
+  printf '%s\n' "$2" | awk -v k="$1" -v m="$(eeprom_model)" '
+    /^[[:space:]]*\[.*\][[:space:]]*$/ { s = $0; gsub(/[][[:space:]]/, "", s); s = tolower(s); next }
+    index($0, k "=") == 1 { v = substr($0, length(k) + 2); gsub(/[[:space:]]/, "", v)
+                             val = (s == "" || s == "all" || (m != "" && s == m)) ? tolower(v) : "?" }
+    END { print val }'
+}
+eeprom_pending() { [ -f "$BOOT/pieeprom.upd" ] && [ -f "$BOOT/recovery.bin" ]; }
+
+eeprom_safe() {                    # eeprom_safe EINSTELLUNGEN -> 0, wenn nur von der SD-Karte und ohne Netzwerk-Installation
+  # NET_INSTALL_AT_POWER_ON=1 (Standard mancher Images) ginge vor NET_INSTALL_ENABLED=0: darum beide
+  [ "$(eeprom_get BOOT_ORDER "$1")" = "$BOOT_ORDER_WANT" ] && [ "$(eeprom_get NET_INSTALL_ENABLED "$1")" = 0 ] &&
+    [ "$(eeprom_get NET_INSTALL_AT_POWER_ON "$1")" = 0 ]
+}
+
+bootloader_state() {               # setzt BL und CUR_EEPROM, ohne etwas zu ändern
+  if ! command -v rpi-eeprom-config >/dev/null; then BL=no_tool; return 0; fi
+  CUR_EEPROM=$(rpi-eeprom-config 2>/dev/null) || true
+  if [ -z "$CUR_EEPROM" ]; then BL=unreadable; return 0; fi
+  if eeprom_safe "$CUR_EEPROM"; then
+    BL=ok
+    # wartet ein fremdes, unsicheres Update (pieeprom.upd), würde es die Härtung beim Neustart aufheben: neu schreiben
+    if eeprom_pending && ! eeprom_safe "$(rpi-eeprom-config "$BOOT/pieeprom.upd" 2>/dev/null)"; then BL=open; fi
+  elif eeprom_pending && eeprom_safe "$(rpi-eeprom-config "$BOOT/pieeprom.upd" 2>/dev/null)"; then
+    BL=pending                     # unser Update wartet auf den Neustart (ein fremdes wird ersetzt)
+  else
+    BL=open
+  fi
+}
+
+write_bootloader() {
+  local tmp
+  bootloader_state
+  [ "$BL" = open ] || return 0
+  tmp=$(mktemp)
+  # bisherige Einstellungen behalten, nur diese zwei ersetzen – unter [all], damit kein Abschnitt [pi4] o.ä. sie schluckt
+  printf '%s\n' "$CUR_EEPROM" | grep -vE '^(BOOT_ORDER|NET_INSTALL_ENABLED|NET_INSTALL_AT_POWER_ON)=' > "$tmp"
+  printf '[all]\nBOOT_ORDER=%s\nNET_INSTALL_ENABLED=0\nNET_INSTALL_AT_POWER_ON=0\n' "$BOOT_ORDER_WANT" >> "$tmp"
+  if rpi-eeprom-config --apply "$tmp" >/dev/null 2>&1; then
+    BL=pending; log "Bootloader: Start nur von der SD-Karte (BOOT_ORDER=$BOOT_ORDER_WANT) – wirkt nach dem nächsten Neustart"
+  else
+    BL=failed; log "WARNUNG: Bootloader-Einstellung nicht geschrieben (rpi-eeprom-config --apply gescheitert)"
+  fi
+  rm -f "$tmp"
+}
+
+# -- Bluetooth aus -----------------------------------------------------------------------------------------------
+bt_config_off() {                  # dtoverlay=disable-bt gilt für diesen Pi: ohne Abschnitt, unter [all] oder [pi5]
+  [ -f "$BOOT/config.txt" ] && awk '
+    /^[[:space:]]*\[/ { s = tolower($0); gsub(/[[:space:]]/, "", s); on = (s == "[all]" || s == "[pi5]"); next }
+    on && /^[[:space:]]*dtoverlay=disable-bt([[:space:]]|$)/ { found = 1 }
+    END { exit !found }' on=1 "$BOOT/config.txt"
+}
+
+write_bt() {
+  if [ -f "$BOOT/config.txt" ] && ! bt_config_off; then
+    printf '\n[all]\ndtoverlay=disable-bt\n' >> "$BOOT/config.txt"   # [all]: nicht in einem Abschnitt wie [cm5] landen
+    log "Bluetooth: in config.txt abgeschaltet – wirkt nach dem nächsten Neustart"
+  fi
+  [ -n "$R" ] || systemctl disable --now hciuart.service bluetooth.service >/dev/null 2>&1 || true
+}
+
+# -- Keine Anmeldung an der Konsole ------------------------------------------------------------------------------
+write_console() {
+  local new u changed=""
+  new=$(mktemp)
+  {
+    echo "# FestPOS: keine Anmeldung am Bildschirm (festpos-haertung). Der Hinweistext (/etc/issue, z.B. der"
+    echo "# Einrichtungscode) bleibt sichtbar; statt «login» zeigt festpos-haertung --kein-login einen Hinweis."
+    echo "[Service]"
+    echo "ExecStart="
+    echo "ExecStart=-/sbin/agetty --noclear --skip-login --login-program $SELF --login-options --kein-login %I \$TERM"
+  } > "$new"
+  if ! cmp -s "$new" "$GETTY_DROP"; then
+    install -d "${GETTY_DROP%/*}"; install -m 0644 "$new" "$GETTY_DROP"; changed=1
+  fi
+  printf '# FestPOS: keine weiteren Konsolen (Alt+F2 …) – festpos-haertung\n[Login]\nNAutoVTs=0\nReserveVT=0\n' > "$new"
+  if ! cmp -s "$new" "$LOGIND_DROP"; then
+    install -d "${LOGIND_DROP%/*}"; install -m 0644 "$new" "$LOGIND_DROP"; changed=1
+    # logind liest NAutoVTs nur beim Start: neu starten (laufende Sitzungen bleiben)
+    [ -n "$R" ] || systemctl try-restart systemd-logind.service >/dev/null 2>&1 || true
+  fi
+  rm -f "$new"
+  # bei jedem Lauf: weitere Konsolen (Alt+F2 …) und serielle Anmeldungen, die noch laufen, beenden – auch wenn sie
+  # schon gesperrt waren (NAutoVTs=0 und mask verhindern nur neue)
+  if [ -z "$R" ]; then
+    # shellcheck disable=SC2086
+    systemctl stop 'getty@tty[2-9].service' $SERIAL_GETTYS >/dev/null 2>&1 || true
+  fi
+  for u in $SERIAL_GETTYS; do
+    [ "$(readlink "$UNITS/$u" 2>/dev/null)" = /dev/null ] && continue
+    if [ -n "$R" ]; then install -d "$UNITS"; ln -sfn /dev/null "$UNITS/$u"
+    else systemctl mask --now "$u" >/dev/null 2>&1 || true; fi   # --now: eine laufende Anmeldeaufforderung gleich weg
+    changed=1
+  done
+  [ -n "$changed" ] || return 0
+  log "Konsole: keine Anmeldung mehr am Bildschirm"
+  if [ -z "$R" ]; then               # Anmeldeaufforderung gleich ersetzen – ausser dort ist gerade jemand angemeldet
+    systemctl daemon-reload 2>/dev/null || true
+    who 2>/dev/null | grep -qw tty1 || systemctl try-restart getty@tty1.service 2>/dev/null || true
+  fi
+}
+
+console_off() {
+  local u
+  [ -f "$GETTY_DROP" ] && [ -f "$LOGIND_DROP" ] || return 1
+  for u in $SERIAL_GETTYS; do [ "$(readlink "$UNITS/$u" 2>/dev/null)" = /dev/null ] || return 1; done
+  if [ -z "$R" ]; then                # und wirklich keine Anmeldung mehr am Laufen
+    for u in $SERIAL_GETTYS getty@tty2.service getty@tty3.service getty@tty4.service getty@tty5.service getty@tty6.service; do
+      systemctl is-active --quiet "$u" 2>/dev/null && return 1
+    done
+  fi
+  return 0
+}
+
+kein_login() {                     # statt «login» an der Konsole
+  printf '\nFestPOS: Anmelden am Bildschirm ist abgeschaltet. Zugang für die Technik: SSH mit Schlüssel.\n'
+  exec sleep infinity
+}
+
+write_state() {
+  [ "$BL" = unknown ] && bootloader_state
+  install -d "${STATE%/*}"
+  printf '{"boot": "%s", "boot_order": "%s", "bt_off": %s, "console_off": %s, "at": %s}\n' "$BL" \
+    "$(eeprom_get BOOT_ORDER "$CUR_EEPROM")" "$(bt_config_off && echo true || echo false)" \
+    "$(console_off && echo true || echo false)" "$(date +%s)" > "$STATE.neu"
+  chmod 0644 "$STATE.neu"; mv -f "$STATE.neu" "$STATE"
+}
+
 stand() {
   local user home keys=0 nopw=false
   IFS=: read -r user home <<< "$(first_user)"
   [ -n "$user" ] && keys=$(key_count "$R$home/.ssh/authorized_keys")
   if [ -n "$user" ] && grep -lqsE "^[[:space:]]*${user}[[:space:]].*NOPASSWD" "$R"/etc/sudoers.d/* 2>/dev/null; then nopw=true; fi
-  printf '{"ssh_keys_only": %s, "user": "%s", "keys": %s, "sudo_without_password": %s, "password_set": %s}\n' \
+  bootloader_state
+  printf '{"ssh_keys_only": %s, "user": "%s", "keys": %s, "sudo_without_password": %s, "password_set": %s, ' \
     "$([ -f "$SSHD_DROP" ] && echo true || echo false)" "$user" "$keys" "$nopw" \
     "$([ -n "$user" ] && has_password "$user" && echo true || echo false)"
+  printf '"boot": "%s", "bt_off": %s, "console_off": %s}\n' "$BL" "$(bt_config_off && echo true || echo false)" \
+    "$(console_off && echo true || echo false)"
 }
 
 case "${1:-}" in
   --stand) stand ;;
-  '') take_keys; write_sshd; write_sudo ;;
+  --kein-login) kein_login ;;
+  '') take_keys; write_sshd; write_sudo; write_bootloader; write_bt; write_console; write_state ;;
   *) echo "Aufruf: festpos-haertung [--stand]" >&2; exit 2 ;;
 esac
 exit 0

@@ -2,7 +2,10 @@
 
 Die einzige Stelle, die festpos.conf, node.conf, festpos-tls/ und die Update-Schlüssel für eine neue Karte
 zusammenstellt – das Kartenpaket (ZIP zum Herunterladen) und die Karte, die der Pi selbst schreibt, bekommen damit
-genau denselben Inhalt. Läuft als root (festpos-wiederherstellen, festpos-karte), braucht nur die Boot-Partition.
+genau denselben Inhalt. Läuft als root (festpos-wiederherstellen, festpos-karte). Sind die Daten verschlüsselt
+(T-0-N/FestPOS#3), stehen die geheimen Werte und Schlüssel nicht auf der Boot-Partition: dann aus dem, was
+festpos-krypt beim Start entpackt hat (geheim.merged/key_file). Die neue Karte bekommt sie ausgeschrieben und
+verschiebt sie beim ersten Start selbst in ihren verschlüsselten Bereich.
 
 Fälle (Plan T10, 2.1):
   - Einzelbetrieb, Buchstabe b/c: CLUSTER_SIZE=3, CLUSTER_SECRET ausgeschrieben (Pi A wird danach umgestellt).
@@ -14,7 +17,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from . import backup
+from . import backup, geheim
 
 LETTERS = ("a", "b", "c")
 
@@ -26,8 +29,9 @@ class KartenFehler(Exception):
 
 
 def conf_text(boot: Path) -> str:
+    """festpos.conf, wie sie gilt (mit den geheimen Werten, auch wenn sie im Container liegen)."""
     try:
-        return (boot / "festpos.conf").read_text(encoding="utf-8", errors="surrogateescape")
+        return geheim.merged((boot / "festpos.conf").read_text(encoding="utf-8", errors="surrogateescape"))
     except OSError:
         raise KartenFehler("conf") from None
 
@@ -51,7 +55,7 @@ def effective_secret(text: str, boot: Path, etc: Path) -> str:
     s = backup.conf_value(text, "CLUSTER_SECRET") or ""
     if s.strip() not in backup.PLACEHOLDER_SECRETS:
         return s
-    for p in (boot / "festpos-tls" / "server.key", etc / "tls" / "server.key"):
+    for p in (geheim.key_file(boot, "server.key") or boot / "festpos-tls" / "server.key", etc / "tls" / "server.key"):
         try:
             return backup.derived_secret(p.read_bytes())
         except OSError:
@@ -72,7 +76,7 @@ def boot_files(boot: Path, etc: Path, letter: str) -> dict[str, bytes]:
     out = {"festpos.conf": conf.encode("utf-8", errors="surrogateescape"), "node.conf": f"NODE={letter}\n".encode()}
     tls = {}
     for name in backup.TLS_FILES:
-        p = boot / "festpos-tls" / name
+        p = (geheim.key_file(boot, name) if name in geheim.KEY_FILES else None) or boot / "festpos-tls" / name
         if p.is_file():
             tls[name] = p.read_bytes()
     if not {"ca.crt", "server.crt", "server.key"} <= set(tls):

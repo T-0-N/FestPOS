@@ -55,8 +55,9 @@ def _ids_items(rc: dict) -> list[dict]:
     if old.get("ledger_key"):
         same = old["ledger_key"] == now.get("ledger_key")
         out.append(_item("ledger_key", "ok" if same else "wait" if keys == "restoring" else "warn"))
-    if keys in ("differ", "differ_cluster"):
-        out.append(_item("keys", "warn", cluster=keys == "differ_cluster", single=len(Config.peers) <= 1))
+    if keys in ("differ", "differ_cluster", "other_net"):
+        out.append(_item("keys", "warn", cluster=keys == "differ_cluster", single=len(Config.peers) <= 1,
+                         other_net=keys == "other_net"))
     return out
 
 

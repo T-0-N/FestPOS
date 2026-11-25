@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("playwright.sync_api")
 
-from tests.test_browser_p4 import _start, _watch, browser  # noqa: E402,F401  (browser = Fixture)
+from tests.test_browser_p4 import browser, _preconfirm, _start, _watch  # noqa: E402,F401  (browser = Fixture)
 from tests.test_browser_receipt import _until  # noqa: E402
 
 
@@ -29,6 +29,8 @@ def _login(ctx, base):
     page.fill("#user", "admin")
     page.fill("#pw", "geheim")
     page.press("#pw", "Enter")
+    page.wait_for_selector("#pnetcard")
+    _preconfirm(page)                                    # kritische Aktionen: schon bestätigt (#9)
     page.wait_for_selector("#pnetcard")
     return page, errs
 

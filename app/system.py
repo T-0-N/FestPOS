@@ -45,7 +45,12 @@ PEER_MAX_AGE = 30   # Antwort eines anderen Pi so lange als «live» verwenden (
 # Was in die Datenbank kommt (node_info.<pi>), wenn es sich ändert. Temperatur, freier Speicher und Laufzeit ändern
 # ständig: die gibt es nur live (dieser Pi selbst, die anderen über /api/internal/node). Jeder Schreibzugriff geht
 # über rqlite auf die SD-Karten aller Pi (T9).
-DURABLE = ("version", "kernel", "model", "os", "ip", "upd", "svc", "ram_total", "disk_total", "backup", "apk", "pnet")
+DURABLE = ("version", "kernel", "model", "os", "ip", "upd", "svc", "ram_total", "disk_total", "backup", "apk", "pnet",
+           "harden", "osup", "krypt")
+# Start nur von der SD-Karte, Bluetooth aus, keine Anmeldung an der Konsole: schreibt festpos-haertung (root) bei
+# jedem Start und Update
+HAERTUNG_STATE = os.environ.get("FESTPOS_HAERTUNG_STATE", "/run/festpos-haertung.json")
+BOOT_STATES = ("ok", "open", "pending", "failed", "no_tool", "unreadable")
 
 
 # -- Infos dieses Pi --------------------------------------------------------------------------------------
@@ -61,6 +66,58 @@ def _net_status() -> dict | None:
     from . import update_net
     try:
         return update_net.keep_status()
+    except Exception:  # noqa: BLE001 – Infos des Pi kommen trotzdem
+        return None
+
+
+def harden_status() -> dict | None:
+    """Stand von festpos-haertung: {boot, bt_off, console_off} – None, wenn (noch) nicht geschrieben."""
+    try:
+        d = json.loads(_read(HAERTUNG_STATE) or "null")
+    except ValueError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    boot = d.get("boot") if d.get("boot") in BOOT_STATES else "unreadable"
+    return {"boot": boot, "bt_off": d.get("bt_off") is True, "console_off": d.get("console_off") is True}
+
+
+# Betriebssystem (T-0-N/FestPOS#5): Stand schreibt festpos-os-update (root); ohne Stand das Datum der Paketdatenbank
+OS_STAND = os.environ.get("FESTPOS_OS_STAND", "/var/lib/festpos-os/stand.json")
+DPKG_STATUS = os.environ.get("FESTPOS_DPKG_STATUS", "/var/lib/dpkg/status")
+REBOOT_FLAG = os.environ.get("FESTPOS_REBOOT_FLAG", "/run/reboot-required")
+OS_OLD_DAYS = 183
+
+
+def os_status() -> dict | None:
+    """{date: Stand der Pakete (JJJJ-MM-TT), result, error, open, kernel, reboot} – None ohne dpkg (z.B. Tests)."""
+    try:
+        d = json.loads(_read(OS_STAND) or "{}")
+    except ValueError:
+        d = {}
+    d = d if isinstance(d, dict) else {}
+    date = d.get("date")
+    if not date:
+        try:
+            date = time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(DPKG_STATUS)))
+        except OSError:
+            return None
+    return {"date": str(date)[:10], "result": d.get("result"), "error": str(d.get("error") or "")[:300],
+            "open": d.get("open"), "kernel": platform.release(), "reboot": os.path.exists(REBOOT_FLAG)}
+
+
+def _fw_status() -> dict | None:
+    from . import firewall
+    try:
+        return firewall.local_status()
+    except Exception:  # noqa: BLE001 – Infos des Pi kommen trotzdem
+        return None
+
+
+def _krypt_status() -> dict | None:
+    from . import krypt
+    try:
+        return krypt.local_status()
     except Exception:  # noqa: BLE001 – Infos des Pi kommen trotzdem
         return None
 
@@ -82,7 +139,11 @@ def local_info() -> dict:
                   "apk": fully_apk.local_checksum(),              # welche Fully-APK dieser Pi hat (T6)
                   "net": _net_status(),                           # dauerhaft verbunden (Internet c), nur live
                   "tunnel": _tunnel_status(),                     # Tunnel zur QR-Bestellung auf diesem Pi (T22)
-                  "pnet": printer_net.local_state()}              # Drucker-Netz: VLAN-Schnittstelle eingerichtet?
+                  "pnet": printer_net.local_state(),              # Drucker-Netz: VLAN-Schnittstelle eingerichtet?
+                  "harden": harden_status(),                      # Start nur von SD, Bluetooth, Konsole
+                  "fw": _fw_status(),                             # Firewall ins Internet (#10), nur live
+                  "osup": os_status(),                            # Updates des Betriebssystems (#5)
+                  "krypt": _krypt_status()}                       # Daten verschlüsselt (#3)
     model = _read("/proc/device-tree/model").strip("\x00\n ")
     info["model"] = model or platform.machine()
     for line in _read("/etc/os-release").splitlines():
@@ -122,6 +183,8 @@ def durable(info: dict) -> dict:
     d = {k: info.get(k) for k in DURABLE}
     if isinstance(d["backup"], dict):
         d["backup"] = {k: v for k, v in d["backup"].items() if k != "at"}
+    from . import krypt
+    d["krypt"] = krypt.durable(d["krypt"])
     return d
 
 
@@ -222,6 +285,22 @@ class PowerIn(BaseModel):
 
 def _phones_in_use(cfg: dict) -> list[dict]:
     return [t for t in cfg["targets"] if t.get("active", True)]
+
+
+@admin_router.get("/netinfo")
+async def netinfo():
+    """FestPOS-Netz, VIP und Beispieladressen für Vorschläge in der Verwaltung (T-0-N/FestPOS#2)."""
+    from . import netz
+    return netz.info()
+
+
+@admin_router.post("/os/online")
+async def os_online():
+    """Sicherheitsupdates mit Internet direkt über apt holen (nur Sicherheitsquellen, festpos-os-update --online über
+    festpos-wiederherstellen). Läuft einige Minuten; Ergebnis im Stand des Pi (info.osup)."""
+    from . import cards
+    job = await db(cards.submit, "os_online", {})
+    return {"started": True, "job": job}
 
 
 @admin_router.get("/system")

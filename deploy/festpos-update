@@ -7,6 +7,8 @@
   festpos-update --ordner ~/       Update aus einem Ordner holen (festpos.zip + festpos.zip.sig) –
                                    wie ein USB-Stick, z.B. nach «scp festpos.zip* pi@…:~/»
   festpos-update --netz-aus        Internet für «Update aus dem Internet» wieder aus (macht sonst ein Zeitgeber)
+  festpos-update --anfrage-netz    vom Dienst festpos-update-netz.path: nur Internet-Aufträge (net_up/net_down/
+                                   net_share) – eigener Dienst, damit sie nicht hinter einem Update warten
 
 Aufträge der App: install, rollback, keys, net_up/net_down/net_share (Internet), tunnel (QR-Bestellung, T22),
 cloudflared (Tunnel-Programm installieren oder aktualisieren).
@@ -22,6 +24,8 @@ Antworten und Fortschritt: /run/festpos/update-status (gehört root, die App lie
 USB-Stick und Ordner: ein gültiges, neueres Paket wird der App übergeben, die es auf alle Pi verteilt (einer
 nach dem anderen, der druckende zuletzt). Läuft die App nicht, wird es nur auf diesem Pi eingespielt.
 """
+import base64
+import contextlib
 import fcntl
 import grp
 import ipaddress
@@ -47,6 +51,7 @@ from app import release  # noqa: E402  (gehört root wie dieses Programm)
 
 PAKETE = Path(os.environ.get("FESTPOS_UPDATE_DIR", "/var/lib/festpos/update"))       # gehört festpos: nur lesen
 ANFRAGEN = Path(os.environ.get("FESTPOS_UPDATE_REQ", "/run/festpos/update"))         # Aufträge der App
+ANFRAGEN_NETZ = Path(os.environ.get("FESTPOS_UPDATE_REQ_NETZ", "/run/festpos/update-netz"))   # nur Internet
 STATUS = Path(os.environ.get("FESTPOS_UPDATE_STATUS", "/run/festpos/update-status"))  # Antworten (root, lesbar)
 WORK = Path(os.environ.get("FESTPOS_UPDATE_WORK", "/var/lib/festpos-update"))       # nur root
 USB_MNT = Path(os.environ.get("FESTPOS_USB_MOUNT", "/run/festpos-usb"))
@@ -226,13 +231,28 @@ def take(zip_src: Path, sig_src: Path, name: str, expect_sha: str | None = None)
     return {"zip": z, "sig": sig, "sha": sha}
 
 
+FOREIGN = ("unknown_key", "bad_signature", "sig_namespace")     # fremd signiert oder verändert
+
+
+def note_foreign(p: dict, e: release.ReleaseError) -> None:
+    """Fremd signiertes oder verändertes Paket: Sicherheitsereignis für Protokoll und Übersicht (T-0-N/FestPOS#11)."""
+    try:
+        from app import ereignisse
+        ereignisse.append({"kind": "update_foreign", "code": e.code, "file": str(p.get("name") or p["zip"].name)[:80],
+                           "fp": str(e.kw.get("fp") or "")[:80]})
+    except Exception as x:  # noqa: BLE001 – das Update bleibt abgewiesen, auch wenn die Meldung nicht geht
+        print(f"Sicherheitsereignis nicht geschrieben: {type(x).__name__}: {x}", file=sys.stderr)
+
+
 def check(p: dict, keys: list) -> dict:
     """Signatur und Aufbau der Kopie prüfen -> p mit version, key."""
     try:
         key = release.verify(p["zip"], p["sig"], keys)
         info = release.inspect_zip(p["zip"])
-    except release.ReleaseError:
+    except release.ReleaseError as e:
         p["zip"].unlink(missing_ok=True)
+        if e.code in FOREIGN:
+            note_foreign(p, e)
         raise
     return {**p, "version": info["version"], "key": key, "size": p["zip"].stat().st_size}
 
@@ -248,6 +268,11 @@ def install(p: dict, log: Protokoll) -> dict:
         root = release.extract_zip(p["zip"], neu)
         log(f"==> Signatur gültig ({p['key'].comment or p['key'].fp}) – spiele Version {p['version']} ein")
         rc = run(["bash", str(root / "deploy" / "update.sh")], log, cwd=root)
+        if rc in (0, 2) and version_of(DEST) == p["version"]:
+            try:
+                package_keys(root, log)                        # Schlüsselwechsel erst nach gelungenem Update
+            except OSError as e:
+                log(f"WARNUNG: Schlüsselwechsel aus dem Paket nicht übernommen: {type(e).__name__}: {e}")
     finally:
         shutil.rmtree(neu, ignore_errors=True)
         p["zip"].unlink(missing_ok=True)
@@ -258,6 +283,74 @@ def install(p: dict, log: Protokoll) -> dict:
     code = None if ok else "not_installed" if rc in (0, 2) else "update_failed"
     return {"ok": ok, "rc": rc, "before": before, "after": after, "code": code,
             "kw": {"installed": after or "?"} if code == "not_installed" else {}, "msg": summary(log.lines, ok)}
+
+
+def _write_synced(p: Path, text: str) -> None:
+    """Datei fertig schreiben und auf die Karte bringen, dann in einem Schritt an ihren Platz."""
+    tmp = p.with_name(f".{p.name}.neu")
+    tmp.unlink(missing_ok=True)
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644), "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
+def package_keys(root: Path, log: Protokoll) -> None:
+    """Schlüsselwechsel aus einem eben eingespielten, vertrauenswürdig signierten Paket (deploy/update-keys/):
+    zurückgezogene Fingerabdrücke zur Liste auf der Boot-Partition (nie wieder entfernt), neue Schlüssel als
+    festpos-update-<Fingerabdruck>.pub dazu. Dateien mit nur zurückgezogenen Schlüsseln werden umbenannt
+    (*.pub.zurueckgezogen) – so bleibt sichtbar, was war."""
+    src, boot = root / release.PACKAGE_KEYS, boot_dir()
+    if not src.is_dir() or src.is_symlink():
+        return
+    revoked = release.load_revoked(boot, strict=True)        # nicht lesbar: nichts ändern (OSError -> Warnung)
+    # Liste und Schlüssel des Pakets: fehlt die Liste, wird nichts zurückgezogen; ist etwas da, aber nicht lesbar oder
+    # fehlerhaft, bricht der ganze Schlüsselwechsel ab (OSError -> Warnung im Protokoll), bevor etwas geändert wird
+    try:
+        new_revoked = release.parse_revoked_strict(release.read_regular(src / "zurueckgezogen.txt", release.MAX_KEYFILE)
+                                                   .decode("utf-8", "replace")) - revoked
+    except FileNotFoundError:
+        new_revoked = set()
+    except release.ReleaseError as e:
+        raise OSError(f"zurueckgezogen.txt im Paket: {e.code}") from None
+    found_all = []
+    for pub in sorted(src.glob("*.pub")):
+        try:
+            found, bad = release.parse_keys(release.read_regular(pub, release.MAX_KEYFILE).decode("utf-8", "replace"))
+        except release.ReleaseError as e:
+            raise OSError(f"{pub.name} im Paket: {e.code}") from None
+        if bad or not found:
+            raise OSError(f"{pub.name} im Paket: kein gültiger Schlüssel")
+        found_all += found
+    # 1. neue Schlüssel ablegen (fertig geschrieben und auf der Karte), 2. erst dann zurückziehen: scheitert 1., gilt
+    # alles wie bisher – nie ohne gültigen Schlüssel, aber mit zurückgezogenem alten
+    gone = revoked | new_revoked
+    have = {k.blob for k in release.load_keys(boot)[0]}
+    for found in [found_all]:
+        for k in found:
+            if k.fp in gone or k.blob in have:
+                continue
+            name = "festpos-update-" + re.sub(r"[^A-Za-z0-9]", "", k.fp.removeprefix("SHA256:"))[:16] + ".pub"
+            _write_synced(boot / name, f"ssh-ed25519 {base64.b64encode(k.blob).decode()} {k.comment}".rstrip() + "\n")
+            have.add(k.blob)
+            log(f"==> Neuer Update-Schlüssel übernommen: {k.fp} ({k.comment or name})")
+    if new_revoked:
+        text = "".join(f"{fp}  zurückgezogen mit Version {version_of(DEST)}\n" for fp in sorted(new_revoked))
+        with open(boot / release.REVOKED_FILE, "a", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        log(f"==> Update-Schlüssel zurückgezogen: {', '.join(sorted(new_revoked))}")
+        revoked |= new_revoked
+    for p in sorted(boot.glob(release.KEY_GLOB)):            # Datei nur noch mit zurückgezogenen Schlüsseln
+        try:
+            found, _ = release.parse_keys(release.read_regular(p, release.MAX_KEYFILE).decode("utf-8", "replace"))
+        except (OSError, release.ReleaseError):
+            continue
+        if found and all(k.fp in revoked for k in found):
+            p.rename(p.with_name(p.name + ".zurueckgezogen"))
+            log(f"==> {p.name}: Schlüssel zurückgezogen, Datei umbenannt")
 
 
 def rollback(req: dict, log: Protokoll) -> dict:
@@ -298,6 +391,12 @@ RESOLV = Path(os.environ.get("FESTPOS_RESOLV", "/etc/resolv.conf"))
 NODE_ENV = Path(os.environ.get("FESTPOS_NODE_ENV", "/etc/festpos/env"))
 SSID_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,32}$")
 PSK_RE = re.compile(r"^(?:[\x20-\x7e]{8,63}|[0-9a-fA-F]{64})$")
+# WLAN-Land: ohne Land sind Kanal 12/13 und viele 5-GHz-Kanäle gesperrt – ein Router oder Hotspot dort wäre unsichtbar
+WLAN_LAND = os.environ.get("FESTPOS_WLAN_LAND", "CH")
+SCAN_MAX = float(os.environ.get("FESTPOS_NET_SCAN_MAX", "30"))        # so lange nach dem WLAN suchen (Sekunden)
+SCAN_STEP = float(os.environ.get("FESTPOS_NET_SCAN_STEP", "3"))
+NET_ACTIONS = ("net_up", "net_down", "net_share")
+NET_PUBLIC = "internet.json"                                         # Stand der Verbindung für die App (STATUS)
 
 
 def sh(cmd: list[str], log: Protokoll, timeout: int = 90) -> int:
@@ -377,11 +476,96 @@ def net_state(data: dict | None = None) -> dict:
     p = work_dir() / "internet.json"
     if data is not None:
         p.write_text(json.dumps(data), encoding="utf-8")
+        publish_net(data)
         return data
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+def publish_net(st: dict | None) -> None:
+    """Stand für die App (gehört root, lesbar): nach einem Neustart der App übernimmt sie eine dauerhafte Verbindung,
+    statt sie abzubauen. Ohne Geheimnisse (kein WLAN-Passwort, keine alte resolv.conf)."""
+    if not st:
+        (STATUS / NET_PUBLIC).unlink(missing_ok=True)
+        return
+    write_status(NET_PUBLIC, {k: st.get(k) for k in ("via", "dev", "keep", "gateway", "dns", "ssid", "at", "share")})
+
+
+def nm_con_of(dev: str) -> str:
+    """NetworkManager-Verbindung, die auf diesem Gerät aktiv ist ("" = keine)."""
+    try:
+        out = subprocess.run(["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", dev], capture_output=True,
+                             text=True, errors="replace", timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (out.splitlines() or [""])[0].strip()
+
+
+def nm_get(con: str, field: str) -> str | None:
+    """Einstellung einer Verbindung; None = Abfrage gescheitert (nicht dasselbe wie eine leere Einstellung)."""
+    try:
+        r = subprocess.run(["nmcli", "-g", field, "connection", "show", con], capture_output=True, text=True,
+                           errors="replace", timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def nm_lan_up(st: dict, gw: str, dns: str, lan, log: "Protokoll") -> bool:
+    """Weg «Router im Netz» über NetworkManager: Route und DNS nur im Arbeitsspeicher (--temporary) an die Verbindung
+    des FestPOS-Netzes. NetworkManager schreibt /etc/resolv.conf selbst und behält beides, auch wenn eth0 kurz
+    weg war (Switch-Port, Kabel) – direkt in resolv.conf geschrieben ginge es dabei verloren. Nach einem Neustart ist
+    es weg (festpos-node startet ohne). False: ging nicht (ältere NetworkManager) – dann der alte Weg."""
+    dev = lan_dev(lan)
+    con = nm_con_of(dev)
+    if not con:
+        return False
+    old_dns, old_ignore = nm_get(con, "ipv4.dns"), nm_get(con, "ipv4.ignore-auto-dns")
+    if old_dns is None or not old_ignore:                 # bisherige Werte unbekannt: nichts ändern, alter Weg
+        return False
+    st["nm"] = {"con": con, "dev": dev, "dns": old_dns, "ignore": old_ignore}
+    net_state(st)                                         # erst festhalten, dann ändern: «aus» findet alles
+    if sh(["nmcli", "connection", "modify", "--temporary", con, "+ipv4.routes", f"0.0.0.0/0 {gw} 900",
+           "ipv4.dns", dns, "ipv4.ignore-auto-dns", "yes"], log) or sh(["nmcli", "device", "reapply", dev], log):
+        if nm_lan_down(st, log):                          # zurück: nur dann den gemerkten Stand vergessen
+            st.pop("nm", None)
+            net_state(st)
+        return False
+    return True
+
+
+def nm_lan_down(st: dict, log: "Protokoll") -> bool:
+    """Route und DNS wieder wie vorher. False: ging nicht (dann bleibt der gemerkte Stand für «aus»)."""
+    nm, gw = st.get("nm") or {}, st.get("gateway") or ""
+    if not nm.get("con"):
+        return True
+    ok = not sh(["nmcli", "connection", "modify", "--temporary", nm["con"], "-ipv4.routes", f"0.0.0.0/0 {gw} 900",
+                 "ipv4.dns", nm.get("dns") or "", "ipv4.ignore-auto-dns", nm.get("ignore") or "no"], log)
+    return not sh(["nmcli", "device", "reapply", nm.get("dev") or ""], log) and ok
+
+
+def wlan_seen(dev: str, ssid: str) -> bool:
+    """Sieht das WLAN-Gerät dieses Netz? (Liste neu suchen lassen; «:» steht in der Liste als «\\:»)"""
+    try:
+        out = subprocess.run(["nmcli", "-t", "-f", "SSID", "device", "wifi", "list", "ifname", dev, "--rescan", "yes"],
+                             capture_output=True, text=True, errors="replace", timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return ssid in {ln.replace("\\:", ":") for ln in out.splitlines()}
+
+
+def wlan_find(dev: str, ssid: str, log: "Protokoll") -> bool:
+    """Funk an ist nicht gleich «Netz gefunden»: suchen, bis es da ist (höchstens SCAN_MAX Sekunden)."""
+    end = time.monotonic() + SCAN_MAX
+    while True:
+        if wlan_seen(dev, ssid):
+            return True
+        if time.monotonic() >= end:
+            log(f"WLAN «{ssid}» nach {int(SCAN_MAX)} s nicht gefunden")
+            return False
+        time.sleep(SCAN_STEP)
 
 
 SHARE_TABLE = "festpos_share"
@@ -460,12 +644,14 @@ def net_share(req: dict, log: Protokoll) -> dict:
     if req.get("off") is True:
         share_off(log)
         log("Weitergabe aus")
+        net_state({**st, "share": False})                   # nach einem Neustart der App: den wahren Stand übernehmen
         return {"ok": True}
     lan = lan_net()
     try:
         share_on(lan, st.get("dev") or lan_dev(lan), log, share_allow(req, lan))
     except OSError:
         raise release.ReleaseError("net_share") from None
+    net_state({**st, "share": True})
     return {"ok": True, "iface": st.get("dev") or ""}
 
 
@@ -478,13 +664,16 @@ def net_down(log: Protokoll) -> dict:
     if subprocess.run(["nmcli", "-t", "-f", "NAME", "connection", "show"], capture_output=True, text=True,
                       errors="replace", timeout=20).stdout.splitlines().count(NET_CON):
         sh(["nmcli", "connection", "delete", NET_CON], log)
-    if st.get("gateway"):
+    if st.get("nm"):
+        nm_lan_down(st, log)
+    if st.get("gateway") and "resolv" in st:                 # alter Weg (Route direkt), auch nach einem Rückfall
         sh(["ip", "route", "del", "default", "via", st["gateway"]], log, 20)
     if st.get("resolv") is not None:
         RESOLV.write_text(st["resolv"], encoding="utf-8")
     if devices()["wlan"]:
         sh(["nmcli", "radio", "wifi", "off"], log, 20)
     (work_dir() / "internet.json").unlink(missing_ok=True)
+    publish_net(None)
     return {"ok": True}
 
 
@@ -497,15 +686,16 @@ def net_up(req: dict, log: Protokoll) -> dict:
         gw, dns = ip4(req.get("gateway")), ip4(req.get("dns"))
         if ipaddress.IPv4Address(gw) not in lan or gw in (str(lan.network_address), str(lan.broadcast_address)):
             raise release.ReleaseError("net_gateway", name=gw)
-        if RESOLV.is_symlink():
-            raise release.ReleaseError("net_resolv")
-        st["resolv"] = RESOLV.read_text(encoding="utf-8") if RESOLV.is_file() else ""
-        st["gateway"] = gw
-        net_state(st)                                         # erst festhalten, dann ändern: «aus» findet alles
-        if sh(["ip", "route", "replace", "default", "via", gw, "metric", "900"], log, 20):
-            net_down(log)
-            raise release.ReleaseError("net_gateway", name=gw)
-        RESOLV.write_text(f"# FestPOS: nur für das Update (festpos-update)\nnameserver {dns}\n", encoding="utf-8")
+        st["gateway"], st["dns"] = gw, dns
+        if not nm_lan_up(st, gw, dns, lan, log):              # Rückfall: Route und resolv.conf direkt (wie bisher)
+            if RESOLV.is_symlink():
+                raise release.ReleaseError("net_resolv")
+            st["resolv"] = RESOLV.read_text(encoding="utf-8") if RESOLV.is_file() else ""
+            net_state(st)                                     # erst festhalten, dann ändern: «aus» findet alles
+            if sh(["ip", "route", "replace", "default", "via", gw, "metric", "900"], log, 20):
+                net_down(log)
+                raise release.ReleaseError("net_gateway", name=gw)
+            RESOLV.write_text(f"# FestPOS: nur für das Update (festpos-update)\nnameserver {dns}\n", encoding="utf-8")
         dev = ""
     elif via in ("wlan", "usb"):
         found = devices()
@@ -516,11 +706,15 @@ def net_up(req: dict, log: Protokoll) -> dict:
             if not found["wlan"]:
                 raise release.ReleaseError("net_no_wlan")
             dev = found["wlan"][0]
+            st["ssid"] = ssid
             net_state(st)
+            sh(["iw", "reg", "set", WLAN_LAND], log, 20)          # Land: sonst fehlen Kanal 12/13 und viele 5-GHz-Kanäle
             sh(["rfkill", "unblock", "wifi"], log, 20)
             sh(["nmcli", "radio", "wifi", "on"], log, 20)
-            time.sleep(float(os.environ.get("FESTPOS_NET_SCAN_WAIT", "5")))   # Funk an: Netze erst suchen lassen
+            seen = wlan_find(dev, ssid, log)                       # versteckte Netze: trotzdem versuchen
             extra = ["wifi-sec.key-mgmt", "wpa-psk"] if psk else []
+            if not seen:
+                extra += ["802-11-wireless.hidden", "yes"]
             if sh(["nmcli", "connection", "add", "save", "no", "type", "wifi", "ifname", dev, "con-name", NET_CON,
                    "ssid", ssid, "connection.autoconnect", "no", "ipv4.method", "auto", "ipv6.method", "disabled",
                    "ipv4.route-metric", "900", *extra], log):
@@ -536,7 +730,7 @@ def net_up(req: dict, log: Protokoll) -> dict:
                 pw.unlink(missing_ok=True)
             if rc:
                 net_down(log)
-                raise release.ReleaseError("net_wlan", name=ssid)
+                raise release.ReleaseError("net_wlan" if seen else "net_wlan_not_found", name=ssid)
         else:
             if not found["usb"]:
                 raise release.ReleaseError("net_no_usb")
@@ -567,6 +761,7 @@ def net_up(req: dict, log: Protokoll) -> dict:
         sh(["systemd-run", f"--unit={NET_TIMER}", f"--on-active={NET_MAX}", "--timer-property=AccuracySec=10s",
             str(Path(sys.argv[0]).resolve()), "--netz-aus"], log, 20)
     st["dev"] = dev
+    st["share"] = req.get("share") is True
     net_state(st)
     try:
         allow = share_allow(req, lan)
@@ -590,7 +785,11 @@ def net_up(req: dict, log: Protokoll) -> dict:
 # TUNNEL_TOKEN in festpos.conf (tunnel-conf, festpos-node), hat er Vorrang: dann nur speichern, nichts umschalten.
 # Benutzer, Gruppe und Firewall des Gästedienstes legt festpos-node bei jedem Start an – hier nur Dateien und Dienste.
 TUNNEL_DIR = Path(os.environ.get("FESTPOS_TUNNEL_DIR", "/etc/festpos"))
-GAST_DIR = Path(os.environ.get("FESTPOS_GAST_DIR", "/etc/festpos-gast"))
+# Token und Schlüssel des Gästedienstes nur im Arbeitsspeicher; den Token aus der Verwaltung bei verschlüsselten Daten
+# im Container, sonst in TUNNEL_DIR (T-0-N/FestPOS#3). /etc/festpos/tunnel.env verweist auf die Arbeitskopie.
+TUNNEL_RUN = Path(os.environ.get("FESTPOS_TUNNEL_RUN", "/run/festpos-geheim"))
+KRYPT_GEHEIM = Path(os.environ.get("FESTPOS_KRYPT_GEHEIM", "/run/festpos-krypt/fs/geheim"))
+GAST_DIR = Path(os.environ.get("FESTPOS_GAST_DIR", "/run/festpos-gast"))
 GAST_GROUP = os.environ.get("FESTPOS_GAST_GROUP", "festpos-gast")
 CLOUDFLARED = Path(os.environ.get("FESTPOS_CLOUDFLARED", "/usr/bin/cloudflared"))
 TUNNEL_UNITS = ("festpos-gast.service", "festpos-tunnel.service")
@@ -624,17 +823,27 @@ def tunnel(req: dict, log: Protokoll) -> dict:
     tok = str(req.get("token") or "").strip()
     if not off and not tunnel_token.parse(tok):
         raise release.ReleaseError("tunnel_bad")
-    app_env, fp = TUNNEL_DIR / "tunnel-app.env", TUNNEL_DIR / "tunnel-app.fp"
+    fp = TUNNEL_DIR / "tunnel-app.fp"
+    app_env = (KRYPT_GEHEIM if KRYPT_GEHEIM.is_dir() else TUNNEL_DIR) / "tunnel-app.env"
+    copies = (TUNNEL_DIR / "tunnel-app.env", KRYPT_GEHEIM / "tunnel-app.env", TUNNEL_RUN / "quelle" / "tunnel-app.env")
     if off:
-        app_env.unlink(missing_ok=True)
+        for old in copies:
+            old.unlink(missing_ok=True)
         fp.unlink(missing_ok=True)
     else:
-        put_file(app_env, f"TUNNEL_TOKEN={tok}\n", 0o600)
+        put_file(app_env, f"TUNNEL_TOKEN={tok}\n", 0o600)        # zuerst sicher gespeichert ...
         put_file(fp, tunnel_token.fingerprint(tok) + "\n", 0o644)
+        for old in copies:                                       # ... dann die anderen Kopien weg
+            if old != app_env:
+                old.unlink(missing_ok=True)
     if (TUNNEL_DIR / "tunnel-conf").exists():
         log("Tunnel: TUNNEL_TOKEN in festpos.conf hat Vorrang – Einstellung der Verwaltung gespeichert, sonst nichts geändert")
         return {"ok": True, "conf": True}
-    env = TUNNEL_DIR / "tunnel.env"
+    env = TUNNEL_RUN / "tunnel.env"
+    link = TUNNEL_DIR / "tunnel.env"
+    if link != env and not link.is_symlink():
+        link.unlink(missing_ok=True)
+        link.symlink_to(env)
     if off:
         sh(["systemctl", "disable", "--now", *reversed(TUNNEL_UNITS)], log, 60)
         env.unlink(missing_ok=True)
@@ -724,13 +933,33 @@ def read_request(path: str) -> dict | None:
     return d if isinstance(d, dict) else None
 
 
-def process(rid: str, req: dict | None) -> dict:
+@contextlib.contextmanager
+def net_lock():
+    """Internet-Aufträge nie gleichzeitig (eigener Dienst festpos-update-netz und der Zeitgeber --netz-aus)."""
+    work_dir()
+    with open(WORK / "netz.lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def process(rid: str, req: dict | None, netz: bool = False) -> dict:
+    """netz: aus dem eigenen Dienst für Internet-Aufträge – nimmt nur net_up/net_down/net_share an."""
+    if netz or (req or {}).get("action") in NET_ACTIONS:
+        with net_lock():
+            return _process(rid, req, netz)
+    return _process(rid, req, netz)
+
+
+def _process(rid: str, req: dict | None, netz: bool) -> dict:
     log = Protokoll(rid)
-    write_status("laeuft.json", {"id": rid, "pid": os.getpid(), "at": int(time.time())})
+    busy = "laeuft-netz.json" if netz else "laeuft.json"
+    write_status(busy, {"id": rid, "pid": os.getpid(), "at": int(time.time())})
     out: dict = {"id": rid, "action": (req or {}).get("action"), "ok": False, "code": None, "msg": "",
                  "before": version_of(DEST), "after": None}
     try:
         action = (req or {}).get("action")
+        if netz and action not in NET_ACTIONS:
+            raise release.ReleaseError("request_bad")
         if action == "keys":
             out.update(ok=True)
         elif action == "install":
@@ -769,7 +998,7 @@ def process(rid: str, req: dict | None) -> dict:
         out["at"] = int(time.time())
         log.close()
         write_status(f"{rid}.json", out)
-        (STATUS / "laeuft.json").unlink(missing_ok=True)
+        (STATUS / busy).unlink(missing_ok=True)
     return out
 
 
@@ -784,17 +1013,18 @@ def aufraeumen() -> None:
         pass
     try:
         for e in os.scandir(STATUS):
-            if e.is_file(follow_symlinks=False) and e.name not in ("keys.json", "usb.json") and \
+            if e.is_file(follow_symlinks=False) and e.name not in ("keys.json", "usb.json", NET_PUBLIC) and \
                     e.stat(follow_symlinks=False).st_mtime < grenze:
                 os.unlink(e.path)
     except OSError:
         pass
 
 
-def anfragen() -> int:
-    publish_keys()
+def anfragen(netz: bool = False) -> int:
+    if not netz:
+        publish_keys()
     try:
-        eintraege = list(os.scandir(ANFRAGEN))
+        eintraege = list(os.scandir(ANFRAGEN_NETZ if netz else ANFRAGEN))
     except OSError:
         eintraege = []
     jobs = []
@@ -811,9 +1041,11 @@ def anfragen() -> int:
             pass
     rc = 0
     for _, rid, req in sorted(jobs):
-        rc = rc or (0 if process(rid, req)["ok"] else 2)
-    publish_keys()                                            # Version/Sicherung haben sich evtl. geändert
-    aufraeumen()
+        ok = process(rid, req, netz)["ok"]                    # jeden Auftrag ausführen, auch nach einem Fehler
+        rc = rc or (0 if ok else 2)
+    if not netz:
+        publish_keys()                                        # Version/Sicherung haben sich evtl. geändert
+        aufraeumen()
     return rc
 
 
@@ -1008,6 +1240,8 @@ def schluessel() -> int:
 def main(argv: list[str]) -> int:
     if argv[1:2] == ["--anfrage"]:
         return anfragen()
+    if argv[1:2] == ["--anfrage-netz"]:
+        return anfragen(netz=True)
     if argv[1:2] == ["--schluessel"]:
         return schluessel()
     if len(argv) == 3 and argv[1] == "--usb":
@@ -1015,7 +1249,10 @@ def main(argv: list[str]) -> int:
     if len(argv) == 3 and argv[1] == "--ordner":
         return ordner(argv[2])
     if argv[1:2] == ["--netz-aus"]:
-        net_down(Protokoll(None))
+        with net_lock():
+            if net_state().get("keep"):                       # inzwischen dauerhaft verbunden: nicht abbauen
+                return 0
+            net_down(Protokoll(None))
         return 0
     print(__doc__.split("\n\n")[1], file=sys.stderr)
     return 2

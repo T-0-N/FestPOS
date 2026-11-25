@@ -305,6 +305,7 @@ def test_admin_routes_need_login(client):
         for r in routes:
             yield from flat(r.original_router.routes) if hasattr(r, "original_router") else [r]
     admin_routes = [r for r in flat(main.app.router.routes)
-                    if isinstance(r, APIRoute) and r.path.startswith("/api/admin/") and r.path != "/api/admin/login"]
+                    if isinstance(r, APIRoute) and r.path.startswith("/api/admin/")
+                    and r.path not in ("/api/admin/login", "/api/admin/login/totp")]
     assert len(admin_routes) > 90
     assert [r.path for r in admin_routes if not any(d.dependency is core.admin for d in r.dependencies)] == []

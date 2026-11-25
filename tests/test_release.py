@@ -238,3 +238,36 @@ def test_build_zip_refuses_when_tracked_files_are_missing(tmp_path, monkeypatch)
     assert "fehlen im Ordner" in str(e.value) and "app/uplink.py" in str(e.value)
     assert not (tmp_path / "out.zip").exists()
     shutil.rmtree(repo)
+
+
+def test_several_signatures_and_revoked_keys(tmp_path):
+    """Schlüsselwechsel (T-0-N/FestPOS#13): mehrere Signaturen in einer .sig-Datei, eine gültige genügt;
+    zurückgezogene Schlüssel gelten nie."""
+    from tests.release_util import build_bundle, keypair
+    z = build_bundle(tmp_path / "f.zip", "99.0.0")
+    old_pk, old_line = keypair("alt")
+    new_pk, new_line = keypair("neu")
+    sig = release.sign(z, new_pk) + release.sign(z, old_pk)
+    old_keys = release.parse_keys(old_line)[0]
+    assert release.verify(z, sig, old_keys).comment == "alt"                    # nur der alte bekannt
+    assert release.verify(z, sig, release.parse_keys(new_line)[0]).comment == "neu"
+    with pytest.raises(release.ReleaseError) as e:
+        release.verify(z, sig, release.parse_keys(keypair("fremd")[1])[0])
+    assert e.value.code == "unknown_key"
+    (tmp_path / "festpos-update.pub").write_text(old_line + "\n" + new_line + "\n")
+    (tmp_path / release.REVOKED_FILE).write_text(f"{old_keys[0].fp}  alt\nkein fingerabdruck\n")
+    keys, problems = release.load_keys(tmp_path)
+    assert [k.comment for k in keys] == ["neu"] and "zurückgezogen" in problems[0]
+    # Liste da, aber nicht lesbar (Verknüpfung, zu gross): kein Schlüssel gilt – nie ein zurückgezogener wieder
+    (tmp_path / release.REVOKED_FILE).unlink()
+    (tmp_path / "anderswo.txt").write_text("")
+    (tmp_path / release.REVOKED_FILE).symlink_to(tmp_path / "anderswo.txt")
+    keys, problems = release.load_keys(tmp_path)
+    assert keys == [] and "nicht lesbar" in problems[0]
+    with pytest.raises(OSError):
+        release.load_revoked(tmp_path, strict=True)
+    (tmp_path / release.REVOKED_FILE).unlink()
+    (tmp_path / release.REVOKED_FILE).write_text("x" * (release.MAX_KEYFILE + 1))
+    assert release.load_keys(tmp_path)[0] == []
+    (tmp_path / release.REVOKED_FILE).unlink()
+    assert len(release.load_keys(tmp_path)[0]) == 2                             # fehlt: keine zurückgezogen

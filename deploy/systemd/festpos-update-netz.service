@@ -1,0 +1,11 @@
+[Unit]
+Description=FestPOS: Internet ein/aus und weitergeben (Auftrag der App, festpos-update)
+After=local-fs.target systemd-tmpfiles-setup.service NetworkManager.service
+# keine Startgrenze: jeder Auftrag startet den Dienst einmal
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/festpos-update --anfrage-netz
+# WLAN suchen und verbinden dauert höchstens etwa 2 Minuten
+TimeoutStartSec=5min

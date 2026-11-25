@@ -16,10 +16,16 @@ def _login(c, name, pw=PW):
     return c.post("/api/admin/login", json={"name": name, "password": pw})
 
 
-def _hdr(c, name, pw=PW):
+def _hdr(c, name, pw=PW, confirmed=True):
+    """Token des Benutzers – bestätigt (kritische Aktionen, T-0-N/FestPOS#9), wie nach «Bitte bestätigen»."""
     r = _login(c, name, pw)
     assert r.status_code == 200, r.text
-    return {"Authorization": f"Bearer {r.json()['token']}"}
+    hdr = {"Authorization": f"Bearer {r.json()['token']}"}
+    if confirmed:
+        r = c.post("/api/admin/me/confirm", headers=hdr, json={"password": pw})
+        assert r.status_code == 200, r.text
+        hdr = {"Authorization": f"Bearer {r.json()['token']}"}
+    return hdr
 
 
 @pytest.fixture
@@ -40,12 +46,14 @@ def test_every_rule_matches_a_route_and_defaults_are_safe():
     assert len(routes) > 60
     import re
     concrete = [(m, re.sub(r"\{[^}]+\}", "7", p)) for m, p in routes]
-    for m, rx, _ in auth.RULES:                                      # keine Regel ohne Route (Tippfehler)
+    for m, rx, _ in (*auth.RULES, *auth.CRITICAL_RULES):            # keine Regel ohne Route (Tippfehler)
         assert any(m == m2 and rx.match(p) for m2, p in concrete), f"Regel ohne Route: {m} {rx.pattern}"
     roles = {(m, p): auth.required_role(m, p) for m, p in concrete}
     # Anzeige darf fast nur lesen
     view_writes = {(m, p) for (m, p), r in roles.items() if r == "view" and m != "GET"}
     assert view_writes == {("POST", "/api/admin/me/password"), ("POST", "/api/admin/me/logout-all"),
+                           ("POST", "/api/admin/me/refresh"), ("POST", "/api/admin/me/confirm"),
+                           *(("POST", f"/api/admin/me/totp/{x}") for x in ("start", "confirm", "later", "off", "codes")),
                            ("POST", "/api/admin/jobs/7/reprint"), ("POST", "/api/admin/jobs/7/resolve")}
     for m, p in concrete:                                            # sicherheitsrelevant: nur Admin
         if p.startswith(("/api/admin/users", "/api/admin/backup", "/api/admin/restore", "/api/admin/cluster/",
@@ -65,7 +73,9 @@ def test_login_and_role_limits(client, team):
     v, l_, a = team["Vera"], team["Lea"], team["Ada"]
     me = client.get("/api/admin/me", headers=l_).json()
     from app import auth
-    assert me == {"name": "Lea", "role": "lead", "emergency": False, "role_name": None, "perms": sorted(auth.PERMS), "cert": None}
+    assert me == {"name": "Lea", "role": "lead", "emergency": False, "role_name": None, "perms": sorted(auth.PERMS), "cert": None,
+                  "totp": {"on": False, "required": False, "later": 3, "blocked": False, "codes": 0,
+                           "role_required": False}}
     assert _login(client, "lea").json()["role"] == "lead"                       # Name ohne Gross/Klein
     # Anzeige: Übersicht, Druckaufträge, Statusanzeige – sonst nichts
     assert client.get("/api/admin/stats", headers=v).status_code == 200

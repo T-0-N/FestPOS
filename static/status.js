@@ -453,6 +453,13 @@ const backupText = (min) => (min < 60 ? t("status.srv.backup", { min }) : t("sta
 // Internet (dauerhaft verbunden): Weg, erreichbar, Tunnel. Rot, wenn Karte/TWINT oder QR-Bestellung es
 // brauchen – über den Router aber nicht doppelt: ist der Mobilfunk-Router schon rot, bleibt diese Zeile gelb.
 const INET_VIA = { lan: "status.inet.via_lan", wlan: "status.inet.via_wlan", usb: "status.inet.via_usb" };
+// Grund, wenn die Verbindung fehlt (update_net.py): Prüfung DNS + HTTPS bzw. Fehler beim Verbinden
+const INET_REASON = { dns: "status.inet.r_dns", time: "status.inet.r_time", https: "status.inet.r_https",
+  wlan_not_found: "status.inet.r_wlan_not_found", wlan: "status.inet.r_wlan", no_wlan: "status.inet.r_no_wlan",
+  dhcp: "status.inet.r_dhcp", no_link: "status.inet.r_no_link", no_usb: "status.inet.r_no_usb",
+  gateway: "status.inet.r_gateway", helper: "status.inet.r_helper", same_net: "status.inet.r_same_net",
+  connect: "status.inet.r_connect" };
+const inetReason = (r) => (r?.reason ? t(INET_REASON[r.reason] || INET_REASON.connect, { ssid: r.ssid || "" }) : "");
 function inetLook(net, routerBad, many) {
   const rows = net.pis || [], online = rows.some((r) => r.state === "up" && r.online);
   const checked = rows.some((r) => ["up", "failed", "no_way"].includes(r.state) && (r.state !== "up" || r.online != null));
@@ -466,6 +473,8 @@ function inetLook(net, routerBad, many) {
   const quiet = net.via === "lan" && routerBad;                // der Router meldet es schon
   if (!online) {
     look.main = t("status.inet.offline");
+    const why = inetReason(rows.find((r) => r.reason));                // z.B. «WLAN nicht gefunden», «kein DNS»
+    if (why) look.sub = [way, why].join(" · ");
     look.cls = net.needed && !quiet ? "bad" : "wait";
     if (!quiet) look[net.needed ? "problem" : "warn"] = t("status.inet.p_down");
   } else if (net.qr && tunnel === false) {
@@ -482,6 +491,7 @@ const USB_TXT = { reading: "status.update.usb_reading", handed: "status.update.u
 const USB_BAD = new Set(["invalid", "unreadable", "failed"]);
 // Hinweise des Servers (warnings): Code -> Text. Für alle sichtbar, darum ohne Einzelheiten (z.B. wie kurz ein Passwort ist)
 const STATUS_WARN = { admin_pw_placeholder: "status.warn.admin_pw", admin_pw_short: "status.warn.admin_pw",
+  admin_pw_short_locked: "status.warn.admin_pw",
   backup_none: "status.warn.backup_none", backup_old: "status.warn.backup_old", backup_failed: "status.warn.backup_failed" };
 const STATUS_WARN_BAD = new Set(["admin_pw_placeholder", "backup_failed"]);
 let pollTimer = null, polling = false, LAST = null;
@@ -613,10 +623,13 @@ const Detail = (() => {
     return { title: up.name || t("status.uplink.name"), body, acts: [], key: "uplink" };
   }
   function inetPi(r) {
-    if (r.state !== "up") return t(r.state === "failed" ? "status.inet.d_failed" : r.state === "no_way" ? "status.inet.d_no_way" : "status.inet.d_wait");
+    if (r.state !== "up") {
+      return [t(r.state === "failed" ? "status.inet.d_failed" : r.state === "no_way" ? "status.inet.d_no_way" : "status.inet.d_wait"),
+        inetReason(r)].filter(Boolean).join(" – ");
+    }
     return [r.since ? t("status.inet.d_since", { time: I18n.fmtTime(r.since * 1000) }) : "",
       r.peer ? t("status.inet.d_via_pi", { pi: piLabel(r.peer) }) : "", r.share ? t("status.inet.d_share") : "",
-      r.online == null ? "" : t(r.online ? "status.inet.online" : "status.inet.offline"),
+      r.online == null ? "" : t(r.online ? "status.inet.online" : "status.inet.offline"), r.online === false ? inetReason(r) : "",
       r.tunnel == null ? "" : t(r.tunnel ? "status.inet.tunnel_on" : "status.inet.tunnel_off")].filter(Boolean).join(" · ");
   }
   function inet(net) {

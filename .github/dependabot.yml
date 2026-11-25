@@ -1,0 +1,19 @@
+# Dependabot: meldet neue Versionen der Python-Pakete, der Android-App (Gradle) und der GitHub Actions als Pull Request.
+# Python: requirements.txt nie von Hand – requirements.in anpassen und tools/pin-requirements.py (Prüfsummen).
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: gradle
+    directory: "/android/festpos-tap"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5

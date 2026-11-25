@@ -44,7 +44,8 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from . import certs, device_ids, devices, dhcp as dhcp_mod, i18n, ledger_base as lb, monitor as monitor_mod, rawhttp, timesync
+from . import certs, device_ids, devices, dhcp as dhcp_mod, i18n, ledger_base as lb, monitor as monitor_mod, netz, \
+    rawhttp, timesync
 from .core import LOCAL_HOSTS, Config, admin, current_user, db, rt
 
 log = logging.getLogger("festpos.fully")
@@ -925,7 +926,7 @@ def _pi_host(request: Request) -> str:
     """Adresse dieses Pi, wie die Verwaltung ihn erreicht – dort holt Fully die ZIP ab (im Cluster liegt die
     Einmal-Adresse nur im Speicher des Pi, der die Verwaltung gerade zeigt)."""
     host = (request.headers.get("host") or "").rsplit(":", 1)[0]
-    return host if _HOST_RE.match(host) else "192.168.55.10"
+    return host if _HOST_RE.match(host) else netz.vip()
 
 
 @admin_router.post("/ca")
@@ -1084,7 +1085,7 @@ def _idle(c: dict, now: float, screen_on) -> bool:
 
 def renew_host() -> str:
     """Adresse dieses Pi für Fully (holt die ZIP hier ab – die Einmal-Adresse liegt nur in seinem Speicher)."""
-    return Config.node_ip if _HOST_RE.match(Config.node_ip or "") else "192.168.55.10"
+    return Config.node_ip if _HOST_RE.match(Config.node_ip or "") else netz.vip()
 
 
 async def auto_renew(cfg: dict) -> str | None:
@@ -1242,8 +1243,8 @@ BOOT_WAIT = 180.0                             # nach dem Neustart des Handys: so
 
 
 def _put_setting(key: str, value: str) -> None:
-    rt.store.execute("INSERT INTO settings(key,value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                     (key, value))
+    from . import secretbox                       # Geheimnisse (Passwörter, PIN, Lizenz) verschlüsselt (#8)
+    rt.store.execute(*secretbox.put_stmt(key, value))
 
 
 def provision_config() -> dict:
@@ -1721,7 +1722,7 @@ def _rollout_settings(token: str, client_ip: str) -> dict | None:
     _put_setting("monitor_devices", json.dumps(items, ensure_ascii=False))
     dhcp_mod.sync()                                    # hier sofort, die anderen Pi beim nächsten Durchlauf
     settings = dict(load_template().get("settings") or {})
-    settings.setdefault("startURL", f"https://{entry.get('host') or '192.168.55.10'}")
+    settings.setdefault("startURL", f"https://{entry.get('host') or netz.vip()}")
     settings.update(TEMPLATE_FORCE)
     settings[WHITELIST_KEY] = whitelist_value(settings["startURL"])   # von Anfang an nur die Bestell-App (web_check)
     # Einmal-Passwort: das echte setzt FestPOS erst über HTTPS (fully_bootstrap) – es geht nie unverschlüsselt hinaus

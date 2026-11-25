@@ -4,6 +4,8 @@
   python3 tools/build_zip.py ziel.zip
   python3 tools/build_zip.py --pakete-aus alt.zip  Python-Pakete und rqlite aus einer früheren festpos.zip (ohne
                                                    Internet, wenn sich die Pakete nicht geändert haben)
+  python3 tools/build_zip.py --os-updates DIR      Sicherheitsupdates des Betriebssystems (tools/os_updates.py) als
+                                                   os-updates/ ins Paket (T-0-N/FestPOS#5)
 
 Im Git-Repo kommen alle Dateien hinein, die Git kennt oder kennen würde (also ohne alles aus .gitignore:
 Caches, lokale Konfiguration, Datenbanken). Ohne Git: alles ausser Caches, *.db und deploy/festpos.conf.
@@ -86,7 +88,13 @@ def _add(z: zipfile.ZipFile, path: Path, rel: str, exe: set[str] | None = None) 
 
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
-    alt = None
+    alt, osdir = None, None
+    if "--os-updates" in argv:
+        i = argv.index("--os-updates")
+        osdir = Path(argv[i + 1])
+        argv = argv[:i] + argv[i + 2:]
+        if not osdir.is_dir():
+            sys.exit(f"--os-updates: Ordner {osdir} fehlt")
     if "--pakete-aus" in argv:
         i = argv.index("--pakete-aus")
         alt = Path(argv[i + 1])
@@ -111,6 +119,12 @@ def main(argv: list[str] | None = None) -> None:
                 _add(z, ROOT / rel, rel, exe)
             for rel in extra:
                 _add(z, Path(d) / rel, rel)
+            if osdir:                                  # Sicherheitsupdates des Betriebssystems (#5)
+                for f in sorted(osdir.rglob("*")):
+                    if f.is_file() and not f.is_symlink():
+                        rel = "os-updates/" + f.relative_to(osdir).as_posix()
+                        _add(z, f, rel)
+                        extra.append(rel)
     tmp.replace(out)
     version = (ROOT / "VERSION").read_text().strip()
     print(f"{out}: Version {version}, {len(names) + len(extra)} Dateien, {out.stat().st_size} Bytes")

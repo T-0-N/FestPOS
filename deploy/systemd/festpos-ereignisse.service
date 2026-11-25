@@ -1,0 +1,10 @@
+[Unit]
+Description=FestPOS: Sicherheitsereignisse sammeln (SSH, sudo, Neustart, Boot-Partition)
+After=systemd-journald.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/festpos-ereignisse
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=120

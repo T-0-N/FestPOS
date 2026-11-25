@@ -1,0 +1,10 @@
+[Unit]
+Description=FestPOS: Netz umziehen – jede Minute die Frist prüfen (T-0-N/FestPOS#2)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

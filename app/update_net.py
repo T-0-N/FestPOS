@@ -35,7 +35,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from . import i18n, ledger_base as lb, release, update
+from . import i18n, ledger_base as lb, release, secretbox, update
 from .core import APP_VERSION, Config, admin, current_user, db, rt
 
 log = logging.getLogger("festpos.update_net")
@@ -152,7 +152,22 @@ def view() -> dict:
 # (Route). Die Handhelds schicken alles an die VIP: deren Pi gibt weiter (selbst oder über den Pi mit dem Gerät).
 # Weitergegeben wird nur an die eingetragenen Handhelds und die Pi – beim Ausrollen neuer Handhelds
 # (Schalter b) kurz ans ganze Netz. Handys per USB-Tethering nie.
-KEEP_RETRY = 120                                            # nach einem Fehler so lange warten
+#
+# Stabil halten (T-0-N/FestPOS#1):
+#   - Nach einem Neustart der App (auch beim Update) übernimmt sie eine bestehende Verbindung, statt sie abzubauen:
+#     der Helfer meldet ihren Stand in update-status/internet.json.
+#   - «Online» heisst: Name auflösen (DNS) UND eine HTTPS-Verbindung mit gültigem Zertifikat. Scheitert das, steht der
+#     Grund dabei (kein DNS, Uhrzeit falsch, keine Antwort). Neu verbunden wird erst nach KEEP_FAILS Fehlversuchen
+#     hintereinander, danach mit wachsender Pause (BACKOFF) – ein schwaches Netz flattert so nicht.
+#   - WLAN mit 3 Pi: nur der Pi mit der VIP verbindet sich (ein Handy-Hotspot nimmt oft nur wenige Geräte); die
+#     anderen gehen über ihn.
+KEEP_FAILS = 3                                              # so viele Prüfungen (je 1 Minute) offline: neu verbinden
+BACKOFF = (60, 120, 240, 480, 900)                          # Pause nach dem 1., 2., … Verbinden ohne Erfolg (Sekunden)
+PROBE_HOSTS = ("api.payrexx.com", "api.github.com")         # Prüfung «online»: DNS und HTTPS (Zertifikat geprüft)
+# Grund, wenn das Verbinden scheitert (Fehlercode des Helfers -> Grund für Verwaltung und Statusanzeige)
+REASONS = {"net_wlan_not_found": "wlan_not_found", "net_wlan": "wlan", "net_no_wlan": "no_wlan", "net_dhcp": "dhcp",
+           "net_no_link": "no_link", "net_no_usb": "no_usb", "net_gateway": "gateway", "no_answer": "helper",
+           "no_helper": "helper", "net_same_net": "same_net"}
 _keep: dict = {}
 
 
@@ -163,20 +178,36 @@ def keep_on() -> bool:
 def keep_report() -> dict:
     """Für die anderen Pi (/api/internal/node): bin ich verbunden und gebe ich das Internet weiter?"""
     return {"up": _keep.get("state") == "up", "share": bool(_keep.get("share")), "ip": Config.node_ip or "",
-            "via": _keep.get("via")}
+            "via": _keep.get("via"), "device": bool(_keep.get("device"))}
 
 
-def _online(timeout: float = 3.0) -> bool:
+def _probe(timeout: float = 5.0) -> str | None:
+    """Ist das Internet da? None = ja; sonst der Grund: dns (Namen lassen sich nicht auflösen), time (Zertifikat
+    «noch nicht gültig» bzw. «abgelaufen»: die Uhr des Pi stimmt nicht) oder https (keine Antwort)."""
     if os.environ.get("FESTPOS_HOST_CHECKS", "1") == "0":
-        return _keep.get("state") == "up"
+        return None if _keep.get("state") == "up" else "https"
     import socket
-    for host in ("api.payrexx.com", "1.1.1.1"):
+    dns_ok, time_bad = False, False
+    ctx = ssl.create_default_context()
+    for host in PROBE_HOSTS:
         try:
-            socket.create_connection((host, 443), timeout).close()
-            return True
-        except OSError:
+            socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except (OSError, UnicodeError):
             continue
-    return False
+        dns_ok = True
+        try:
+            with socket.create_connection((host, 443), timeout) as raw, ctx.wrap_socket(raw, server_hostname=host):
+                return None
+        except ssl.SSLCertVerificationError as e:
+            msg = str(e).lower()
+            time_bad = time_bad or "not yet valid" in msg or "expired" in msg
+        except (OSError, ssl.SSLError):
+            continue
+    return "time" if time_bad else "https" if dns_ok else "dns"
+
+
+def _online(timeout: float = 5.0) -> bool:
+    return _probe(timeout) is None
 
 
 TUNNEL_ENV = Path(os.environ.get("FESTPOS_TUNNEL_ENV", "/etc/festpos/tunnel.env"))   # nur mit TUNNEL_TOKEN (festpos-node)
@@ -195,17 +226,24 @@ def _tunnel() -> bool | None:
 
 
 def _peer_sharing() -> dict | None:
-    """Ein anderer Pi, der verbunden ist und das Internet weitergibt (Stand der letzten Abfrage, höchstens 60 s alt)."""
+    """Ein anderer Pi, der selbst verbunden ist (eigenes WLAN/USB-Gerät) und das Internet weitergibt (Stand der letzten
+    Abfrage, höchstens 60 s alt). Nie einer, der es nur von einem dritten Pi weiterreicht – der könnte über diesen Pi
+    gehen (Kreis, beide ohne Internet). Nur wer «device» ausdrücklich meldet (ältere Versionen nicht: dort hilft
+    während eines Updates das eigene Gerät oder der nächste Versuch)."""
     peers = getattr(getattr(rt, "monitor", None), "peers", None) or {}
     for node, p in sorted(peers.items()):
         net = (p.get("data") or {}).get("internet") or {}
-        if net.get("up") and net.get("share") and net.get("ip") and time.time() - (p.get("at") or 0) < 60:
+        if net.get("up") and net.get("share") and net.get("device") is True and net.get("ip") \
+                and time.time() - (p.get("at") or 0) < 60:
             return {"node": node, "ip": net["ip"]}
     return None
 
 
 def keep_view() -> dict:
-    v = {k: _keep.get(k) for k in ("state", "via", "iface", "since", "share", "peer", "checked")}
+    v = {k: _keep.get(k) for k in ("state", "via", "iface", "since", "share", "peer", "checked", "reason", "fails",
+                                   "tries", "last", "next")}
+    v["fails_max"] = KEEP_FAILS
+    v["ssid"] = (_raw().get("ssid") or "") if _keep.get("via") == "wlan" else ""
     if _keep.get("code"):
         v["text"] = update.err_text(_keep["code"], _keep.get("kw"))
     return {"on": keep_on(), **v, "online": _keep.get("online"), "tunnel": _tunnel() if _keep.get("state") == "up" else None}
@@ -266,6 +304,7 @@ def keep_status() -> dict | None:
     st = _keep.get("state")
     return {"state": st, "via": _keep.get("via"), "online": _keep.get("online"), "peer": _keep.get("peer"),
             "share": bool(_keep.get("share")), "device": bool(_keep.get("device")), "since": _keep.get("since"),
+            "reason": _keep.get("reason"), "ssid": (_raw().get("ssid") or "") if _keep.get("reason") == "wlan_not_found" else "",
             "tunnel": _tunnel() if st == "up" else None}
 
 
@@ -279,10 +318,58 @@ def phone_issue() -> bool:
     return st in ("failed", "no_way") or (st == "up" and _keep.get("online") is False)
 
 
+def _helper_state() -> dict:
+    """Stand der Verbindung laut Helfer (update-status/internet.json) – bleibt über einen Neustart der App."""
+    try:
+        d = json.loads((update.STATUS_DIR / "internet.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _adopt(cfg: dict, now: float) -> bool:
+    """Erster Takt nach dem Start der App: steht die dauerhafte Verbindung noch (gleicher Weg), sie übernehmen statt
+    abbauen und neu aufbauen – sonst bräche sie bei jedem Neustart und jedem Update kurz ab."""
+    h = _helper_state()
+    via = cfg.get("via") if cfg.get("via") in VIA else "lan"
+    if not h.get("keep") or h.get("via") not in VIA:
+        return False
+    peer = None
+    if h["via"] == "lan" and via in ("wlan", "usb"):          # über einen anderen Pi mit dem Gerät
+        peer = next((n for n, p in sorted((getattr(getattr(rt, "monitor", None), "peers", None) or {}).items())
+                     if ((p.get("data") or {}).get("internet") or {}).get("ip") == h.get("gateway")), None)
+        if not peer:
+            return False
+    elif h["via"] != via or (via == "lan" and h.get("gateway") != cfg.get("gateway")) or \
+            (via == "wlan" and (h.get("ssid") or "") != (cfg.get("ssid") or "")):
+        return False                                         # anderer Weg, Router oder ein anderes WLAN eingestellt
+    _keep.clear()
+    _keep.update(state="up", via=via, iface=h.get("dev") or "", since=int(h.get("at") or now), share=bool(h.get("share")),
+                 peer=peer, device=h["via"] in ("wlan", "usb"), allow=None, fails=0, tries=0, adopted=True)
+    log.info("Internet dauerhaft: bestehende Verbindung übernommen (%s)", via)
+    return True
+
+
+def _cluster() -> bool:
+    return bool(Config.peers)
+
+
+def _wlan_not_mine() -> bool:
+    """WLAN mit 3 Pi: nur der Pi mit der VIP verbindet sich mit dem Hotspot (viele nehmen nur wenige Geräte)."""
+    return _cluster() and not _holds_vip()
+
+
+def _other_wlan_holder() -> bool:
+    """Ein anderer Pi ist selbst mit dem WLAN verbunden und gibt weiter (Stand der letzten Abfrage)?"""
+    peers = getattr(getattr(rt, "monitor", None), "peers", None) or {}
+    return any((n := (p.get("data") or {}).get("internet") or {}).get("up") and n.get("share") and n.get("device")
+               and time.time() - (p.get("at") or 0) < 60 for p in peers.values())
+
+
 def keep_tick() -> None:
     """Monitor-Takt (jeder Pi, jede Minute): Verbindung nach Schalter (c) halten oder abbauen."""
     if not keep_on():
-        if _keep.get("state") in ("up", "failed"):
+        if _keep.get("state") in ("up", "failed") or _helper_state().get("keep"):
             _keep.clear()
             _net_down(force=True)
             log.info("Internet dauerhaft: aus")
@@ -291,24 +378,43 @@ def keep_tick() -> None:
     if _task and not _task.done():
         return                                               # Update aus dem Internet läuft gerade
     now = time.time()
+    cfg = _raw()
+    if not _keep:
+        _adopt(cfg, now)
     if _keep.get("state") == "up":
-        _keep["online"] = _online()
-        _keep["checked"] = int(now)
-        if _keep["online"]:
+        reason = _probe()
+        _keep.update(online=reason is None, reason=reason, checked=int(now))
+        if reason is None and _keep.get("device") and _keep.get("via") == "wlan" and _wlan_not_mine() \
+                and _other_wlan_holder():
+            # zwei Pi am Hotspot (z.B. beide gleichzeitig gestartet): der ohne VIP geht über den anderen
+            log.info("Internet dauerhaft: WLAN dem Pi mit der VIP überlassen")
+            _keep.clear()
+        elif reason is None:
+            _keep.update(fails=0, tries=0, next=None)
             _share_follow()
             return
+        else:
+            _keep["fails"] = (_keep.get("fails") or 0) + 1
+            log.warning("Internet dauerhaft: nicht erreichbar (%s, %d. Mal)", reason, _keep["fails"])
+            if _keep["fails"] < KEEP_FAILS or now < (_keep.get("next") or 0):
+                return                                       # kurz weg (schwaches Netz): nicht gleich neu verbinden
     elif now < (_keep.get("next") or 0):
         return
-    cfg, psk = _raw(), rt.store.setting("update_net_psk") or ""
+    tries = (_keep.get("tries") or 0) + 1                     # Pause bis zum nächsten Verbinden: 1, 2, 4 … 15 Minuten
+    wait = BACKOFF[min(tries, len(BACKOFF)) - 1]
+    psk = rt.store.setting("update_net_psk") or ""
     via = cfg.get("via") if cfg.get("via") in VIA else "lan"
     found = devices()
     share, peer, device = False, None, False
-    if via == "wlan" and found["wlan"] or via == "usb" and any(d["link"] for d in found["usb"]):
+    has_dev = via == "wlan" and found["wlan"] or via == "usb" and any(d["link"] for d in found["usb"])
+    if has_dev and via == "wlan" and _wlan_not_mine():
+        has_dev = False                                      # WLAN: nur der Pi mit der VIP am Hotspot, die anderen über ihn
+    if has_dev:
         share = device = True                                # dieser Pi hat das Gerät: verbinden und weitergeben
     elif via in ("wlan", "usb"):
         peer = _peer_sharing()
         if not peer:
-            _keep.update(state="no_way", via=via, next=now + 60, code=None)
+            _keep.update(state="no_way", via=via, next=now + 60, code=None, reason=None, last=int(now))
             return
         cfg = {"via": "lan", "gateway": peer["ip"], "dns": cfg.get("dns") or "1.1.1.1"}
         share = _holds_vip()                                 # die Handhelds kommen hier an: an den Pi weiterreichen
@@ -316,13 +422,17 @@ def keep_tick() -> None:
     try:
         iface = _net_up(cfg, psk, share=share, keep=True, allow=allow if share else None)
     except release.ReleaseError as e:
+        _keep.clear()                                        # Pause ab dem Ende des Versuchs (WLAN-Suche dauert)
         _keep.update(state="failed", via=via, code=e.code, kw={k: str(v) for k, v in (e.kw or {}).items()},
-                     next=now + KEEP_RETRY)
-        log.warning("Internet dauerhaft: %s", e.code)
+                     reason=REASONS.get(e.code, "connect"), tries=tries, last=int(now), next=time.time() + wait)
+        log.warning("Internet dauerhaft: %s (%d. Versuch, nächster in %d s)", e.code, tries, wait)
         return
     _keep.clear()
     _keep.update(state="up", via=via, iface=iface, since=int(now), share=share, peer=peer and peer["node"],
-                 online=_online(), checked=int(now), device=device, allow=allow if share else None)
+                 checked=int(now), device=device, allow=allow if share else None, fails=0, last=int(now))
+    reason = _probe()
+    _keep.update(online=reason is None, reason=reason, tries=0 if reason is None else tries,
+                 next=None if reason is None else time.time() + wait)
     log.info("Internet dauerhaft: ein (%s%s)", via, f" über Pi {peer['node']}" if peer else "")
 
 
@@ -419,7 +529,7 @@ def _download(url: str, token: str, dest: Path, limit: int, progress=None) -> in
 # -- Internet ein/aus über festpos-update -----------------------------------------------------------------------
 def _helper(req: dict, wait: float) -> dict:
     rid = f"net-{int(time.time())}-{secrets.token_hex(3)}"
-    update.place_request(req, rid)
+    update.place_request(req, rid, netz=True)                  # eigener Dienst: wartet nicht hinter einem Update
     end = time.monotonic() + wait
     while time.monotonic() < end:
         r = update._result(rid)
@@ -583,11 +693,11 @@ async def save(n: NetIn, request: Request):
     up = "INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
     stmts = [(up, ("update_net", json.dumps(new, ensure_ascii=False)))]
     if token:
-        stmts.append((up, ("update_net_token", token)))
+        stmts.append(secretbox.put_stmt("update_net_token", token))
     elif n.clear_token:
         stmts.append(("DELETE FROM settings WHERE key='update_net_token'", ()))
     if psk:
-        stmts.append((up, ("update_net_psk", psk)))
+        stmts.append(secretbox.put_stmt("update_net_psk", psk))
     shown = {**new, **({"token": short_token(token)} if token else {"token": "-"} if n.clear_token else {}),
              **({"psk": "***"} if psk else {})}
     stmts.append(lb.audit_stmt(_actor(request), "update_net_config", **shown))

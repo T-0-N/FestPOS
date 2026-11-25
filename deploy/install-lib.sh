@@ -30,6 +30,11 @@ FESTPOS_SCRIPTS=(
   "festpos-druckernetz.py festpos-druckernetz 0755"
   "festpos-handy-usb festpos-handy-usb 0755"
   "festpos-haertung festpos-haertung 0755"
+  "festpos-ereignisse festpos-ereignisse 0755"
+  "festpos-firewall festpos-firewall 0755"
+  "festpos-os-update festpos-os-update 0755"
+  "festpos-krypt festpos-krypt 0755"
+  "festpos-netz festpos-netz 0755"
 )
 UDEV_RULE=$R/etc/udev/rules.d/99-festpos-usb.rules     # USB-Stick mit Update -> festpos-usb@.service
 UDEV_HANDY=$R/etc/udev/rules.d/99-festpos-handy-usb.rules   # Handy per USB -> festpos-handy-usb@.service (T2)
@@ -150,7 +155,18 @@ festpos_install_system() {      # festpos_install_system QUELLE -> Skripte, Dien
     # Hier NICHT «--now»: update.sh kann gerade aus diesem Dienst heraus laufen – das würde aufeinander warten.
     systemctl enable festpos-update.service >/dev/null 2>&1 || true
     systemctl enable --now festpos-update.path >/dev/null 2>&1 || true
+    # Internet ein/aus (Update aus dem Internet, dauerhaft verbunden): eigener Dienst, wartet nicht hinter update.sh
+    systemctl enable --now festpos-update-netz.path >/dev/null 2>&1 || true
     systemctl enable --now festpos-sicherung.timer >/dev/null 2>&1 || true   # alle 15 min auf einen USB-Stick
+    # Sicherheitsereignisse (SSH, sudo, Neustart, Boot-Partition) für Protokoll und Übersicht, T-0-N/FestPOS#11
+    systemctl enable --now festpos-ereignisse.timer >/dev/null 2>&1 || true
+    # Firewall ins Internet: Modus aus der Verwaltung anwenden, Namen auflösen, Zähler (T-0-N/FestPOS#10)
+    systemctl enable --now festpos-firewall.timer festpos-firewall.path >/dev/null 2>&1 || true
+    # Daten verschlüsselt (T-0-N/FestPOS#3): beim Start öffnen, vor festpos-node, rqlite und FestPOS; nach dem Umstellen
+    # prüfen. Hier nicht «--now»: geöffnet wird nur beim Start.
+    systemctl enable festpos-krypt.service festpos-krypt-pruefen.service >/dev/null 2>&1 || true
+    # Netz umziehen (T-0-N/FestPOS#2): ohne Bestätigung über die neue Adresse zurück ins alte Netz
+    systemctl enable --now festpos-netz.timer >/dev/null 2>&1 || true
     # Schlüssel aus einer Sicherung, Kartenpaket, auf 3 Pi umstellen, APK vom Stick (Verwaltung, T8)
     systemctl enable --now festpos-wiederherstellen.path >/dev/null 2>&1 || true
     # Ersteinrichtung im Browser (T11): läuft nur ohne festpos.conf (ConditionPathExists)

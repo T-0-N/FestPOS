@@ -338,7 +338,10 @@ class MikroTik(Driver):
 
     def setup(self, host: str) -> str:
         parts = host.split(".")
-        net = ".".join(parts[:3]) + ".0/24" if len(parts) == 4 and all(p.isdigit() for p in parts) else "192.168.55.0/24"
+        from . import netz                         # FestPOS-Netz (T-0-N/FestPOS#2); ohne Angabe: vom Router geschätzt
+        cur = netz.current()
+        net = str(cur) if cur else (".".join(parts[:3]) + ".0/24" if len(parts) == 4 and all(p.isdigit() for p in parts)
+                                    else netz.DEFAULT)
         return "\n".join([
             "/certificate add name=festpos-https common-name=festpos-router days-valid=3650 key-size=2048 "
             "key-usage=digital-signature,key-encipherment,tls-server",

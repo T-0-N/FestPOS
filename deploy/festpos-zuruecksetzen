@@ -3,12 +3,13 @@
 #
 #   * festpos.conf wird aus festpos.conf.example neu erstellt.
 #     Übernommen werden ADMIN_PASSWORD, CLUSTER_SECRET und die Netzwerkeinstellungen
-#     (NET_PREFIX, NET_CIDR, IFACE, VIP, NODE_*_IP, VRRP_ID, CLUSTER_SIZE, SSH_FROM, ADMIN_FROM) – Zeilen 1:1 aus der alten Datei.
+#     (NET, NET_PREFIX, NET_CIDR, DHCP_POOL, IFACE, VIP, NODE_*_IP, VRRP_ID, CLUSTER_SIZE, SSH_FROM, ADMIN_FROM) – Zeilen 1:1 aus der alten Datei.
 #   * Alle Zertifikate werden neu erzeugt (Server-CA, Geräte-CA, Server-Zertifikat, je 30 Jahre).
 #     -> Alle bisherigen Geräte (Handys, PC) sind damit draussen und brauchen ein neues Zertifikat.
 #   * Die Geräteliste in der Verwaltung wird geleert.
 #   * Produkte, Kategorien, Drucker, Tische, Bestellungen und Einstellungen bleiben.
-#   * Vorher wird alles nach /root/festpos-backup-DATUM/ gesichert.
+#   * Vorher wird alles nach /root/festpos-backup-DATUM/ gesichert – bei verschlüsselten Daten (T-0-N/FestPOS#3) in den
+#     verschlüsselten Bereich (/var/lib/festpos/zuruecksetzen-DATUM/), nie unverschlüsselt auf die Karte.
 #
 # Aufruf auf dem Pi, im Ordner mit make-certs.sh:
 #   cd ~/festpos-neu/deploy && sudo bash festpos-zuruecksetzen
@@ -17,7 +18,13 @@ set -euo pipefail
 BOOT=${BOOT:-/boot/firmware}
 HERE=$(cd "$(dirname "$0")" && pwd)
 RQLITE=${RQLITE:-http://127.0.0.1:4001}
-BACKUP=${BACKUP:-/root/festpos-backup-$(date +%Y%m%d-%H%M%S)}
+KRYPT=/usr/local/sbin/festpos-krypt
+QUELLE=/run/festpos-geheim/quelle                     # geheime Werte und Schlüssel, wenn die Daten verschlüsselt sind
+if [ -e /run/festpos-krypt/eingehaengt ]; then
+  BACKUP=${BACKUP:-/var/lib/festpos/zuruecksetzen-$(date +%Y%m%d-%H%M%S)}
+else
+  BACKUP=${BACKUP:-/root/festpos-backup-$(date +%Y%m%d-%H%M%S)}
+fi
 
 [ "$(id -u)" = 0 ] || { echo "Bitte mit sudo ausführen."; exit 1; }
 [ -f "$HERE/festpos.conf.example" ] && [ -f "$HERE/make-certs.sh" ] \
@@ -25,11 +32,10 @@ BACKUP=${BACKUP:-/root/festpos-backup-$(date +%Y%m%d-%H%M%S)}
 [ -f "$BOOT/festpos.conf" ] || { echo "$BOOT/festpos.conf fehlt – nichts zu übernehmen."; exit 1; }
 
 OLD=$BOOT/festpos.conf
-KEEP='ADMIN_PASSWORD|CLUSTER_SECRET|NET_PREFIX|NET_CIDR|IFACE|VIP|NODE_A_IP|NODE_B_IP|NODE_C_IP|VRRP_ID|CLUSTER_SIZE|SSH_FROM|ADMIN_FROM|RAFT_TLS'
+KEEP='ADMIN_PASSWORD|ADMIN_PASSWORD_HASH|ADMIN_PASSWORD_LAENGE|CLUSTER_SECRET|NET|NET_PREFIX|NET_CIDR|DHCP_POOL|IFACE|VIP|NODE_A_IP|NODE_B_IP|NODE_C_IP|VRRP_ID|CLUSTER_SIZE|SSH_FROM|ADMIN_FROM|RAFT_TLS'
 KEPT=$(tr -d '\r' < "$OLD" | grep -E "^($KEEP)=" || true)
-for k in ADMIN_PASSWORD CLUSTER_SECRET; do
-  grep -q "^$k=" <<<"$KEPT" || { echo "$k fehlt in $OLD – Abbruch."; exit 1; }
-done
+grep -qE "^ADMIN_PASSWORD(_HASH)?=" <<<"$KEPT" || { echo "ADMIN_PASSWORD fehlt in $OLD – Abbruch."; exit 1; }
+grep -q "^CLUSTER_SECRET=" <<<"$KEPT" || { echo "CLUSTER_SECRET fehlt in $OLD – Abbruch."; exit 1; }
 case "$KEPT" in
   *bitte-aendern*) echo "WARNUNG: Passwort/Geheimnis steht noch auf 'bitte-aendern'." ;;
 esac
@@ -73,7 +79,15 @@ diff <(tr -d '\r' < "$BACKUP/festpos.conf" | grep -vE '^\s*(#|$)') <(grep -vE '^
 # Prüfsummen und Anmeldungen hängen sonst am alten server.key (Platzhalter bei CLUSTER_SECRET): festschreiben
 # shellcheck source=festpos-conf.sh
 source "$HERE/festpos-conf.sh"
-if festpos_secret_fix "$OLD" "$BOOT/festpos-tls/server.key"; then
+OLDKEY=$BOOT/festpos-tls/server.key; [ -f "$OLDKEY" ] || OLDKEY=$QUELLE/server.key
+# Verschlüsselt und im Container nur der Platzhalter: zurück in festpos.conf (kein Geheimnis), dann wie bisher
+if grep -qE '^[[:space:]]*CLUSTER_SECRET[[:space:]]*=[[:space:]]*"?im-container' "$OLD" && [ -f "$QUELLE/festpos.conf" ]; then
+  case "$( (festpos_read_conf "$QUELLE/festpos.conf" >/dev/null 2>&1; printf '%s' "${CLUSTER_SECRET:-}") )" in
+    ""|admin|bitte-aendern|bitte-aendern-lang-und-zufaellig)
+      sed -i -E 's/^[[:space:]]*CLUSTER_SECRET[[:space:]]*=.*/CLUSTER_SECRET=bitte-aendern/' "$OLD" ;;
+  esac
+fi
+if festpos_secret_fix "$OLD" "$OLDKEY"; then
   echo "   CLUSTER_SECRET festgeschrieben (aus dem bisherigen Schlüssel) – bei 3 Pi diese festpos.conf auf alle Karten"
 fi
 
@@ -81,12 +95,15 @@ echo "== Neue Zertifikate"
 cd "$HERE"
 SUDO_USER_HOME=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)
 CA_DIR="$SUDO_USER_HOME/festpos-ca"                  # ca.key ausserhalb des Projektordners (REV-026)
+echo "   make-certs.sh fragt nach einem Passwort für ca.key (mindestens 12 Zeichen)."
 FESTPOS_CA_DIR="$CA_DIR" bash make-certs.sh "$OLD" --neue-ca | sed 's/^/   /'
 install -d "$BOOT/festpos-tls"
 for f in ca.crt server.crt server.key device-ca.crt device-ca.key; do
   install -m 0600 "festpos-tls/$f" "$BOOT/festpos-tls/"
 done
 rm -f "$BOOT/festpos-tls/ca.key"
+# Verschlüsselt: neue Schlüssel gleich in den Container (sonst beim nächsten Start)
+[ -x "$KRYPT" ] && { "$KRYPT" --einziehen || echo "   WARNUNG: Schlüssel noch auf der Boot-Partition (beim nächsten Start verschoben)"; }
 chown -R "${SUDO_USER:-root}:" "festpos-tls" "$CA_DIR"
 cp festpos-tls/ca.crt "$SUDO_USER_HOME/festpos-ca.crt"
 chown "${SUDO_USER:-root}:" "$SUDO_USER_HOME/festpos-ca.crt"
@@ -110,7 +127,8 @@ Fertig. Jetzt:
   4. Bei 3 Pi: den Ordner $HERE/festpos-tls auf die anderen Pi kopieren und dort
      sudo festpos-zertifikate <Ordner>  ausführen (alle Pi brauchen dieselben Zertifikate).
 
-  ca.key liegt in $CA_DIR – auf einen USB-Stick kopieren und vom Pi löschen.
+  ca.key liegt in $CA_DIR (mit dem eben gewählten Passwort verschlüsselt) – auf einen USB-Stick
+  kopieren und vom Pi löschen. Das Passwort getrennt davon aufbewahren.
   Die neue CA ist auch unter http://<VIP>/ca.crt abrufbar (zum Installieren auf den Handys).
   Alles Alte liegt in $BACKUP.
 TXT

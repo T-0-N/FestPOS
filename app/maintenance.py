@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from . import auth, backup as backup_mod, cards, devices, i18n, ledger
+from . import auth, backup as backup_mod, cards, devices, i18n, ledger, secretbox
 from . import ledger_base as lb
 from .core import APP_VERSION, Config, admin, db, log, rt
 from .i18n import t
@@ -46,7 +46,7 @@ def ensure_password() -> None:
     if rt.store.setting(PASSWORD):
         return
     rt.store.batch([("INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO NOTHING",
-                     (PASSWORD, backup_mod.new_password())),
+                     (PASSWORD, secretbox.stored(PASSWORD, backup_mod.new_password()))),
                     ("INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO NOTHING",
                      (PASSWORD_AT, str(int(time.time()))))])
     log.info("Sicherungs-Passwort erzeugt – in der Verwaltung ausdrucken (Wartung › Sicherung)")
@@ -78,6 +78,10 @@ def publish_system_ids() -> None:
 
 
 def current_conf() -> dict:
+    """Werte aus festpos.conf für die Sicherung (Ersatz-Pi): Notfall-Passwort als Prüfwert, ältere im Klartext."""
+    if Config.admin_password_hash:
+        return {"cluster_secret": Config.cluster_secret, "admin_password_hash": Config.admin_password_hash,
+                "admin_password_len": str(Config.admin_password_len)}
     return {"cluster_secret": Config.cluster_secret, "admin_password": Config.admin_password}
 
 
@@ -141,7 +145,7 @@ async def password_new(request: Request, confirm: str = Query(...)):
 
     def run():
         old = rt.store.setting(PASSWORD)
-        rt.store.batch([(UPSERT, (PASSWORD_OLD, old or "")), (UPSERT, (PASSWORD, backup_mod.new_password())),
+        rt.store.batch([secretbox.put_stmt(PASSWORD_OLD, old or ""), secretbox.put_stmt(PASSWORD, backup_mod.new_password()),
                         (UPSERT, (PASSWORD_AT, str(int(time.time())))),
                         ("DELETE FROM settings WHERE key=?", (PASSWORD_PRINTED,))])
     await db(run)
@@ -355,7 +359,7 @@ def _keys_of(content: dict[str, bytes]) -> tuple[dict[str, bytes], dict] | None:
         conf = json.loads(content.get("conf.json") or b"{}")
     except ValueError:
         conf = {}
-    return tls, {k: v for k, v in conf.items() if k in ("cluster_secret", "admin_password") and isinstance(v, str)}
+    return tls, {k: v for k, v in conf.items() if k in backup_mod.CONF_KEYS and isinstance(v, str)}
 
 
 def keys_differ(tls: dict[str, bytes], conf: dict) -> bool:
@@ -363,7 +367,12 @@ def keys_differ(tls: dict[str, bytes], conf: dict) -> bool:
     if any(_read(here / name if here else None) != content for name, content in tls.items()):
         return True
     now = current_conf()
-    return any(conf.get(k) and conf[k] != now[k] for k in ("cluster_secret", "admin_password"))
+    return any(conf.get(k) and conf[k] != now.get(k) for k in ("cluster_secret", "admin_password", "admin_password_hash"))
+
+
+def _other_net(tls: dict[str, bytes]) -> bool:
+    from . import netz, zertifikate
+    return bool(tls.get("ca.crt")) and zertifikate.other_net(tls["ca.crt"], str(netz.current() or ""))
 
 
 def apply_keys(content: dict[str, bytes]) -> bool:
@@ -372,6 +381,8 @@ def apply_keys(content: dict[str, bytes]) -> bool:
     k = _keys_of(content)
     if not k:
         return False
+    if _other_net(k[0]):                                     # Zertifikate eines anderen Netzes: nie einspielen
+        raise HTTPException(409, t("err.restore.keys_other_net"))
     tls, conf = k
     if any(ord(ch) < 32 or ord(ch) == 127 for v in conf.values() for ch in v):   # gehörte nie in festpos.conf (S2)
         raise HTTPException(422, t("err.restore.damaged", error="conf.json"))
@@ -390,6 +401,8 @@ def _keys_state(content: dict[str, bytes], new: bool) -> str:
         return "unknown"
     if not keys_differ(*k):
         return "same"
+    if _other_net(k[0]):
+        return "other_net"                                   # Sicherung aus dem alten Netz (Netz umgezogen, #2)
     if len(Config.peers) > 1:
         return "differ_cluster"
     return "restoring" if new else "differ"

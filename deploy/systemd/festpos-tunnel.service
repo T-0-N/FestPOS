@@ -30,7 +30,7 @@ ProtectControlGroups=yes
 RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-InaccessiblePaths=-/var/lib/festpos -/etc/festpos -/etc/festpos-gast -/boot -/root
+InaccessiblePaths=-/var/lib/festpos -/var/lib/festpos-krypt -/run/festpos-krypt -/run/festpos-geheim -/etc/festpos -/etc/festpos-gast -/run/festpos-gast -/boot -/root
 MemoryMax=256M
 
 [Install]

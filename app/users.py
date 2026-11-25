@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from . import auth, i18n
 from . import ledger_base as lb
-from .core import admin, current_user, db, rt
+from .core import admin, current_user, db, refresh_session, rt
 
 admin_router = APIRouter(prefix="/api/admin", dependencies=[Depends(admin)])
 
@@ -24,9 +24,21 @@ ROLE_RE = "^(" + "|".join(auth.ROLES) + r"|r[0-9]{1,6})$"
 EMERGENCY_GEN = "emergency_gen"            # Einstellung: Stand des Notfall-Logins («Überall abmelden»)
 
 
+def _with_totp(r: dict) -> dict:
+    """Zweiter Faktor kurz zusammengefasst (an, übrige «Später», Wiederherstellungs-Codes) – ohne Geheimnisse."""
+    try:
+        d = json.loads(r.get("totp") or "{}")
+    except ValueError:
+        d = {}
+    d = d if isinstance(d, dict) else {}
+    out = {k: v for k, v in r.items() if k != "totp"}
+    return {**out, "totp_on": bool(d.get("on")), "totp_later": d.get("later"), "totp_codes": len(d.get("codes") or []),
+            "totp_later_until": d.get("later_until") or 0}
+
+
 def load_users() -> list[dict]:
     """Für auth.lookup (Sitzungen): ohne Passwort-Hash. Nummer 0 = Notfall-Login (nur sein Stand)."""
-    rows = rt.store.query("SELECT id, name, role, gen, active FROM users")
+    rows = [_with_totp(r) for r in rt.store.query("SELECT id, name, role, gen, active, totp FROM users")]
     try:
         gen = int(rt.store.setting(EMERGENCY_GEN, "0") or 0)
     except ValueError:
@@ -44,6 +56,7 @@ class UserEdit(BaseModel):
     role: str | None = Field(default=None, pattern=ROLE_RE)
     active: bool | None = None
     password: str | None = Field(default=None, min_length=auth.PW_MIN, max_length=auth.PW_MAX)
+    totp_reset: bool | None = None            # zweiten Faktor zurücksetzen (Handy verloren): neu einrichten (#9)
 
 
 class OwnPasswordIn(BaseModel):
@@ -56,15 +69,18 @@ def _who(request: Request) -> str:
 
 
 def _public(u: dict) -> dict:
-    return {k: u.get(k) for k in ("id", "name", "role", "active", "created_at", "last_login")} | {"active": bool(u.get("active"))}
+    t2 = _with_totp({"totp": u.get("totp")})
+    return {k: u.get(k) for k in ("id", "name", "role", "active", "created_at", "last_login")} | {
+        "active": bool(u.get("active")), "totp_on": t2["totp_on"]}
 
 
 def me_info(u: dict) -> dict:
     """Wer angemeldet ist: Name, Rolle, Name der eigenen Rolle (feste übersetzt der Browser) und die Rechte."""
     role = u.get("role")
+    from . import twofa
     return {"name": u.get("name"), "role": role, "emergency": bool(u.get("emergency")),
             "role_name": None if role in auth.BUILTIN else (auth.roles().get(role) or {}).get("name"),
-            "perms": sorted(auth.perms_of(role))}
+            "perms": sorted(auth.perms_of(role)), "totp": twofa.summary(u)}
 
 
 @admin_router.get("/me")
@@ -91,6 +107,18 @@ async def own_password(p: OwnPasswordIn, request: Request):
     await db(run)
     auth.forget()
     return {"ok": True}
+
+
+@admin_router.post("/me/refresh")
+async def refresh(request: Request):
+    """Nach Bedienung in der Verwaltung: neues Token mit neuer Frist ohne Bedienung (Ablauf nach 12 Stunden bleibt).
+    Mit Basic Auth gibt es nichts zu verlängern."""
+    scheme, _, tok = request.headers.get("authorization", "").partition(" ")
+    u = current_user(request) or {}
+    s = await db(refresh_session, tok.strip(), u) if scheme.lower() == "bearer" else None
+    if not s:
+        raise HTTPException(409, i18n.t("err.login.no_session"))
+    return s
 
 
 @admin_router.post("/me/logout-all")
@@ -125,7 +153,8 @@ def _last_admin(u: dict) -> bool:
 
 @admin_router.get("/users")
 async def list_users():
-    rows = await db(rt.store.query, "SELECT id, name, role, active, created_at, last_login FROM users ORDER BY name")
+    rows = await db(rt.store.query, "SELECT id, name, role, active, created_at, last_login, totp FROM users "
+                                   "ORDER BY name")
     return {"users": [_public(r) for r in rows], "roles": await db(roles_view), "perms": list(auth.PERMS)}
 
 
@@ -165,14 +194,18 @@ async def edit_user(uid: int, e: UserEdit, request: Request):
             raise HTTPException(422, i18n.t("err.users.last_admin"))
         sets, args = [], []
         if e.role:
-            sets.append("role=?")
-            args.append(e.role)
+            # andere Rechte bzw. andere Frist ohne Bedienung: neu anmelden. Verglichen wird in derselben Anweisung mit
+            # der gespeicherten Rolle (nicht mit der vorher gelesenen) – auch wenn gleichzeitig jemand anders ändert.
+            sets += ["gen=gen+(role IS NOT ?)", "role=?"]
+            args += [e.role, e.role]
         if e.active is not None:
             sets += ["active=?", "gen=gen+1"]             # gesperrt: offene Sitzungen enden sofort
             args.append(1 if e.active else 0)
         if e.password:
             sets += ["pw_hash=?", "gen=gen+1"]
             args.append(auth.hash_password(e.password))
+        if e.totp_reset:                                 # neu einrichten bei der nächsten Anmeldung; Sitzungen enden
+            sets += ["totp=NULL", "gen=gen+1"]
         if sets:
             old = rt.store.query_one("SELECT name, role, active FROM users WHERE id=?", (uid,))
             removes = e.active is False or bool(e.role and e.role != "admin")
@@ -181,7 +214,8 @@ async def edit_user(uid: int, e: UserEdit, request: Request):
             res = rt.store.batch([
                 (f"UPDATE users SET {', '.join(dict.fromkeys(sets))} WHERE id=?{guard}", (*args, uid)),
                 lb.audit_if_changed_stmt(_who(request), "user_update", name=old["name"], role=e.role, active=e.active,
-                                         password=bool(e.password))], transaction=True)
+                                         password=bool(e.password), totp_reset=bool(e.totp_reset))],
+                transaction=True)
             if not res[0].rows_affected:
                 if not rt.store.query_one("SELECT id FROM users WHERE id=?", (uid,)):
                     raise HTTPException(404, i18n.t("err.users.not_found"))

@@ -314,14 +314,14 @@ def test_internet_row_red_only_when_needed_and_never_twice(server, browser):  # 
     page = ctx.new_page()
     errs = _watch(page)
     now = int(time.time())
-    case = {"via": "wlan", "online": True, "needed": True, "router": None}
+    case = {"via": "wlan", "online": True, "needed": True, "router": None, "reason": None}
 
     def fake(route):
         r = route.fetch()
         data = r.json()
         data["internet"] = {"via": case["via"], "needed": case["needed"], "pay": case["needed"], "qr": False, "pis": [
             {"id": data["pis"][0]["id"], "state": "up", "online": case["online"], "device": True, "share": True,
-             "since": now - 600, "tunnel": None}]}
+             "since": now - 600, "tunnel": None, "reason": case["reason"], "ssid": "Fest-Hotspot"}]}
         data["uplink"], data["uplink_needed"] = case["router"], case["router"] is not None
         route.fulfill(response=r, json=data)
     page.route("**/api/status", fake)
@@ -332,6 +332,11 @@ def test_internet_row_red_only_when_needed_and_never_twice(server, browser):  # 
     case["online"] = False                                                # weg und gebraucht: rot, oben gemeldet
     page.wait_for_selector("#inet.bad")
     assert "Internet nicht erreichbar" in page.inner_text("#detail")
+    case["reason"] = "wlan_not_found"                                     # mit Grund (T-0-N/FestPOS#1)
+    _until(page, "document.getElementById('inet').innerText.includes('nicht gefunden')")
+    assert "WLAN «Fest-Hotspot» nicht gefunden" in page.inner_text("#inet")
+    case["reason"] = "dns"
+    _until(page, "document.getElementById('inet').innerText.includes('DNS')")
     case["needed"] = False                                                # nicht gebraucht: nur gelb
     page.wait_for_selector("#inet.wait")
     assert "Internet nicht erreichbar" not in page.inner_text("#detail")    # kein Fehler (gestörte Drucker stehen vorne)
@@ -343,6 +348,7 @@ def test_internet_row_red_only_when_needed_and_never_twice(server, browser):  # 
     page.wait_for_selector("#detail-sheet .panel")
     sheet = page.inner_text("#detail-sheet")
     assert "über Router" in sheet and "Karte/TWINT" in sheet and "gibt weiter" in sheet and "nicht erreichbar" in sheet
+    assert "Namensauflösung (DNS) geht nicht" in sheet
     assert page.evaluate("document.documentElement.scrollWidth") <= 412, _zu_breit(page, 412)
     assert not errs, errs
     ctx.close()

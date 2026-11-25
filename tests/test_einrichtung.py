@@ -94,7 +94,12 @@ def test_new_single_pi(setup):
     assert r.json() == {"ok": True, "node": "a", "ca_key": True}
     conf = (boot / "festpos.conf").read_text()
     get = lambda k: backup.conf_value(conf, k)  # noqa: E731
-    assert get("ADMIN_PASSWORD") == "Theater-Fest-2026" and get("CLUSTER_SIZE") == "1" and get("RTC_AKKU") == "1"
+    # Notfall-Passwort nur als Prüfwert auf der Karte (T-0-N/FestPOS#15)
+    from app import emergency
+    assert get("ADMIN_PASSWORD") is None and "Theater-Fest-2026" not in conf
+    assert emergency.check("Theater-Fest-2026", get("ADMIN_PASSWORD_HASH")) and get("ADMIN_PASSWORD_LAENGE") == "17"
+    assert get("ADMIN_PASSWORD_HASH") == emergency.make_hash("Theater-Fest-2026", get("CLUSTER_SECRET"))
+    assert get("CLUSTER_SIZE") == "1" and get("RTC_AKKU") == "1"
     assert get("VIP") == "192.168.55.10" and len(get("CLUSTER_SECRET")) >= 32 and get("DHCP") == "1"
     assert (boot / "node.conf").read_text() == "NODE=a\n"
     tls = {n: (boot / "festpos-tls" / n).read_bytes() for n in backup.TLS_FILES}
@@ -105,15 +110,48 @@ def test_new_single_pi(setup):
     sans = srv.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     assert {str(i) for i in sans.get_values_for_type(x509.IPAddress)} >= {"192.168.55.10", "192.168.55.13", "127.0.0.1"}
     assert ca.extensions.get_extension_for_class(x509.NameConstraints).critical
-    key = c.get(f"/api/einrichtung/ca.key?token={tok}")
-    assert key.status_code == 200 and b"PRIVATE KEY" in key.content
-    assert c.get("/api/einrichtung/ca.key?token=falsch").status_code == 401
+    # ca.key nur verschlüsselt: kein Download im Klartext, Passwort mindestens 12 Zeichen
+    old = c.get(f"/api/einrichtung/ca.key?token={tok}")
+    assert old.status_code in (404, 405) and b"PRIVATE KEY" not in old.content
+    assert c.post("/api/einrichtung/ca.key", json={"token": tok, "password": "zu-kurz"}).status_code == 422
+    assert c.post("/api/einrichtung/ca.key", json={"token": "falsch", "password": "Kassen-Ordner-26"}).status_code == 401
+    key = c.post("/api/einrichtung/ca.key", json={"token": tok, "password": "Kassen-Ordner-26"})
+    assert key.status_code == 200 and key.content.startswith(b"-----BEGIN ENCRYPTED PRIVATE KEY-----")
+    assert b"BEGIN PRIVATE KEY" not in key.content
+    from cryptography.hazmat.primitives import serialization
+    ca_key = serialization.load_pem_private_key(key.content, b"Kassen-Ordner-26")
+    assert ca_key.public_key() == ca.public_key()                                   # passt zur CA
     assert c.get("/ca.crt").content == tls["ca.crt"]
     assert json.loads((setup["data"] / "start.json").read_text()) == {"lang": "fr"}
     # danach endgültig aus: weder die App noch der Helfer richten nochmals ein
     r = c.post("/api/einrichtung/neu", json={"token": tok, "admin_password": "Theater-Fest-2026", "values": VALUES})
     assert r.status_code == 409
     assert c.get("/api/einrichtung").json()["done"]["mode"] == "neu"
+
+
+def test_ca_key_to_usb_stick_only_encrypted(setup):
+    """ca.key auf den USB-Stick am Pi: der root-Helfer schreibt nur einen verschlüsselten Schlüssel (festpos-ca/),
+    einen anderen ca.key auf dem Stick überschreibt er nicht."""
+    c, env, tmp = setup["c"], setup["env"], setup["tmp"]
+    stick = tmp / "stick"
+    stick.mkdir()
+    env["FESTPOS_STICK_ORDNER"] = str(stick)
+    tok = _token(c)
+    assert c.post("/api/einrichtung/neu", json={"token": tok, "admin_password": "Theater-Fest-2026",
+                                                "values": VALUES}).status_code == 200
+    assert c.post("/api/einrichtung/ca.key/usb", json={"token": tok, "password": "kurz"}).status_code == 422
+    r = c.post("/api/einrichtung/ca.key/usb", json={"token": tok, "password": "Kassen-Ordner-26"})
+    assert r.status_code == 200 and r.json()["path"] == "festpos-ca/ca.key", r.text
+    key = (stick / "festpos-ca" / "ca.key").read_bytes()
+    assert key.startswith(b"-----BEGIN ENCRYPTED PRIVATE KEY-----")
+    assert (stick / "festpos-ca" / "ca.crt").read_bytes() == c.get("/ca.crt").content
+    r = c.post("/api/einrichtung/ca.key/usb", json={"token": tok, "password": "Kassen-Ordner-26"})
+    assert r.status_code == 200 and r.json()["path"].startswith("festpos-ca/ca-")         # anderer Inhalt: daneben
+    assert (stick / "festpos-ca" / "ca.key").read_bytes() == key
+    # Klartext nimmt der Helfer nie an (auch nicht, wenn die App es versuchte)
+    job = setup["mod"]._submit("ca_key_usb", {"key": "-----BEGIN PRIVATE KEY-----\nx\n", "crt": "-----BEGIN CERTIFICATE-----"})
+    res = setup["mod"]._wait(job)
+    assert res and not res["ok"] and res["code"] == "job"
 
 
 def test_new_with_own_update_key(setup):
@@ -240,7 +278,7 @@ def test_uploads_need_the_session_key_before_anything_is_read(setup):
 
 
 def test_certs_like_make_certs():
-    made = zertifikate.make_all("10.1.2", 24, ["10.1.2.10", "10.1.2.11", "10.1.2.12", "10.1.2.13"])
+    made = zertifikate.make_all("10.1.2.0/24", ["10.1.2.10", "10.1.2.11", "10.1.2.12", "10.1.2.13"])
     ca = x509.load_pem_x509_certificate(made["ca.crt"])
     nc = ca.extensions.get_extension_for_class(x509.NameConstraints).value
     assert {str(s.value) for s in nc.permitted_subtrees} >= {"10.1.2.0/24", "127.0.0.1/32", "festpos.local", "localhost"}
@@ -249,7 +287,7 @@ def test_certs_like_make_certs():
     assert len(list(eku)) == 2
     assert isinstance(srv.public_key(), ec.EllipticCurvePublicKey)
     with pytest.raises(ValueError):
-        zertifikate.make_all("10.1.2", 24, ["10.9.9.9"])
+        zertifikate.make_all("10.1.2.0/24", ["10.9.9.9"])
 
 
 def test_units_and_node_script():
@@ -267,7 +305,7 @@ def test_setup_serve_https_and_redirect(tmp_path, monkeypatch):
     """B1: https mit vorläufigem Zertifikat, Port 80 leitet nur um; ohne Zertifikat Rückfall http."""
     import asyncio
     from app import setup_serve, zertifikate
-    made = zertifikate.make_all("192.168.55", 24, ["192.168.55.10"])
+    made = zertifikate.make_all("192.168.55.0/24", ["192.168.55.10"])
     (tmp_path / "c.pem").write_bytes(made["server.crt"])
     (tmp_path / "k.pem").write_bytes(made["server.key"])
     monkeypatch.setattr(setup_serve, "CERT", tmp_path / "c.pem")

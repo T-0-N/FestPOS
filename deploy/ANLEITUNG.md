@@ -30,6 +30,11 @@ noch nicht mit einem echten Payrexx-Konto getestet.
 
 ## Netz
 
+Die Tabelle zeigt das **Standardnetz 192.168.55.0/24** als Beispiel. Netz und Grösse lassen sich bei der
+Ersteinrichtung frei wählen (z.B. `10.20.0.0/22` für mehr Geräte, `/16` bis `/27`); die Adressen gelten dann sinngemäss
+(Handhelds .10, Pi .11/.12/.13 ab der Netzadresse). Die Zertifizierungsstelle gilt genau für das gewählte Netz – ein
+anderes Netz heisst darum später neue Zertifikate auf allen Geräten (Netz umziehen).
+
 | Gerät | IP | Switch-Port (TL-SG108PE) |
 |---|---|---|
 | **Adresse für Handhelds und PC** | **192.168.55.10** | – |
@@ -66,6 +71,36 @@ aus, 5, 10, 30 oder 60 Minuten), schreibt er die feste IP auf die neue MAC um, g
 der Übersicht, rotes Handheld auf der Statusanzeige („Zertifikat doppelt“) und in der Geräteansicht beide MAC mit
 „Neue MAC übernehmen“, „Alte MAC behalten“ oder „Sperren“ (dann das richtige Handheld neu einrichten). Jeder Wechsel,
 Alarm und jede Entscheidung steht im Protokoll (Betrieb › Protokoll).
+
+### Netz umziehen (im Betrieb)
+
+Verwaltung › Geräte & Netz › Pi › **Netz umziehen …** (nur Admin). Voraussetzungen: Tagesabschluss gemacht (keine
+offenen Bestellungen), eine frische Sicherung (letzte Stunde: herunterladen oder USB-Stick), alle Pi erreichbar.
+
+1. **Planen:** neues Netz mit Grösse, Adresse für die Handhelds, Pi A/B/C, DHCP-Bereich. FestPOS prüft (im Netz, keine
+   Überschneidung mit dem alten Netz, dem Druckernetz und dem Einrichtungsnetz, alle bisherigen Adressen haben im neuen
+   Netz Platz) und zeigt, was automatisch geht und was **von Hand** nötig ist: Drucker mit fester Adresse, Switch,
+   Access Point, Internet-Router (Gateway der Handhelds). Alle Adressen werden mit gleichem Abstand zur Netzadresse
+   umgerechnet (192.168.55.21 → 10.20.0.21).
+2. **Umzug starten:** FestPOS erzeugt eine neue Zertifizierungsstelle (CA) genau für das neue Netz und ein
+   Serverzertifikat für den bisherigen Server-Schlüssel; die Gerätezertifikate der Handhelds bleiben gültig. Die neue
+   CA geht über Fully auf die Handhelds. Den PC vorbereiten: «Neue CA für diesen PC herunterladen» und installieren.
+3. **Umstellen:** nach etwa 1½ Minuten stellen **alle Pi gleichzeitig** um und starten neu (rund 2–3 Minuten ohne
+   FestPOS). Die Datenbank zieht dabei mit (rqlite mit den neuen Adressen). Feste Adressen in den Einstellungen,
+   Drucker und DHCP-Zuteilungen sind umgerechnet.
+4. **Bestätigen:** den PC ins neue Netz bringen (DHCP oder neue feste Adresse), `https://<neue Adresse>:8443` öffnen und
+   **Umzug bestätigen** – innert 10 Minuten nach dem Neustart. Ohne Bestätigung stellen alle Pi selbst ins alte Netz
+   zurück (auch wenn ein Pi ausfällt und nicht ins neue Netz kommt), die Datenbank wird zurückgerechnet. «Zurück ins
+   alte Netz» geht bis dahin auch von Hand.
+5. **Danach:** Die Handhelds bekommen über Fully die neue Start-Adresse (die Verwaltung zeigt, welche noch fehlen, und
+   versucht es jede Minute wieder). **Den neuen ca.key herunterladen** (mit einem Passwort verschlüsselt) und getrennt
+   aufbewahren – er wird danach auf dem Pi gelöscht. Neue Sicherung machen. Die Checkliste von Hand abarbeiten.
+
+**Übergangszeit:** Die alten Adressen bleiben 24 Stunden zusätzlich – mit den alten Zertifikaten. Ein Handheld, das beim
+Umzug aus war, kommt so noch herein und bekommt die neue Start-Adresse; danach (beim nächsten Neustart der Pi) sind die
+alten Adressen weg, ein vergessenes Handheld dann über «neu einrichten». **Sicherungen aus dem alten Netz:** Die
+Datenbank wird beim Einspielen umgerechnet; ihre Schlüssel (alte CA) werden nie eingespielt. Eine Karte aus dem
+Kartenpaket von vor dem Umzug bei der Ersteinrichtung wird mit klarer Meldung abgewiesen – ein neues Kartenpaket machen.
 
 ### Drucker-Netz: Drucker im eigenen VLAN (empfohlen)
 
@@ -182,15 +217,23 @@ einzelnen Pi):
    - *Zu Pi A hinzufügen* – Pi B oder C: das **Kartenpaket** von Pi A wählen (Geräte & Netz › Pi › Auf 3 Pi erweitern ›
      Kartenpaket herunterladen), dann den Buchstaben. Einfacher geht es mit «SD-Karte schreiben» an Pi A (T10) – diese
      Karte kommt gar nicht in die Ersteinrichtung.
-3. **Notfall-Passwort** (Benutzer `admin`, mindestens 10 Zeichen) – nur bei «Neu einrichten».
+3. **Notfall-Passwort** (Benutzer `admin`, mindestens 16 Zeichen; ein Vorschlag lässt sich übernehmen) – nur bei
+   «Neu einrichten». Auf der Karte steht danach nur ein Prüfwert, nicht das Passwort: gut aufschreiben.
 4. **Uhrzeit** dieses Geräts übernehmen (Zeitzone Europe/Zurich).
-5. **Netz:** Standard passt zur Tabelle oben (Handhelds 192.168.55.10, Pi A .11, B .12, C .13, DHCP für die Handhelds); nur
-   bei Bedarf unter «Ändern».
+5. **Netz:** vorgegeben ist das Netz der Tabelle oben (192.168.55.0/24: Handhelds .10, Pi A .11, B .12, C .13, DHCP
+   .150–.189). Ein anderes Netz mit Grösse eintragen, z.B. `10.20.0.0/22`: die Seite zeigt gleich, welche Adressen
+   dazugehören und wie viele Geräte Platz haben, und schlägt passende Adressen vor (Pi B, Pi C und DHCP-Bereich unter
+   «Pi B, Pi C, DHCP-Bereich»). Geprüft wird vor dem Einrichten: alle Adressen im Netz und verschieden, der DHCP-Bereich
+   ohne die Adressen der Pi, kein Überschneiden mit dem Druckernetz (192.168.56.0/24) und der Einrichtungsadresse.
 6. **Batterie der Uhr:** offizielle aufladbare RTC-Batterie ja/nein (`RTC_AKKU`).
 7. **Zusammenfassung › Einrichten.** Der Pi schreibt `festpos.conf`, `node.conf` und `festpos-tls/` auf die
    Boot-Partition – die Datei bleibt der Ort der Einstellungen und ist am PC lesbar.
-8. Bei «Neu einrichten»: **ca.key herunterladen** und auf einen USB-Stick legen (er kommt nicht auf die Karte und ist
-   nach dem Neustart weg; gebraucht wird er nur, um später das Server-Zertifikat zu erneuern), dazu `ca.crt`. Erst dann
+8. Bei «Neu einrichten»: **ca.key sichern** (er kommt nicht auf die Karte und ist nach dem Neustart weg; gebraucht wird
+   er nur, um später das Server-Zertifikat zu erneuern). Zuerst ein **Passwort** für ca.key wählen (mindestens 12
+   Zeichen, zweimal) – der Schlüssel geht nur verschlüsselt hinaus. Dann **Auf USB-Stick am Pi speichern** (Stick am
+   Pi einstecken; landet im Ordner `festpos-ca/` samt `ca.crt`) oder **ca.key herunterladen** und zusammen mit
+   `ca.crt` in einen Ordner `festpos-ca/` auf einem USB-Stick legen (Dateinamen so lassen: `make-certs.sh` sucht
+   genau `ca.key`). Das Passwort **getrennt** vom Stick aufbewahren (z.B. auf Papier im Kassenordner). Erst dann
    **Pi neu starten**.
 
 Danach ist der Modus endgültig aus. Der Pi setzt sich auf die feste Festplatz-IP (am Heimrouter ist er dann nicht mehr
@@ -205,7 +248,7 @@ Ersteinrichtung:
 
 ```bash
 cd festpos/deploy
-cp festpos.conf.example festpos.conf     # ADMIN_PASSWORD ändern! (mind. 10 Zeichen, CLUSTER_SECRET optional)
+cp festpos.conf.example festpos.conf     # ADMIN_PASSWORD ändern! (mind. 16 Zeichen, CLUSTER_SECRET optional)
 bash make-certs.sh festpos.conf          # erzeugt deploy/festpos-tls/ und ~/festpos-ca/
 ```
 (`make-certs.sh` braucht `openssl`: unter Linux/macOS vorhanden, unter Windows z.B. in Git Bash.)
@@ -213,14 +256,21 @@ bash make-certs.sh festpos.conf          # erzeugt deploy/festpos-tls/ und ~/fes
 **Passwörter in `festpos.conf`** dürfen jedes Zeichen enthalten (`$`, `&`, Leerzeichen, Umlaute). Die Datei
 wird nur gelesen, nicht ausgeführt. Einzige Regel: Ab „Leerzeichen + #“ beginnt ein Kommentar. Enthält ein
 Passwort ` #`, den Wert in Anführungszeichen setzen: `ADMIN_PASSWORD="Bier #1"`.
-Steht bei `ADMIN_PASSWORD` noch der Platzhalter `bitte-aendern` (oder `admin`), ist der Notfall-Login gesperrt;
-ist es kürzer als 10 Zeichen, zeigen Übersicht und Statusanzeige eine Warnung.
+Steht bei `ADMIN_PASSWORD` noch der Platzhalter `bitte-aendern` (oder `admin`), ist der Notfall-Login gesperrt.
+Beim ersten Start ersetzt der Pi das Passwort durch einen **Prüfwert** (`ADMIN_PASSWORD_HASH`, `ADMIN_PASSWORD_LAENGE`):
+danach steht es nicht mehr im Klartext auf der Karte. Ein neues Notfall-Passwort trägt man wieder als
+`ADMIN_PASSWORD=…` ein und startet neu (bei 3 Pi auf jeder Karte). Ist es kürzer als **16 Zeichen**, zeigen Übersicht
+und Statusanzeige eine Warnung; gibt es einen eigenen Benutzer mit der Rolle Admin, ist der Notfall-Login dann
+gesperrt (ohne eigenen Admin bleibt er offen, sonst käme niemand mehr hinein).
 
 - `festpos-tls/` → kommt auf die Boot-Partition jeder Karte (macht `setup.sh`). Darin `ca.crt`, die zusätzlich
   auf **jedes Handheld und jeden PC** kommt (Schritt 4).
 - `~/festpos-ca/ca.key` → der Schlüssel der Zertifizierungsstelle. Liegt absichtlich **ausserhalb** des
   Projektordners, damit er nie auf eine Karte kopiert wird. **Sicher aufbewahren** (USB-Stick); gebraucht
-  wird er nur, um später ein neues Server-Zertifikat auszustellen.
+  wird er nur, um später ein neues Server-Zertifikat auszustellen. Er ist mit einem Passwort verschlüsselt:
+  `make-certs.sh` fragt beim Erzeugen nach einem neuen (mindestens 12 Zeichen) und später beim Erneuern danach.
+  Ohne Fragen: `FESTPOS_CA_PASS_FILE=/pfad/zur/datei` (erste Zeile = Passwort). Ein `ca.key` aus einer älteren
+  Version ist noch unverschlüsselt – `make-certs.sh` zeigt, wie man ihn verschlüsselt.
 - Die Zertifizierungsstelle darf nur Zertifikate für das Festnetz (192.168.55.x), `festpos.local` und
   `localhost` ausstellen. Selbst mit einem gestohlenen `ca.key` lassen sich damit keine fremden Webseiten
   (Bank, Google …) auf den Handhelds fälschen.
@@ -247,6 +297,30 @@ gültig, protokolliert in `/var/log/sudo.log`). Das stellt `festpos-haertung` be
 (Image ohne Imager-Angaben) bleibt `sudo` ohne Passwort, damit die Fernwartung überhaupt geht – das meldet
 `sudo festpos-haertung --stand` (`"password_set": false`); Passwort setzen mit `sudo passwd <benutzer>`, beim
 nächsten Start gilt dann auch für `sudo` das Passwort.
+
+**Start nur von der SD-Karte, Bluetooth aus, keine Anmeldung am Bildschirm:** Ein Pi 5 startet ab Werk auch von einem
+USB-Stick oder über das Netz – wer kurz Zugang hat, könnte so ein fremdes System starten und die SD-Karte lesen oder
+verändern. `festpos-haertung` stellt darum bei der Ersteinrichtung, bei jedem Start und bei jedem Update den
+Bootloader (EEPROM) auf **nur SD-Karte** (`BOOT_ORDER=0xf1`, keine Netzwerk-Installation), schaltet **Bluetooth** ab
+(`dtoverlay=disable-bt`) und nimmt am **Bildschirm** keine Anmeldung mehr an (der Hinweistext, z.B. der
+Einrichtungscode, bleibt sichtbar; keine weiteren Konsolen, keine serielle Konsole). Die Bootloader-Einstellung wirkt
+nach dem **nächsten Neustart** – bis dahin zeigt Verwaltung › Geräte & Netz › Pi beim Pi «Start auch von USB» und
+in der Übersicht einen Hinweis; Pi antippen › **Pi jetzt neu starten**. Zustand pro Pi: Pi antippen › Zustand (Start,
+Bluetooth, Konsole) oder `sudo festpos-haertung --stand`.
+
+**Sicherheitsereignisse in der Verwaltung:** Jeder Pi meldet SSH-Anmeldungen (Benutzer, Adresse), `sudo` (Befehl und
+falsche Passwörter), Neustarts, geänderte Dateien auf der Boot-Partition (Prüfsumme beim Start – fällt auf, wenn
+jemand die SD-Karte an einem anderen Rechner geändert hat) und abgewiesene fremd signierte Updates; dazu kommen
+Anmeldesperren der Verwaltung und jeder Notfall-Login. Sie stehen im **Protokoll** (Häkchen «Nur Sicherheit») und
+oben in der **Übersicht** als gelbe Karte «Sicherheit: n neue Ereignisse», bis jemand **Gesehen** klickt – auf allen
+Pi, innert einer Minute. War es niemand vom Team: Passwörter ändern, SSH-Schlüssel prüfen und die Technik informieren.
+Gesammelt wird von `festpos-ereignisse` (alle 20 Sekunden, `festpos-ereignisse.timer`), Stand in
+`/var/lib/festpos-ereignisse/`. Eigene Wartung per SSH erscheint dort ebenfalls – einfach «Gesehen» klicken.
+
+*Rückgängig* (z.B. um den Pi von einer USB-SSD zu starten): Im Raspberry Pi Imager › *Misc utility images* ›
+*Bootloader (Pi 5 family)* › *SD Card Boot* auf eine leere SD-Karte schreiben, in den Pi stecken, einschalten, warten,
+bis die grüne Lampe gleichmässig blinkt, ausschalten. Danach startet er wieder mit der Werkseinstellung. Startet
+danach wieder eine FestPOS-Karte, stellt `festpos-haertung` den Bootloader erneut auf «nur SD-Karte».
 
 **Weitere Einstellungen in `festpos.conf`:**
 - `SSH_FROM` – nur von diesen Adressen ist SSH (Fernzugang) erlaubt, Standard `192.168.55.200-192.168.55.254`
@@ -329,8 +403,12 @@ Pi an den Switch, Strom an. Nach ca. 1 Minute ist er unter **https://192.168.55.
 Am PC (feste IP 192.168.55.200 einstellen, `ca.crt` im Browser/System als vertrauenswürdig
 importieren oder die Warnung einmal bestätigen) **https://192.168.55.10:8443/admin.html** öffnen
 (Port **8443**: die Verwaltung braucht kein Gerätezertifikat, nur das Passwort),
-Benutzer `admin` mit dem Notfall-Passwort (aus der Ersteinrichtung bzw. aus `festpos.conf`). Die Anmeldung gilt 12 Stunden; der Browser merkt sich dabei nur ein
-Sitzungs-Token, nicht das Passwort.
+Benutzer `admin` mit dem Notfall-Passwort (aus der Ersteinrichtung bzw. aus `festpos.conf`). Der Browser merkt sich dabei
+nur ein Sitzungs-Token, nicht das Passwort. Ohne Bedienung meldet die Verwaltung nach 30 Minuten ab (einstellbar 10–120
+Minuten unter Benutzer › Zugriff auf die Verwaltung); eine Minute vorher fragt sie «Noch da?». Klicken, Tippen und
+Eingaben verlängern, das automatische Aktualisieren der Seiten nicht. Spätestens nach 12 Stunden ist immer eine neue
+Anmeldung nötig. Benutzer mit der Rolle **Anzeige** bleiben angemeldet – dafür eignet sich die Statusanzeige an einem
+Bildschirm oder Tablet.
 
 Das Menü links ist in drei Gruppen geordnet: **Betrieb** (Bestellungen, Druckaufträge, Tagesabschluss, Protokoll),
 **Vorbereiten** (Produkte, Tische, Kasse & App) und **System** (Geräte & Netz, Benutzer, Wartung).
@@ -487,7 +565,9 @@ gelten, und warnt ebenfalls rechtzeitig (auch in der Übersicht). Das Server-Zer
 `bash make-certs.sh festpos.conf` und spielst es auf jedem Pi mit `sudo festpos-zertifikate ~/festpos/deploy/festpos-tls`
 ein (vorher den Projektordner auf den Pi kopieren) – an den Handhelds ändert sich nichts. Liegt `ca.key` nicht in
 `~/festpos-ca` (z.B. auf dem USB-Stick): `FESTPOS_CA_DIR=/pfad/zum/ordner bash make-certs.sh festpos.conf`.
-Ohne `ca.key` bricht `make-certs.sh` ab, statt still eine neue Zertifizierungsstelle zu erzeugen.
+Ohne `ca.key` bricht `make-certs.sh` ab, statt still eine neue Zertifizierungsstelle zu erzeugen. Es fragt nach dem
+Passwort für `ca.key` (aus der Ersteinrichtung bzw. dem ersten `make-certs.sh`); liegt der Schlüssel aus der
+Ersteinrichtung auf dem Stick: `FESTPOS_CA_DIR=/pfad/zum/stick/festpos-ca`.
 
 ### Neue Zertifizierungsstelle (einmalig, wenn die Verwaltung es meldet)
 
@@ -933,6 +1013,55 @@ Lücke weiter. Die eigene Sicherung vom Stick braucht kein Passwort. Danach zeig
 Am PC lesen: `python3 tools/sicherung_lesen.py DATEI.festpos ZIELORDNER` (fragt das Passwort; braucht das Paket
 `cryptography`). Der Ordner enthält danach alle Schlüssel – löschen, wenn nicht mehr gebraucht.
 
+### Daten verschlüsselt (Schlüssel im Chip)
+
+Die Daten jedes Pi liegen verschlüsselt auf der Karte: Datenbank (Bestellungen, Kassenbuch, Gastdaten), Druckaufträge,
+Archiv, dazu `server.key`, `device-ca.key`, `CLUSTER_SECRET`, das Notfall-Passwort und der Tunnel-Token. Der
+Schlüssel liegt im Chip des Pi (OTP): eine gestohlene SD-Karte ist am PC oder in einem anderen Pi unlesbar. Der
+Schlüssel wird **einmal** pro Pi zufällig in den Chip geschrieben und lässt sich nicht mehr ändern; der Pi wird
+dadurch nicht gesperrt und startet weiter jedes System. Der Pi 5 verschlüsselt in Hardware – Bestellen und Drucken
+sind gleich schnell.
+
+**Was auf der Boot-Partition steht:** In `festpos.conf` steht bei diesen Werten nur `im-container`, `festpos-tls/`
+enthält nur noch die Zertifikate. Wer am PC einen neuen Wert einträgt (z.B. `CLUSTER_SECRET` oder `TUNNEL_TOKEN`),
+überschreibt einfach `im-container`: beim nächsten Start gilt der neue Wert und wandert in den verschlüsselten
+Bereich. Ebenso neue Schlüssel von `festpos-zertifikate` oder einer Sicherung.
+
+**Wiederherstellungs-Schlüssel:** Pro Pi gibt es einen (8 Gruppen à 4 Zeichen). Er öffnet die Karte, wenn der Pi
+defekt ist. Ausdrucken und **zusammen mit dem Sicherungs-Passwort** aufbewahren, nicht beim Pi.
+
+**Neuer Pi** (nach der Ersteinrichtung, Karte aus «SD-Karte schreiben» oder dem Kartenpaket, Ersatz-Pi): verschlüsselt
+sich beim ersten Start selbst – vorläufig mit einem Schlüssel auf der Karte. Die Übersicht meldet rot
+«Wiederherstellungs-Schlüssel von Pi … noch nicht gesichert». Geräte & Netz › Pi › **Schlüssel sichern …**: Schlüssel
+drucken, Häkchen «ausgedruckt und aufbewahrt», **Gesichert** – erst jetzt kommt der Schlüssel in den Chip, der
+vorläufige wird gelöscht.
+
+**Bestehender Pi** (nach dem Update auf diese Version): Geräte & Netz › Pi › Karte «Daten verschlüsselt» ›
+**Umstellen …**. Schlüssel drucken, Häkchen setzen, **Jetzt umstellen**. Nicht während eines Anlasses: Der Pi sichert
+auf den USB-Stick (falls einer steckt), startet neu, kopiert die Daten in den verschlüsselten Bereich und prüft sie
+Datei für Datei, schreibt den Schlüssel in den Chip und startet nochmals neu (etwa 5 Minuten, je nach Datenmenge). Erst
+wenn der Bereich dann mit dem Chip aufgeht und FestPOS läuft, löscht er die alten, unverschlüsselten Daten. Klappt
+etwas nicht, gilt alles wie vorher; die Karte zeigt den Grund. Im Cluster einen Pi nach dem anderen umstellen – die
+anderen laufen weiter. Braucht `cryptsetup`: es kommt mit dem Update-Paket; fehlt es, steht «nach dem nächsten Update».
+
+**Defekter Pi – Karte lesen:**
+- *In einem anderen Pi:* Am PC auf die Boot-Partition der Karte eine Textdatei `festpos-wiederherstellung.txt` mit
+  dem Wiederherstellungs-Schlüssel legen (Gross-/Kleinschreibung und Leerzeichen egal) und die Karte in den neuen Pi
+  stecken. Er öffnet sie damit, schreibt seinen eigenen Schlüssel dazu und löscht die Datei. Ohne die Datei startet
+  FestPOS auf dieser Karte nicht und legt `festpos-gesperrt.txt` mit diesem Hinweis auf die Boot-Partition.
+- *Am Linux-PC* (Karte im Kartenleser, Systempartition eingebunden):
+  `sudo cryptsetup open /media/…/var/lib/festpos-krypt/daten.luks festpos`, Schlüssel genau wie gedruckt eintippen
+  (Grossbuchstaben, mit Bindestrichen), dann `sudo mount -o ro /dev/mapper/festpos /mnt`: unter `/mnt/daten` liegen
+  die Daten, unter `/mnt/geheim` die Schlüssel. Danach `sudo umount /mnt` und `sudo cryptsetup close festpos`.
+- Einfacher ist meist: Ersatz-Pi neu einrichten und die **Sicherung** einspielen (Kapitel «Automatische Sicherung»).
+
+**Grenzen:** Schützt vor der gestohlenen Karte. Wer Karte **und** Pi hat und das System auf der Karte verändern kann,
+kommt an den Schlüssel – dagegen hilft erst Secure Boot. root auf dem laufenden Pi hat weiter Zugriff. Nicht im
+verschlüsselten Bereich liegen das Betriebssystem, die SSH-Hostschlüssel und das WLAN-Passwort für «Update aus dem
+Internet» (NetworkManager). Ein älterer Pi ohne Schlüssel im Chip (alte Firmware) verschlüsselt trotzdem, der
+Schlüssel liegt dann aber auf der Karte («Schlüssel auf der Karte»). Nach dem Umstellen gibt der Pi die gelöschten
+Blöcke frei (`fstrim`); ganz sicher weg sind alte Daten auf einer SD-Karte erst mit einer neuen Karte.
+
 ---
 
 ## Später: Erweitern auf 3 Pis (ausfallsicher)
@@ -1045,7 +1174,30 @@ von selbst.
 **Notweg**, falls kein Gerät mit Zertifikat mehr geht: am Pi selbst, z.B. per SSH-Tunnel
 `ssh -L 8443:localhost:8443 pi@192.168.55.11` und dann `https://localhost:8443/admin.html` – dort ausschalten.
 
-- **Notfall-Login:** Benutzer `admin` (oder Name leer lassen) mit dem `ADMIN_PASSWORD` aus `festpos.conf` ist
+**Zweiter Faktor** (Code aus einer Authenticator-App, z.B. Google Authenticator, Microsoft Authenticator oder Aegis):
+- **Pflicht** für die Rollen unter Benutzer › Zugriff › «Zweiter Faktor Pflicht für» (Standard: Admin). Nach der
+  Anmeldung öffnet sich «Zweiter Faktor einrichten»: in der App «Konto hinzufügen», QR-Code scannen (ohne Kamera: den
+  Schlüssel abtippen), den angezeigten Code eingeben. Danach zeigt FestPOS **10 Wiederherstellungs-Codes** – ausdrucken
+  oder notieren und getrennt vom Handy aufbewahren; jeder gilt einmal statt des Codes aus der App. Dreimal geht
+  «Später»; nach dem dritten Mal läuft die Verwaltung bis zum Abmelden weiter, danach geht nur noch das Einrichten.
+- **Freiwillig** für alle anderen: Benutzermenü (unten links) › **Zweiter Faktor …**. Dort auch neue
+  Wiederherstellungs-Codes und – wenn er für die Rolle nicht Pflicht ist – ausschalten (je mit Passwort und Code).
+- **Anmelden:** zuerst Name und Passwort, dann der Code (wechselt alle 30 Sekunden). Handy weg: «Wiederherstellungs-Code
+  verwenden». Meldet FestPOS, der Code passe zu einer anderen Uhrzeit, stimmt die Uhr des Pi oder des Handys nicht
+  (Übersicht › Uhrzeit prüfen).
+- **Handy verloren:** ein anderer Admin öffnet Benutzer › Bearbeiten und setzt den zweiten Faktor zurück; die Person
+  richtet ihn bei der nächsten Anmeldung neu ein. Gibt es keinen anderen Admin: mit dem Notfall-Login.
+- Der **Notfall-Login** hat keinen zweiten Faktor – er geht nur im FestPOS-Netz oder am Pi selbst.
+- Mit zweitem Faktor geht die Anmeldung im Browser-Dialog (Basic Auth, z.B. curl) nur noch zum **Lesen**.
+
+**Kritische Aktionen bestätigen:** Update verteilen, zurücksetzen oder wiederholen, Update aus dem Internet, Benutzer
+und Rollen anlegen, ändern oder löschen, Netz & Internet, Drucker-Netz, Sicherung einspielen, Bestellungen löschen,
+neues Sicherungs-Passwort, Kartenpaket, Karte schreiben und die Einstellungen unter Benutzer › Zugriff fragen nochmals
+nach dem Passwort (und dem Code). Die Bestätigung gilt 5 Minuten für alle diese Aktionen, auf allen Pi, und steht wie
+jede kritische Aktion im Protokoll.
+
+- **Notfall-Login:** geht nur im FestPOS-Netz oder am Pi selbst (z.B. über einen SSH-Tunnel), jede Anmeldung steht
+  im Protokoll. Benutzer `admin` (oder Name leer lassen) mit dem `ADMIN_PASSWORD` aus `festpos.conf` ist
   immer Admin – auch wenn niemand mehr sein Passwort weiss. Dieses Passwort nur der Festleitung oder dem
   Technik-Verantwortlichen geben. Der Name «admin» kann nicht als normaler Benutzer angelegt werden.
   Mit dem Platzhalter `bitte-aendern` ist der Notfall-Login gesperrt (siehe Schritt 1).
@@ -1056,7 +1208,7 @@ von selbst.
   Passwörter durchprobiert und dabei die Adresse wechselt, die Festleitung an ihrem PC nicht aus). Wer ganz sicher
   gehen will, lässt die Verwaltung mit `ADMIN_FROM` in `festpos.conf` nur vom Admin-PC aus zu (Schritt 1).
 - **Anmeldung im Browser-Dialog (Basic Auth)**, z.B. für die einfache Statusanzeige auf einem alten iPad: damit lässt
-  sich nur **ansehen**. Ändern geht im Browser nur aus der Verwaltung selbst (mit ihrer eigenen Anmeldung); eine
+  sich nur **ansehen** (mit zweitem Faktor auch mit `curl` nur lesen). Ändern geht im Browser nur aus der Verwaltung selbst (mit ihrer eigenen Anmeldung); eine
   Anfrage, die eine andere Webseite im Namen des angemeldeten Browsers schickt, weist der Pi ab. `curl` und eigene
   Skripte mit Name und Passwort gehen weiterhin.
 - Passwörter: mindestens 8 Zeichen. Jede Person ändert ihr eigenes unten links: auf den eigenen Namen klicken ›
@@ -1082,7 +1234,7 @@ gleicht das beim Tagesabschluss mit dem gezählten Bargeld und den Abrechnungen 
 - Jede Bestellung und jedes Storno bekommt beim Anlegen eine **Prüfsumme** (HMAC-SHA256 mit einem Schlüssel aus
   `CLUSTER_SECRET`, der nur auf den Pi liegt – nicht in der Datenbank; in der Sicherung nur verschlüsselt). Wer nachträglich
   in der Datenbank einen Betrag oder eine Menge ändert, fällt beim Tagesabschluss auf. Bei **Quittungen** deckt die
-  Prüfsumme seit T41 alles ab, was gedruckt wird: auch Empfänger (Name und Adresse), Zahlart, MWST-Nummer, Kopf- und
+  Prüfsumme seit T41 alles ab, was gedruckt wird: auch Empfänger (Name und Ort), Zahlart, MWST-Nummer, Kopf- und
   Fusszeilen und die Beträge pro Position. Ältere Quittungen werden weiter nach der früheren Regel geprüft.
 - Steht bei `CLUSTER_SECRET` der Platzhalter, leitet FestPOS den Schlüssel aus dem Server-Zertifikat ab (Übersicht
   zeigt einen Hinweis). Damit ein neues Zertifikat die Prüfsummen nicht unprüfbar macht, schreiben `make-certs.sh`,
@@ -1129,7 +1281,7 @@ gleicht das beim Tagesabschluss mit dem gezählten Bargeld und den Abrechnungen 
 - **Quittung** beim Abrechnen: über den ganzen Tisch (alle Bestellungen, «Bestellungen #0001, #0003») oder pro Person
   (Einzeln). Jede Position wird pro Tisch nur einmal im Original quittiert – auch wenn die Verwaltung bei einer der
   Bestellungen «Quittung drucken» wählt (dann kommt, was noch offen ist, sonst eine KOPIE). Über CHF 400 mit MWST nur in
-  der Verwaltung mit Empfänger (bei einer Bestellung des Tisches).
+  der Verwaltung mit Name und Ort des Gastes (bei einer Bestellung des Tisches).
 - **Karte/TWINT mit Payrexx (NFC)** geht auch an einem offenen Tisch (ganz, pro Person oder Teilen): der Server bucht
   die Zahlung selbst an den Tisch (Zahlart Payrexx, höchstens was offen ist). Eine Payrexx-Zahlung lässt sich am Handheld
   nicht rückgängig machen.
@@ -1245,10 +1397,24 @@ gehört zum Drucker unter Geräte › Drucker). Darunter drei Spalten:
   als **KOPIE** – auch das wird festgehalten.
   Stornierte Positionen werden nicht mehr quittiert; eine schon gedruckte Quittung bleibt, das Storno steht als
   Gegenbuchung im Kassenbuch.
-- **Über CHF 400 mit MWST** müssen Name und Adresse des Gastes auf der Quittung stehen (Kassenzettel bis CHF 400
-  brauchen sie nicht, Art. 57 MWSTV): Verwaltung › **Bestellungen** › Bestellung öffnen › **Empfänger** eintragen ›
-  **Quittung drucken** – ohne Empfänger druckt die Verwaltung sie nicht. Das Handheld druckt eine solche Quittung gar
+- **Über CHF 400 mit MWST** müssen Name und Ort des Gastes auf der Quittung stehen (Kassenzettel bis CHF 400
+  brauchen sie nicht, Art. 26 MWSTG; die ganze Adresse fragt FestPOS bewusst nicht ab – weniger Personendaten):
+  Verwaltung › **Bestellungen** › Bestellung öffnen › **Name des Gastes** und **Ort** eintragen › **Quittung drucken** –
+  ohne beides druckt die Verwaltung sie nicht. Das Handheld druckt eine solche Quittung gar
   nicht erst, sondern verweist auf die Verwaltung (bei „Einzeln“ zählt der Betrag pro Person).
+- **Saison abschliessen** (Verwaltung › Tagesabschluss, nur Admin; Erinnerung in der Übersicht, sobald abgeschlossene
+  Quittungen älter als 3 Monate sind): Belege 10 Jahre beim Verein aufbewahren (OR, MWSTG – Kassier, Treuhand oder
+  Revisor), die Gastdaten aber nicht unbegrenzt auf dem Pi (Datenschutzgesetz). In drei Schritten:
+  1. **Archiv erstellen** mit eigenem Passwort (mindestens 12 Zeichen, gut aufschreiben): alle Tagesabschlüsse seit der
+     letzten Saison, alle ihre Quittungen und Kopien – unverändert, mit Prüfsummen –, jeder Abschluss als PDF.
+     Verschlüsselt wie eine Sicherung.
+  2. **Sichern und bestätigen:** «Auf den USB-Stick» (FestPOS schreibt es in den Ordner `festpos-archiv` und liest es
+     zur Kontrolle zurück) oder «Herunterladen» und die Datei zur Kontrolle wieder hochladen.
+  3. **Gastdaten der Saison löschen** (Passwort nochmals): erst jetzt löscht FestPOS die Quittungen dieser Abschlüsse
+     samt Name und Ort der Gäste auf dem Pi. Ohne bestätigtes Archiv geht das nicht.
+  Die Quittungsnummern laufen weiter, die Tagesabschlüsse bleiben auf dem Pi (ohne Gastdaten) und ihre Prüfsummenkette
+  läuft weiter. Ein Archiv lässt sich jederzeit auf derselben Karte wieder hochladen und prüfen; am PC öffnet es
+  `python3 tools/archiv.py <datei>` (Passwort, prüft die Dateien und legt PDF und Daten in einen Ordner).
 - In der Verwaltung › Bestellungen zeigt jede Bestellung ihre Quittungen (Nummer, Zeit, wer, Kopien) mit
   **Kopie drucken**. Der **Tagesabschluss** (und sein PDF) nennt Anzahl, Nummern von–bis, Betrag, Kopien und Lücken.
   Übungsbestellungen aus dem Testmodus ergeben „TEST“-Quittungen ohne Nummer.
@@ -1257,7 +1423,7 @@ gehört zum Drucker unter Geräte › Drucker). Darunter drei Spalten:
 
 **Protokoll** – Verwaltung › Tagesabschluss › Reiter **Protokoll**: wer wann was geändert hat (Preise und Produkte, Kategorien,
 Einstellungen, Import, Sicherung eingespielt, Zahlart geändert, Stornos, Quittungen und Kopien, Abschlüsse, MWST,
-Rollen der Handhelds, Benutzer). Passwörter und PINs stehen nie darin. Das Protokoll lässt sich in der Verwaltung nicht löschen.
+Rollen der Handhelds, Benutzer, kritische Aktionen, Sicherheitsereignisse – Häkchen «Nur Sicherheit»). Passwörter und PINs stehen nie darin. Das Protokoll lässt sich in der Verwaltung nicht löschen.
 
 **Wichtig für die Prüfsummen:** In `festpos.conf` ein eigenes, langes `CLUSTER_SECRET` eintragen und behalten
 (steht dort nur der Platzhalter, nimmt FestPOS einen Schlüssel aus dem Server-Zertifikat – nach „Alles
@@ -1349,7 +1515,8 @@ Darunter:
   fällt die Karte weg. Ist unter Verwaltung › Geräte & Netz › Netz & Internet **Dauerhaft verbunden** an, steht dort die Zeile **Internet**:
   erreichbar oder nicht, der Weg (Router, WLAN oder USB-Adapter, mit dem Pi, der das Gerät hat) und ob der Tunnel der
   QR-Bestellung läuft. Antippen zeigt pro Pi «verbunden seit …», «über Pi A», «gibt weiter» und wofür das Internet
-  gebraucht wird. **Rot** ist sie nur, wenn Karte/TWINT oder QR-Bestellung eingeschaltet sind (sonst gelb); geht der
+  gebraucht wird; fehlt die Verbindung, steht der Grund dabei (z.B. «WLAN … nicht gefunden», «Namensauflösung (DNS)
+  geht nicht», «Uhrzeit des Pi stimmt nicht»). **Rot** ist sie nur, wenn Karte/TWINT oder QR-Bestellung eingeschaltet sind (sonst gelb); geht der
   Weg über den Mobilfunk-Router und meldet der schon rot, bleibt sie gelb – die Störung steht nur einmal oben. Die
   Handhelds melden dann oben rot «Internet ohne Verbindung».
 - **Server:** eine Zeile pro Pi: welcher druckt und wann zuletzt auf den USB-Stick gesichert wurde; Temperatur und
@@ -1589,6 +1756,29 @@ und „FestPOS-WLAN“; der Ablauf zeigt nur, ob alles bereit ist, und fragt nic
   weiter – selbst oder über den Pi mit dem Gerät. Weitergegeben wird **nur an die eingetragenen Handhelds** (Geräte & Netz ›
   Handhelds & PC, «Im Einsatz») und die Pi; ein neu eingetragenes Handheld ist nach höchstens einer Minute dabei. Die Seite zeigt pro Pi «Verbunden seit …»,
   «über Pi A», ob das Internet erreichbar ist und ob der Tunnel läuft.
+  **Stabil auch bei Neustart und Update:** Startet FestPOS neu (auch mitten in einem Update), übernimmt es die
+  bestehende Verbindung, statt sie abzubauen; der Funk bleibt während eines Updates an. Internet-Aufträge laufen in
+  einem eigenen Dienst und warten nicht hinter einem Update. «Erreichbar» heisst: ein Name lässt sich auflösen (DNS)
+  **und** eine HTTPS-Verbindung kommt zustande. Scheitert die Prüfung, steht der **Grund** dabei (kein DNS, Uhrzeit
+  falsch, keine Antwort, WLAN nicht gefunden …) – in der Verwaltung mit dem letzten und dem nächsten Versuch, auf der
+  Statusanzeige in der Zeile Internet. Neu verbunden wird erst nach **3 Fehlversuchen** hintereinander (je eine Minute),
+  danach mit wachsender Pause (1, 2, 4, 8, höchstens 15 Minuten) – ein schwaches Netz flattert so nicht.
+  Weg «Router im Netz»: Route und DNS setzt der Pi über NetworkManager (bleiben, auch wenn das Kabel kurz weg war).
+- **Firewall ins Internet** (Netz & Internet › Karte «Firewall», nur Admin, gilt für alle Pi): Der Pi selbst verbindet
+  sich nur mit dem, was FestPOS braucht. Drei Modi:
+  - **Nur FestPOS-Dienste** (Standard, empfohlen): Payrexx, Cloudflare (Tunnel, Paketquelle), GitHub (Updates),
+    Paketquellen von Debian und Raspberry Pi, Zeitserver und DNS über die eingestellten Server. Alles andere wird
+    verworfen und gezählt; die Karte zeigt pro Pi die Zahl und das zuletzt verworfene Ziel.
+  - **Beobachten:** alles erlaubt, andere Ziele werden nur gezählt – um herauszufinden, was fehlt (z.B. wenn Payrexx
+    eine neue Adresse hat).
+  - **Offen:** wie vor Version 1.2.0, nichts gezählt – nur zur Fehlersuche.
+  «Beobachten» und «Offen» gelten höchstens 24 Stunden, danach stellt FestPOS von selbst auf «Nur FestPOS-Dienste»
+  (Protokoll). Der Wechsel ist eine kritische Aktion (Passwort nochmals). Die Handhelds sind nie betroffen – Fully,
+  Payrexx-App und Android brauchen mehr. Das lokale Netz (Handhelds, Drucker, Router, andere Pi) bleibt immer offen.
+  Die Namen löst `festpos-firewall` alle 10 Minuten neu auf; die Liste steht an einer Stelle in `app/ausgehend.py`.
+  WLAN: Land **CH** ist eingestellt (Kanal 12/13 und 5 GHz gehen), der Pi sucht nach dem Einschalten bis zu 30 Sekunden
+  nach dem Netz. Mit 3 Pi verbindet sich nur der Pi mit der VIP mit dem Hotspot (viele Handy-Hotspots nehmen nur
+  wenige Geräte), die anderen gehen über ihn.
 - Die **Vorlage** (siehe unten) bestimmt, wie Fully eingestellt wird.
 
 Pro Handheld:
@@ -2142,6 +2332,10 @@ Paket wie immer über das FestPOS-Netz; nur der eine Pi braucht Internet.
 
 ### Zurück zur vorherigen Version
 
+**Achtung bei Versionen vor 1.1.0:** Ab 1.1.0 liegen die Passwörter und Schlüssel der Einstellungen verschlüsselt in
+der Datenbank. Eine ältere Version liest sie nicht mehr – nach dem Zurückgehen dorthin Sicherungs-, Fully-, WLAN- und
+Router-Passwort, Payrexx-Schlüssel und Tunnel-Token in der Verwaltung neu eintragen.
+
 Verwaltung › Wartung › Update › **Alle Pi zurück auf …** – wechselt auf allen Pi zur Sicherung (die Version vor dem letzten
 Update), wieder einer nach dem anderen. Nochmals gedrückt („Alle Pi wieder auf …“) wechselt es wieder vor. Die
 Datenbank bleibt dabei unberührt. «Zurück» braucht keine neue Signatur (die Sicherung war ein signiertes Paket) und geht darum nur genau
@@ -2156,6 +2350,21 @@ ist als das installierte und **dieselbe Hauptversion** hat (z.B. v10.5.3 → v10
 Wie jedes Update geht das einen Pi nach dem anderen, den druckenden zuletzt; «Zurück» nimmt auch rqlite zurück.
 Ein Wechsel der Hauptversion (v10 → v11) geschieht nie automatisch: zuerst die Hinweise von rqlite zum Upgrade lesen,
 eine Sicherung machen und erst dann von Hand einspielen.
+
+### Sicherheitsupdates des Betriebssystems mit dem Update
+
+Ein offizielles Update-Paket bringt seit 1.2.0 auch die **Sicherheitsupdates für das System der Pi** mit (Kernel,
+OpenSSL, OpenSSH, NetworkManager, dnsmasq, keepalived, Chromium der Statusanzeige …): die CI holt sie beim Release
+aus den offiziellen Quellen von Debian und Raspberry Pi (signierte Paketlisten) für die Pakete des Images. Jeder Pi
+spielt nach dem FestPOS-Update ein, was bei ihm älter ist – ohne Internet, Pi für Pi wie das Update. Schlägt dabei
+etwas fehl, läuft FestPOS trotzdem mit der neuen Version weiter; der Pi bringt apt selbst wieder in Ordnung (auch nach
+einem Stromausfall mitten im Einspielen, beim nächsten Start).
+
+Verwaltung › Wartung › Update › **Betriebssystem** zeigt pro Pi den Stand der Pakete, das letzte Ergebnis und den
+Kernel. Ein neuer Kernel wirkt erst nach einem **Neustart** – den macht niemand automatisch: «Neustart nötig» beim Pi,
+dann unter Geräte & Netz › Pi die Pi einzeln neu starten (den druckenden zuletzt). Ist der Stand älter als 6 Monate,
+erinnert die Übersicht. Hat ein Pi gerade Internet (dauerhaft verbunden), holt **«Mit Internet holen»** die
+Sicherheitsupdates direkt über apt – nur aus den Sicherheitsquellen. Das Paket wird damit grösser (einige 100 MB).
 
 ### Pi, die gefehlt haben
 
@@ -2225,7 +2434,7 @@ druckenden zuletzt).
 Vorher einen **Tagesabschluss** erstellen (siehe „Kassenbuch“: ohne eigenes `CLUSTER_SECRET` lassen sich die
 Prüfsummen offener Bestellungen danach nicht mehr prüfen).
 
-Setzt `festpos.conf` auf den Standard zurück – **übernommen werden `ADMIN_PASSWORD`, `CLUSTER_SECRET` und alle Netzwerk-/IP-Einstellungen** –,
+Setzt `festpos.conf` auf den Standard zurück – **übernommen werden das Notfall-Passwort (Prüfwert), `CLUSTER_SECRET` und alle Netzwerk-/IP-Einstellungen** –,
 erzeugt Zertifizierungsstellen und Server-Zertifikat neu (30 Jahre gültig) und leert die Geräteliste (neue Gerätezertifikate gelten wie eingestellt, Standard 10 Jahre). Produkte, Bestellungen und Einstellungen
 bleiben. Vorher wird alles nach `/root/festpos-backup-DATUM/` gesichert.
 

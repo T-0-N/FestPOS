@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -189,6 +190,7 @@ MIGRATIONS = [
     "ALTER TABLE payrexx_payments ADD COLUMN closing_id INTEGER",
     # T46: spät bestätigt zu einer bar abgeschlossenen Bestellung – die Verwaltung entscheidet (zurück oder nachbuchen)
     "ALTER TABLE payrexx_payments ADD COLUMN late TEXT",
+    "ALTER TABLE users ADD COLUMN totp TEXT",                 # zweiter Faktor (twofa.py, T-0-N/FestPOS#9)
     "UPDATE payrexx_payments SET closing_id=(SELECT o.closing_id FROM orders o WHERE o.id=payrexx_payments.order_id) "
     "WHERE closing_id IS NULL AND status='confirmed' AND EXISTS (SELECT 1 FROM orders o WHERE "
     "o.id=payrexx_payments.order_id AND o.closing_id IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM corrections c "
@@ -275,7 +277,17 @@ class Store:
 
     def setting(self, key: str, default: str = "") -> str:
         v = self.scalar("SELECT value FROM settings WHERE key=?", (key,))
+        if v is not None and key in _secret_keys():                     # Geheimnis: verschlüsselt abgelegt (#8)
+            from . import secretbox
+            v = secretbox.unseal(key, v)
+            if v is None:                                              # verschlüsselt, aber nicht lesbar
+                logging.getLogger("festpos").warning("Einstellung %s nicht lesbar (anderes CLUSTER_SECRET?)", key)
         return default if v is None else v
+
+
+def _secret_keys() -> frozenset:
+    from .secretbox import AUTO
+    return AUTO
 
 
 # ---------------------------------------------------------------------------

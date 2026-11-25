@@ -73,11 +73,40 @@ def _favicon(m) -> bool:
     return "favicon" in m.text or "favicon" in ((m.location or {}).get("url") or "")
 
 
+def _confirm_ask(m) -> bool:
+    """428 «Bitte bestätigen» (kritische Aktion, T-0-N/FestPOS#9): gehört zum Ablauf, kein Fehler."""
+    return "status of 428" in m.text
+
+
 def _watch(page) -> list[str]:
     errs: list[str] = []
     page.on("pageerror", lambda e: errs.append(f"pageerror: {e}"))
-    page.on("console", lambda m: errs.append(f"console: {m.text}") if m.type == "error" and not _favicon(m) else None)
+    page.on("console", lambda m: errs.append(f"console: {m.text}")
+            if m.type == "error" and not _favicon(m) and not _confirm_ask(m) else None)
     return errs
+
+
+def _preconfirm(page, pw: str = "geheim") -> None:
+    """Kritische Aktionen für die nächsten 5 Minuten bestätigen (wie «Bitte bestätigen», #9), dann neu laden – für Tests,
+    in denen es um die Aktion selbst geht. Die Verwaltung liest das Token beim Start aus dem sessionStorage."""
+    page.evaluate("""async (pw) => {
+      const r = await fetch('/api/admin/me/confirm', {method: 'POST', body: JSON.stringify({password: pw}), headers: {
+        Authorization: 'Bearer ' + sessionStorage.getItem('festpos.token'), 'Content-Type': 'application/json', 'X-Festpos-UI': '1'}});
+      if (!r.ok) throw new Error('confirm ' + r.status);
+      sessionStorage.setItem('festpos.token', (await r.json()).token);
+    }""", pw)
+    page.reload()
+    page.wait_for_selector(".side")
+
+
+def _confirm(page, pw: str = "geheim", code: str | None = None) -> None:
+    """Fenster «Bitte bestätigen» (kritische Aktion, T-0-N/FestPOS#9) abwarten und mit dem Passwort bestätigen –
+    danach läuft die Aktion von selbst weiter."""
+    page.wait_for_selector(".confirm-dlg[open]")
+    page.fill(".confirm-dlg [name=password]", pw)
+    if code is not None:
+        page.fill(".confirm-dlg [name=code]", code)
+    page.click(".confirm-dlg .btn.pri")
 
 
 def _phone(browser, base, name=None):
@@ -88,6 +117,12 @@ def _phone(browser, base, name=None):
     errs = _watch(page)
     page.goto(base + "/index.html")
     page.wait_for_selector('[data-act="digit"]')
+    # Bootstrap geladen (Testmodus, Produkte …): sonst fehlt z.B. «Testmodus starten» in den Einstellungen, wenn ein
+    # Test schneller ist als die Antwort (CI, 1.1.0-rc.2)
+    for _ in range(150):
+        if page.evaluate("!!localStorage.getItem('festpos.boot')"):
+            break
+        page.wait_for_timeout(100)
     return ctx, page, errs
 
 

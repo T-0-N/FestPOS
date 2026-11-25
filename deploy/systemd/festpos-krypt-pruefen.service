@@ -1,0 +1,12 @@
+[Unit]
+Description=FestPOS: nach dem Verschlüsseln prüfen, ob FestPOS läuft – sonst zurück (T-0-N/FestPOS#3)
+After=festpos.service
+ConditionPathExists=/var/lib/festpos-krypt/gesund
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/festpos-krypt --nachpruefen
+TimeoutStartSec=1h
+
+[Install]
+WantedBy=multi-user.target

@@ -42,8 +42,19 @@ def notes(tag: str) -> str:
 | `festpos-tap.apk` | Begleit-App für Karte/TWINT mit NFC über Payrexx (nur mit Payrexx, ungetestet) |
 | `FestPOS-Kurzanleitung.pdf` | Kurzanleitung für Bedienung und Festleitung |
 | `SHA256SUMS` | Prüfsummen aller Dateien |
+| `festpos.zip.cdx.json`, `festpos-<VERSION>.img.xz.cdx.json` | Paketliste (SBOM, CycloneDX): Python-Pakete, rqlite, beim Image alle Debian-Pakete |
 
-Die Pi nehmen nur ein `festpos.zip` an, das mit dem Update-Schlüssel des Projekts signiert ist (`festpos.zip.sig`).""")
+Die Pi nehmen nur ein `festpos.zip` an, das mit dem Update-Schlüssel des Projekts signiert ist (`festpos.zip.sig`).
+
+### Herkunft prüfen
+
+ZIP, Image, App und Paketlisten hat der Release-Workflow dieses Repos gebaut; GitHub bestätigt das mit einem
+Herkunftsnachweis. Prüfen mit der GitHub-Kommandozeile (`gh`):
+
+```
+gh attestation verify festpos.zip -R T-0-N/FestPOS
+gh attestation verify festpos-<VERSION>.img.xz -R T-0-N/FestPOS
+```""")
     return "\n".join(out).strip() + "\n"
 
 

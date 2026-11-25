@@ -1,0 +1,8 @@
+[Unit]
+Description=FestPOS: Firewall ins Internet (Modus anwenden, Namen auflösen, Zähler)
+After=festpos-node.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/festpos-firewall
+TimeoutStartSec=90

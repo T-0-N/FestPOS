@@ -14,7 +14,7 @@ schritt() { echo; echo "==> $*"; }
 schritt "ruff"
 ruff check app tests tools deploy/festpos-rqcheck.py deploy/festpos-redirect.py deploy/festpos-display deploy/festpos-settime \
   deploy/festpos-update deploy/festpos-sicherung deploy/festpos-wiederherstellen deploy/festpos-handy-usb deploy/festpos-karte deploy/pi-gen/os_list.py \
-  deploy/festpos-druckernetz.py || fehler=1
+  deploy/festpos-druckernetz.py deploy/festpos-krypt deploy/festpos-netz || fehler=1
 
 schritt "shellcheck"
 if command -v shellcheck >/dev/null; then

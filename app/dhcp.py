@@ -18,7 +18,7 @@ import os
 import re
 from pathlib import Path
 
-from . import device_ids
+from . import device_ids, netz
 from .core import rt
 
 log = logging.getLogger("festpos.dhcp")
@@ -28,7 +28,7 @@ HOSTS_FILE = "festpos-handys"
 CONF = Path(os.environ.get("FESTPOS_DHCP_CONF", "/etc/festpos/dnsmasq.conf"))
 OPTS_DIR = Path(os.environ.get("FESTPOS_DHCP_OPTS", "/var/lib/festpos/dhcp-opts"))     # Gateway bei «auto»
 OPTS_FILE = "festpos-gateway"
-VIP = os.environ.get("FESTPOS_VIP") or "192.168.55.10"
+VIP = netz.vip()                              # FESTPOS_VIP; sonst .10 im Netz (T-0-N/FestPOS#2)
 ARP = Path("/proc/net/arp")
 LEASE = "1h"                                   # kurz: ein neues Gateway kommt nach höchstens 30 Min an
 MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")

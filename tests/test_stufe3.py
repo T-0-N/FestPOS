@@ -25,10 +25,22 @@ ADMIN_PASSWORD=x
 pytestmark = pytest.mark.skipif(not shutil.which("openssl"), reason="openssl fehlt")
 
 
-def make_certs(work: Path, ca_dir: Path, *args: str) -> subprocess.CompletedProcess:
+CA_PASS = "Kassen-Ordner-2026"
+
+
+def pass_file(tmp: Path, pw: str = CA_PASS) -> Path:
+    p = tmp / "ca-pass.txt"
+    p.write_text(pw + "\n")
+    return p
+
+
+def make_certs(work: Path, ca_dir: Path, *args: str, pw: str = CA_PASS) -> subprocess.CompletedProcess:
+    """make-certs.sh wie am PC; das Passwort für ca.key kommt aus einer Datei statt vom Terminal."""
     (work / "festpos.conf").write_text(CONF)
     return subprocess.run(["bash", str(DEPLOY / "make-certs.sh"), "festpos.conf", *args], cwd=work,
-                          env={**os.environ, "FESTPOS_CA_DIR": str(ca_dir)}, capture_output=True, text=True)
+                          env={**os.environ, "FESTPOS_CA_DIR": str(ca_dir),
+                               "FESTPOS_CA_PASS_FILE": str(pass_file(work.parent, pw))},
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
 
 def ossl(*args: str, inp: str | None = None) -> subprocess.CompletedProcess:
@@ -41,7 +53,7 @@ def sign_foreign(ca_dir: Path, tmp: Path, san: str) -> Path:
          "-out", str(tmp / "f.csr"), "-subj", "/CN=fremd")
     (tmp / "f.ext").write_text(f"subjectAltName={san}\n")
     r = ossl("x509", "-req", "-in", str(tmp / "f.csr"), "-CA", str(ca_dir / "ca.crt"), "-CAkey", str(ca_dir / "ca.key"),
-             "-CAcreateserial", "-CAserial", str(tmp / "f.srl"), "-days", "10", "-extfile", str(tmp / "f.ext"),
+             "-passin", f"pass:{CA_PASS}", "-CAcreateserial", "-CAserial", str(tmp / "f.srl"), "-days", "10", "-extfile", str(tmp / "f.ext"),
              "-out", str(tmp / "f.crt"))
     assert r.returncode == 0, r.stderr
     return tmp / "f.crt"
@@ -63,6 +75,41 @@ def test_new_ca_is_name_constrained_and_key_outside_project(tmp_path):
         bad = ossl("verify", "-CAfile", str(tls / "ca.crt"), str(sign_foreign(ca, tmp_path, san)))
         assert bad.returncode != 0 and "permitted subtree" in (bad.stdout + bad.stderr), san
     assert "Fingerabdruck" in r.stdout and "HINWEIS" not in r.stdout
+    # ca.key nur verschlüsselt (PKCS#8, 600 000 Runden): ohne Passwort nicht lesbar
+    key = (ca / "ca.key").read_text()
+    assert key.startswith("-----BEGIN ENCRYPTED PRIVATE KEY-----")
+    assert ossl("pkey", "-in", str(ca / "ca.key"), "-passin", "pass:falsch", "-noout").returncode != 0
+    assert "927C0" in ossl("asn1parse", "-in", str(ca / "ca.key")).stdout                    # 600 000 Runden
+
+
+def test_new_ca_password_needs_twelve_characters(tmp_path):
+    work, ca = tmp_path / "deploy", tmp_path / "geheim"
+    work.mkdir()
+    r = make_certs(work, ca, pw="kurz")
+    assert r.returncode != 0 and "mindestens 12 Zeichen" in r.stdout
+    assert not (ca / "ca.key").exists() and not (ca / "ca.crt").exists()
+
+
+def test_server_cert_with_encrypted_ca_key_needs_the_password(tmp_path):
+    work, ca = tmp_path / "deploy", tmp_path / "geheim"
+    work.mkdir()
+    assert make_certs(work, ca).returncode == 0
+    before = (work / "festpos-tls" / "server.crt").read_bytes()
+    r = make_certs(work, ca, pw="ganz-anderes-pw")
+    assert r.returncode != 0 and "Passwort falsch" in r.stdout
+    assert (work / "festpos-tls" / "server.crt").read_bytes() == before                  # nichts ersetzt
+    r = make_certs(work, ca)
+    assert r.returncode == 0 and (work / "festpos-tls" / "server.crt").read_bytes() != before
+
+
+def test_old_unencrypted_ca_key_still_works_with_hint(tmp_path):
+    work, ca = tmp_path / "deploy", tmp_path / "geheim"
+    work.mkdir()
+    assert make_certs(work, ca).returncode == 0
+    plain = ossl("pkey", "-in", str(ca / "ca.key"), "-passin", f"pass:{CA_PASS}").stdout
+    (ca / "ca.key").write_text(plain)                                                     # wie aus einer alten Version
+    r = make_certs(work, ca)
+    assert r.returncode == 0 and "nicht verschlüsselt" in r.stdout and "openssl pkcs8 -topk8" in r.stdout
 
 
 def test_old_layout_is_migrated_and_new_ca_replaces_old(tmp_path):
@@ -280,3 +327,21 @@ def test_relative_ca_dir_inside_project_refused(tmp_path):
                        capture_output=True, text=True)
     assert r.returncode != 0 and "Projektordner" in r.stdout
     assert not (work / "geheim-rel").exists()
+
+
+def test_cleanup_never_touches_tmp_from_the_environment(tmp_path):
+    """make-certs.sh räumt nur die eigenen Ordner auf – nie einen Ordner aus TMP/TMPDIR der Umgebung (früherer Fehler:
+    endete das Skript vor dem eigenen Arbeitsordner, löschte es «$TMP», oft /tmp)."""
+    work, ca = tmp_path / "deploy", tmp_path / "geheim"
+    work.mkdir()
+    fremd = tmp_path / "fremd-tmp"
+    fremd.mkdir()
+    (fremd / "wichtig").write_text("x")
+    (work / "festpos.conf").write_text(CONF)
+    env = {**os.environ, "FESTPOS_CA_DIR": str(ca), "FESTPOS_CA_PASS_FILE": str(pass_file(work.parent, "kurz")),
+           "TMP": str(fremd), "KTMP": str(fremd), "CERT_TMP": str(fremd)}
+    r = subprocess.run(["bash", str(DEPLOY / "make-certs.sh"), "festpos.conf"], cwd=work, env=env, capture_output=True,
+                       text=True, stdin=subprocess.DEVNULL)
+    assert r.returncode == 1 and "12 Zeichen" in r.stdout                 # endet früh (Passwort zu kurz)
+    assert (fremd / "wichtig").exists()
+    assert make_certs(work, ca).returncode == 0 and (fremd / "wichtig").exists()

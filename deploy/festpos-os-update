@@ -1,0 +1,188 @@
+#!/usr/bin/python3
+"""FestPOS – Sicherheitsupdates des Betriebssystems einspielen (T-0-N/FestPOS#5). Läuft als root.
+
+  festpos-os-update --paket DIR   aus dem Update-Paket (os-updates/ von tools/os_updates.py), ohne Internet –
+                                  update.sh ruft das nach dem FestPOS-Update auf, Pi für Pi
+  festpos-os-update --online      mit Internet direkt über apt, nur die Sicherheitsquellen (Debian-Sicherheit,
+                                  Raspberry Pi) – aus der Verwaltung, wenn der Pi gerade Internet hat
+  festpos-os-update --reparieren  beim Start (festpos-node): ein abgebrochenes apt (Strom weg) zu Ende bringen
+  festpos-os-update --stand       nur den Stand schreiben
+
+Aus dem Paket kommt nur, was hier installiert und älter ist (oder als neu nötig markiert, z.B. ein neuer Kernel);
+jede Datei mit der SHA-256 aus liste.json. Vorher und bei einem Fehler: dpkg --configure -a und apt-get -f install
+(ohne Download) – so bleibt das System nie halb erneuert stehen. FestPOS selbst ist davon nicht betroffen.
+Ein neuer Kernel wirkt erst nach einem Neustart: den macht niemand automatisch – die Verwaltung zeigt «Neustart nötig».
+Stand für die App: /var/lib/festpos-os/stand.json (lesbar).
+Tests: FESTPOS_TEST_ROOT, FESTPOS_DPKG, FESTPOS_DPKG_QUERY, FESTPOS_APT_GET.
+"""
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+R = os.environ.get("FESTPOS_TEST_ROOT", "")
+STAND = Path(f"{R}/var/lib/festpos-os/stand.json")
+REBOOT = Path(f"{R}/run/reboot-required")
+DPKG_STATUS = Path(f"{R}/var/lib/dpkg/status")
+DPKG = os.environ.get("FESTPOS_DPKG", "dpkg")
+DPKG_QUERY = os.environ.get("FESTPOS_DPKG_QUERY", "dpkg-query")
+APT = os.environ.get("FESTPOS_APT_GET", "apt-get")
+SECURITY_LIST = (                                         # --online: nur Sicherheitsquellen
+    "deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware\n"
+    "deb http://archive.raspberrypi.com/debian bookworm main\n")
+APT_OPTS = ["-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"]
+ENV = {**os.environ, "DEBIAN_FRONTEND": "noninteractive", "LC_ALL": "C", "NEEDRESTART_MODE": "l"}
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def run(cmd: list[str], timeout: int = 3600) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, env=ENV, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(cmd, 99, "", f"{type(e).__name__}")
+
+
+def read_stand() -> dict:
+    try:
+        d = json.loads(STAND.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_stand(**kw) -> dict:
+    d = {**read_stand(), **kw, "at": int(time.time()), "kernel": os.uname().release, "reboot": REBOOT.exists()}
+    STAND.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(STAND.parent, 0o755)
+    tmp = STAND.with_suffix(".neu")
+    tmp.write_text(json.dumps(d))
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STAND)
+    return d
+
+
+def installed(name: str, arch: str) -> str | None:
+    q = name if arch in ("all", "") else f"{name}:{arch}"
+    p = run([DPKG_QUERY, "-W", "-f", "${Status}\t${Version}", q], 60)
+    if p.returncode or "install ok installed" not in p.stdout:
+        return None
+    return p.stdout.rsplit("\t", 1)[-1].strip() or None
+
+
+def newer(a: str, b: str) -> bool:
+    """Ist Version a neuer als b (dpkg-Regeln)?"""
+    return run([DPKG, "--compare-versions", a, "gt", b], 60).returncode == 0
+
+
+def broken() -> bool:
+    p = run([DPKG, "--audit"], 120)
+    return bool(p.stdout.strip())
+
+
+def repair() -> bool:
+    """Abgebrochenes dpkg/apt zu Ende bringen (ohne Download) -> danach in Ordnung?"""
+    run([DPKG, "--configure", "-a"], 1800)
+    run([APT, "-f", "install", "--no-download", *APT_OPTS], 1800)
+    return not broken()
+
+
+def from_package(src: Path) -> int:
+    try:
+        items = json.loads((src / "liste.json").read_text())
+        meta = json.loads((src / "stand.json").read_text())
+    except (OSError, ValueError):
+        log("Betriebssystem: keine gültige Liste im Paket – nichts geändert")
+        return 0
+    if broken() and not repair():                          # zuerst ein abgebrochenes dpkg fertig (sonst sähe ein
+        write_stand(result="failed", error="broken")      # halb installiertes Paket wie «nicht installiert» aus)
+        return 1
+    sel, size = [], 0
+    for it in items if isinstance(items, list) else []:
+        f = (src / str(it.get("file", ""))).resolve()
+        if src.resolve() not in f.parents or not f.is_file() or f.is_symlink():
+            log(f"Betriebssystem: {it.get('file')} fehlt – übersprungen")
+            continue
+        cur = installed(str(it.get("name")), str(it.get("arch")))
+        if cur is None and not it.get("new"):
+            continue                                          # hier nicht installiert
+        if cur is not None and not newer(str(it.get("version")), cur):
+            continue                                          # schon gleich oder neuer
+        if hashlib.sha256(f.read_bytes()).hexdigest() != it.get("sha256"):
+            log(f"Betriebssystem: Prüfsumme von {f.name} stimmt nicht – nichts geändert")
+            write_stand(result="failed", error="sha256")
+            return 1
+        sel.append(f)
+        size += f.stat().st_size
+    if not sel:
+        log("Betriebssystem: schon auf dem Stand des Pakets")
+        write_stand(result="ok", date=meta.get("date"), open=0, error="")
+        return 0
+    free = shutil.disk_usage(f"{R}/" if R else "/").free
+    if free < 3 * size + 200 * 1024 * 1024:
+        log("Betriebssystem: zu wenig Platz auf der Karte – nichts geändert")
+        write_stand(result="failed", error="space", open=len(sel))
+        return 1
+    log(f"Betriebssystem: {len(sel)} Pakete einspielen (Stand {meta.get('date')})")
+    p = run([APT, "install", "--no-download", "--no-install-recommends", *APT_OPTS, *map(str, sel)])
+    if p.returncode:
+        log("Betriebssystem: apt meldet einen Fehler – repariere")
+        log((p.stderr or p.stdout)[-1500:])
+        ok = repair()
+        write_stand(result="repaired" if ok else "failed", error=(p.stderr or "apt").strip()[-300:], open=len(sel))
+        return 1
+    kernel = any("linux-image" in f.name or "raspi-firmware" in f.name for f in sel)
+    write_stand(result="ok", date=meta.get("date"), open=0, error="", installed=len(sel), kernel_new=kernel)
+    log("Betriebssystem: fertig" + (" – Neustart nötig (neuer Kernel)" if REBOOT.exists() or kernel else ""))
+    return 0
+
+
+def online() -> int:
+    """Mit Internet direkt über apt – nur die Sicherheitsquellen (eigene Liste, nicht die des Systems)."""
+    lst = Path(f"{R}/etc/festpos/apt-sicherheit.list")
+    lst.parent.mkdir(parents=True, exist_ok=True)
+    lst.write_text(SECURITY_LIST)
+    opts = ["-o", f"Dir::Etc::SourceList={lst}", "-o", "Dir::Etc::SourceParts=/nonexistent"]
+    if broken() and not repair():
+        write_stand(result="failed", error="broken")
+        return 1
+    if run([APT, *opts, "update", "--error-on=any"], 900).returncode:      # jede Quelle muss aktuell sein
+        write_stand(result="failed", error="update")
+        return 1
+    p = run([APT, *opts, "upgrade", "--with-new-pkgs", *APT_OPTS])
+    if p.returncode:
+        ok = repair()
+        write_stand(result="repaired" if ok else "failed", error=(p.stderr or "apt").strip()[-300:])
+        return 1
+    write_stand(result="ok", date=time.strftime("%Y-%m-%d"), open=0, error="", online=True)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] == ["--paket"] and len(argv) == 2:
+        return from_package(Path(argv[1]))
+    if argv == ["--online"]:
+        return online()
+    if argv == ["--reparieren"]:
+        if broken():
+            log("Betriebssystem: unterbrochenes apt gefunden – repariere")
+            ok = repair()
+            write_stand(result="repaired" if ok else "failed", error="" if ok else "broken", repaired_at=int(time.time()))
+            return 0 if ok else 1
+        write_stand()
+        return 0
+    if argv == ["--stand"]:
+        write_stand()
+        return 0
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

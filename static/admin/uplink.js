@@ -1,5 +1,5 @@
 /* FestPOS – Verwaltung › Mobilfunk-Router: Empfang (app/uplink.py). */
-import { $, api, can, esc, guard, toast } from "./core.js";
+import { $, api, can, esc, guard, netEx, toast } from "./core.js";
 import { switchHTML } from "./monitor.js";
 
 // ------------------------------------------------------------------ Mobilfunk-Router: Empfang (uplink.py)
@@ -79,7 +79,7 @@ export function uplinkCard() {
       <label>${th("admin.uplink.kind")}<select name="kind"><option value="">${th("admin.uplink.kind_none")}</option>
         ${drivers.map((d) => `<option value="${esc(d.key)}" translate="no" ${d.key === c.kind ? "selected" : ""}>${esc(d.label)}</option>`).join("")}</select></label>
       <label>${th("admin.uplink.name")}<input name="name" value="${esc(c.name || "")}" maxlength="30" placeholder="${th("admin.uplink.name_placeholder")}" style="width:150px"></label>
-      <label>${th("admin.uplink.host")}<input name="host" value="${esc(c.host || "")}" maxlength="63" placeholder="192.168.55.1" style="width:150px"></label>
+      <label>${th("admin.uplink.host")}<input name="host" value="${esc(c.host || "")}" maxlength="63" placeholder="${esc(netEx("router"))}" style="width:150px"></label>
       <label>${th("admin.uplink.port")}<input name="port" type="number" min="1" max="65535" value="${esc(c.port ?? "")}" placeholder="${esc(drv.port || 443)}" style="width:90px"></label>
       <label>${th("admin.uplink.iface")}<input name="iface" value="${esc(c.iface || "")}" maxlength="32" placeholder="${esc(drv.iface || "")}" style="width:100px"></label>
       <label>${th("admin.uplink.user")}<input name="user" value="${esc(c.user || "")}" maxlength="40" autocomplete="off" style="width:130px"></label>

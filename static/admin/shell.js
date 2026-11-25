@@ -1,6 +1,8 @@
 /* FestPOS – Verwaltung › Gerüst: Menü, Seiten und Reiter, Anmeldung, Logo, Links. Jede Seite trägt sich in RENDER ein. */
-import { $, $$, api, can, esc, guard, LANG_KEY, LANGS, ME, myLang, roleName, setLangs, setLoginView, setMe, setToken, TOKEN } from "./core.js";
+import { $, $$, api, can, esc, forgetLogin, guard, LANG_KEY, LANGS, ME, myLang, roleName, setLangs, setLoginView, setMe, setNet, setToken, TOKEN } from "./core.js";
+import { setIdle, startIdle, stopIdle } from "./idle.js";
 import { drawAsk, setGoPi, startClock } from "./clock.js";
+import { checkSetup } from "./twofa.js";
 
 // ------------------------------------------------------------------ Gerüst
 // Menü in Gruppen (2026.10.10-27): Betrieb (während des Anlasses), Vorbereiten, System. [Seite, Text, Recht(e), Gruppe]
@@ -115,6 +117,7 @@ function userMenu() {
         <select id="adminlang"><option value="">${th("admin.nav.language_auto")}</option>
           ${LANGS.map((l) => `<option value="${esc(l.code)}" ${myLang() === l.code ? "selected" : ""}>${esc(l.name)}</option>`).join("")}</select></label>` : ""}
       ${ME && !ME.emergency ? `<button type="button" role="menuitem" data-ownpw>${th("admin.users.own_password")} …</button>` : ""}
+      ${ME && !ME.emergency ? `<button type="button" role="menuitem" data-totp>${th("admin.totp.menu")} …</button>` : ""}
       <hr>
       ${ME ? `<button type="button" role="menuitem" data-logoutall>${th("admin.nav.logout_all")} …</button>` : ""}
       <button type="button" role="menuitem" class="out" data-logout>${th("admin.nav.logout")}</button>
@@ -197,12 +200,17 @@ export function shell() {
   layoutGroups();
   startClock();                                        // Uhr des Pi und Hinweis «Bitte Uhrzeit prüfen» (T2)
   startLamp();                                         // Ampel beim Knopf «Statusanzeige»
+  startIdle((minutes) => {                             // Abmelden ohne Bedienung (idle.js)
+    forgetLogin(); clearInterval(refreshTimer); clearInterval(pairTimer);
+    showLogin(t("admin.login.idle_out", { minutes }));
+  });
 }
 export async function showVersion() {
   const h = await fetch("/api/health").then((r) => r.json()).catch(() => null);
   const el = $("#ver"); if (el && h?.version) el.textContent = t("admin.nav.version", { version: h.version });
 }
 export function showLogin(msg = "") {
+  stopIdle();
   clearInterval(refreshTimer);
   stopLamp();
   $("#app").innerHTML = `<div class="login"><form class="card" id="login">
@@ -224,16 +232,52 @@ export function showLogin(msg = "") {
     } catch { return showLogin(t("admin.common.server_unreachable")); }
     const d = await r.json().catch(() => null);
     if (!r.ok) return showLogin(r.status === 401 ? t("admin.login.wrong") : (typeof d?.detail === "string" ? d.detail : t("admin.common.error_status", { status: r.status })));
-    setToken(d.token);
-    sessionStorage.setItem("festpos.token", TOKEN);
-    setMe({ name: d.name, role: d.role, emergency: d.emergency, role_name: d.role_name, perms: d.perms || [] });
-    await loadLangs();
-    shell(); showVersion(); show(page);
+    if (d.second_step) return showLoginCode(d.pending, d.name);   // zweiter Faktor: zweiter Schritt (T-0-N/FestPOS#9)
+    await loggedIn(d);
+  });
+}
+async function loggedIn(d) {
+  setToken(d.token);
+  sessionStorage.setItem("festpos.token", TOKEN);
+  setIdle(d);                                          // Frist ohne Bedienung (fehlt bei der Rolle Anzeige)
+  setMe({ name: d.name, role: d.role, emergency: d.emergency, role_name: d.role_name, perms: d.perms || [], totp: d.totp });
+  await loadLangs();
+  shell(); showVersion(); show(page);
+  checkSetup();                                        // zweiter Faktor Pflicht, noch nicht eingerichtet
+}
+// Zweiter Schritt: Code aus der Authenticator-App oder ein Wiederherstellungs-Code (pending gilt 5 Minuten)
+function showLoginCode(pending, name, msg = "", recovery = false) {
+  $("#app").innerHTML = `<div class="login"><form class="card" id="login">
+      ${BRAND.logo ? logoImg(BRAND.logo, false, "login-logo") : ""}
+      <h2>${th("admin.login.title")}</h2>
+      <p>${th("admin.login.step2", { name })}</p>
+      <label class="field">${th(recovery ? "admin.login.recovery" : "admin.login.code")}<input id="code" class="code-in" required autofocus
+        autocomplete="one-time-code" ${recovery ? 'maxlength="11" autocapitalize="characters"' : 'inputmode="numeric" maxlength="7"'} spellcheck="false"></label>
+      <p class="hint">${recovery ? th("admin.login.recovery_hint")
+        : `${th("admin.login.code_hint")} <a href="#" id="use-recovery">${th("admin.login.use_recovery")}</a>`}</p>
+      ${msg ? `<p class="err">${esc(msg)}</p>` : ""}
+      <button class="btn pri" type="submit">${th("admin.login.confirm")}</button>
+      <nav class="login-jump" aria-label="${th("admin.nav.jump_aria")}">${jumpLinks("btn")}</nav>
+    </form></div>`;
+  $("#use-recovery")?.addEventListener("click", (e) => { e.preventDefault(); showLoginCode(pending, name, "", true); });
+  $("#login").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    let r;
+    try {
+      r = await fetch("/api/admin/login/totp", { method: "POST", headers: { "Content-Type": "application/json", "X-Festpos-UI": "1", "X-Festpos-Lang": I18n.lang },
+                                                 body: JSON.stringify({ pending, code: $("#code").value }) });
+    } catch { return showLoginCode(pending, name, t("admin.common.server_unreachable"), recovery); }
+    const d = await r.json().catch(() => null);
+    const text = typeof d?.detail === "string" ? d.detail : t("admin.common.error_status", { status: r.status });
+    if (r.status === 409) return showLogin(text);                // zu lange gewartet: nochmals mit Passwort
+    if (!r.ok) return showLoginCode(pending, name, text, recovery);
+    await loggedIn(d);
   });
 }
 setLoginView(showLogin);
 export async function loadLangs() {
-  const s = await api("GET", "/settings").catch(() => null);
+  const [s, n] = await Promise.all([api("GET", "/settings").catch(() => null), api("GET", "/netinfo").catch(() => null)]);
+  setNet(n);                                           // Netz für Vorschläge und Beispiele (#2)
   setLangs(s?.languages || []);
   I18n.setTableWord(s?.table_word);                    // «Platz» statt «Tisch» in den Texten zu Tischen
   return s;

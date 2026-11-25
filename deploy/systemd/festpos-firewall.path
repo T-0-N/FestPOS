@@ -1,0 +1,9 @@
+[Unit]
+Description=FestPOS: Firewall-Modus aus der Verwaltung übernehmen
+
+[Path]
+PathChanged=/run/festpos/firewall/modus.json
+Unit=festpos-firewall.service
+
+[Install]
+WantedBy=paths.target

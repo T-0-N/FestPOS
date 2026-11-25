@@ -16,7 +16,7 @@ from pathlib import Path
 
 from fastapi import HTTPException, Request
 
-from . import auth, i18n, monitor as monitor_mod, timesync
+from . import auth, emergency, i18n, monitor as monitor_mod, secretbox, timesync
 from .i18n import t
 from .version import APP_VERSION  # noqa: F401 – von hier importiert
 
@@ -28,7 +28,10 @@ logging.basicConfig(level=os.environ.get("FESTPOS_LOGLEVEL", "INFO"),
 class Config:
     db = os.environ.get("FESTPOS_DB", "sqlite:///./festpos.db")
     node = os.environ.get("FESTPOS_NODE", "local")
-    admin_password = os.environ.get("FESTPOS_ADMIN_PASSWORD", "admin")
+    admin_password = os.environ.get("FESTPOS_ADMIN_PASSWORD", "admin")   # nur noch ältere Konfiguration (Klartext)
+    # Notfall-Passwort als Prüfwert (T-0-N/FestPOS#15): ADMIN_PASSWORD_HASH/-LAENGE aus festpos.conf (app/emergency.py)
+    admin_password_hash = os.environ.get("FESTPOS_ADMIN_PASSWORD_HASH", "")
+    admin_password_len = int(os.environ.get("FESTPOS_ADMIN_PASSWORD_LEN", "0") or 0)
     # nur für die Pi untereinander (Zeit stellen); KEIN Rückfall aufs Admin-Passwort (REV-013)
     cluster_secret = ""                 # siehe _cluster_secret() unten
     cluster_secret_derived = False      # True: aus dem Server-Schlüssel abgeleitet (Platzhalter in festpos.conf)
@@ -104,6 +107,7 @@ def _cluster_secret() -> tuple[str, bool]:
 
 
 Config.cluster_secret, Config.cluster_secret_derived = _cluster_secret()
+secretbox.use(lambda: Config.cluster_secret)            # Hauptschlüssel der verschlüsselten Geheimnisse (#8)
 
 
 class Runtime:
@@ -138,8 +142,10 @@ class Throttle:
     mit DEMSELBEN Namen (eigene Tippfehler) – sonst könnte, wer ein eigenes Konto hat, zwischen Rateversuchen für
     «admin» die Zählung immer wieder auf null setzen."""
 
-    def __init__(self, max_fails: int = 10, window_s: float = 300, name_max: int = 0, trust_s: float = 12 * 3600):
+    def __init__(self, max_fails: int = 10, window_s: float = 300, name_max: int = 0, trust_s: float = 12 * 3600,
+                 on_lock=None):
         self.max_fails, self.window_s = max_fails, window_s
+        self.on_lock = on_lock                      # on_lock(Adresse, Name, "ip"|"name"): gerade gesperrt (#11)
         self._fails: dict[str, list[tuple[float, str]]] = {}   # Adresse -> [(Zeitpunkt, Name)]
         self._lock = threading.Lock()               # admin() läuft in mehreren Threads gleichzeitig
         # Zusätzlich pro Name über ALLE Adressen (Review 2026-11, S6): wer im WLAN nach jedem zehnten Versuch die
@@ -182,15 +188,27 @@ class Throttle:
                                 headers={"Retry-After": str(wait)})
 
     def fail(self, ip: str, name: str = "") -> None:
+        locked = None
         with self._lock:
             now = time.monotonic()
-            self._fails.setdefault(ip, []).append((now, name.casefold()))
+            fails = [f for f in self._fails.get(ip, ()) if now - f[0] < self.window_s] + [(now, name.casefold())]
+            self._fails[ip] = fails
+            if len(fails) == self.max_fails:        # genau jetzt gesperrt (nicht bei jedem weiteren Versuch)
+                locked = "ip"
             if len(self._fails) > 1000:             # Speicher begrenzen
                 self._fails.pop(next(iter(self._fails)))
             if self.name_max and name:
-                self._name_fails.setdefault(name.casefold(), []).append(now)
+                nf = [f for f in self._name_fails.get(name.casefold(), ()) if now - f < self.window_s] + [now]
+                self._name_fails[name.casefold()] = nf
+                if len(nf) == self.name_max:
+                    locked = locked or "name"
                 if len(self._name_fails) > 1000:
                     self._name_fails.pop(next(iter(self._name_fails)))
+        if locked and self.on_lock:
+            try:
+                self.on_lock(ip, name, locked)
+            except Exception:  # noqa: BLE001 – Meldung darf die Anmeldung nicht stören
+                log.exception("Anmeldesperre melden")
 
     def ok(self, ip: str, name: str = "") -> None:
         with self._lock:
@@ -241,7 +259,15 @@ login_throttle = Throttle(LOGIN_MAX_FAILS, LOGIN_WINDOW_S, name_max=LOGIN_NAME_M
 # wenn das Notfall-Passwort in festpos.conf geändert wird oder der Benutzer gesperrt/gelöscht wird oder ein neues
 # Passwort bekommt (Stand «gen» in der Datenbank). Welche Rolle was darf: auth.py.
 # Basic Auth (z.B. für curl): admin + Notfall-Passwort oder Name + Passwort eines Benutzers.
+#
+# Abmelden ohne Bedienung: Das Token trägt zusätzlich eine Frist («~<Zeit>» am Ende des Zufallsteils) – danach gilt es
+# nicht mehr. Die Verwaltung holt sich bei Bedienung (Klick, Tippen, Eingabe) ein neues Token mit neuer Frist
+# (POST /api/admin/me/refresh); das automatische Aktualisieren der Seiten verlängert nicht. Die Höchstdauer (12 Stunden
+# ab Anmeldung) bleibt. Rolle Anzeige (Statusanzeige) ohne Frist. Ältere Pi lesen die Frist nicht mit (Signatur über
+# denselben Text) – während eines Updates gilt das Token dort weiter wie bisher.
 SESSION_HOURS = 12
+IDLE_DEFAULT, IDLE_MIN, IDLE_MAX = 30, 10, 120          # Minuten ohne Bedienung (Einstellung admin_idle_minutes)
+IDLE_KEY = "admin_idle_minutes"
 
 
 _RANDOM_SESSION_KEY = secrets.token_bytes(32)
@@ -252,34 +278,103 @@ def _session_key() -> bytes:
     # bekannten Vorgaben berechenbar – dann ein zufälliger pro Start (Review 2026-11, S16): Sitzungen enden beim
     # Neustart und gelten nicht auf anderen Pi; auf einem eingerichteten Pi kommt das nicht vor.
     secret = Config.cluster_secret.encode() if timesync.secret_usable(Config.cluster_secret) else _RANDOM_SESSION_KEY
-    return hashlib.sha256(b"festpos-session\0" + secret + b"\0" + Config.admin_password.encode()).digest()
+    # Prüfwert des Notfall-Passworts (auf allen Pi gleich, emergency.salt) – nie der Klartext; neues Passwort:
+    # alle Sitzungen enden. Ältere Konfiguration ohne Prüfwert: wie bisher der Klartext.
+    ref = Config.admin_password_hash or Config.admin_password
+    return hashlib.sha256(b"festpos-session\0" + secret + b"\0" + ref.encode()).digest()
 
 
-def issue_session(uid: int = 0, gen: int = 0) -> dict:
-    exp = int(time.time()) + SESSION_HOURS * 3600
-    msg = f"{exp}.{int(uid)}.{int(gen)}.{secrets.token_urlsafe(12)}"
+def idle_minutes(store=None) -> int:
+    """Minuten ohne Bedienung bis zum Abmelden (Einstellung, 10–120, Standard 30)."""
+    try:
+        v = int((store or rt.store).setting(IDLE_KEY, str(IDLE_DEFAULT)))
+    except Exception:  # noqa: BLE001 – ungültig oder Datenbank gerade nicht da: Standard
+        return IDLE_DEFAULT
+    return min(IDLE_MAX, max(IDLE_MIN, v))
+
+
+def idle_seconds(user: dict) -> int:
+    """Frist ohne Bedienung für diesen Benutzer in Sekunden; 0 = keine (Rolle Anzeige, z.B. für die Statusanzeige)."""
+    return 0 if user.get("role") == "view" else idle_minutes() * 60
+
+
+def issue_session(uid: int = 0, gen: int = 0, idle_s: int = 0, exp: int | None = None, confirmed: int = 0) -> dict:
+    """Neues Token. idle_s: Frist ohne Bedienung (0 = keine); exp: Ablauf behalten (Verlängern nach Bedienung);
+    confirmed: kritische Aktionen bestätigt bis (Zeit, 0 = nicht; twofa.py) – Zufallsteil «~Frist~bestätigt»."""
+    now = int(time.time())
+    exp = exp or now + SESSION_HOURS * 3600
+    idle = min(exp, now + idle_s) if idle_s > 0 else 0
+    conf = min(exp, confirmed) if confirmed > now else 0
+    nonce = secrets.token_urlsafe(12) + (f"~{idle}" if idle or conf else "") + (f"~{conf}" if conf else "")
+    msg = f"{exp}.{int(uid)}.{int(gen)}.{nonce}"
     sig = hmac.new(_session_key(), msg.encode(), hashlib.sha256).hexdigest()
-    return {"token": f"{msg}.{sig}", "expires": exp, "hours": SESSION_HOURS}
+    return {"token": f"{msg}.{sig}", "expires": exp, "hours": SESSION_HOURS,
+            "idle_until": idle or None, "idle_in": idle - now if idle else None, "idle_minutes": idle_s // 60 or None,
+            "confirmed_in": conf - now if conf else None}
 
 
-def session_user(token: str) -> tuple[str, dict | None]:
-    """('ok', Benutzer) | ('expired', None) – echt, aber abgelaufen/gesperrt | ('invalid', None) – gefälscht."""
+def _parse_session(token: str) -> tuple[str, int, int, int, int, int] | None:
+    """('ok', Ablauf, Benutzer, Stand, Frist ohne Bedienung oder 0, bestätigt bis oder 0) – nur echte Tokens;
+    None = gefälscht/kaputt."""
     try:
         exp_s, uid_s, gen_s, nonce, sig = token.split(".")
         exp, uid, gen = int(exp_s), int(uid_s), int(gen_s)
+        parts = nonce.split("~")
+        idle = int(parts[1]) if len(parts) > 1 else 0
+        conf = int(parts[2]) if len(parts) > 2 else 0
     except ValueError:
-        return "invalid", None
+        return None
     good = hmac.new(_session_key(), f"{exp_s}.{uid_s}.{gen_s}.{nonce}".encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(sig.encode(), good.encode()):
+        return None
+    return "ok", exp, uid, gen, idle, conf
+
+
+def session_user(token: str) -> tuple[str, dict | None]:
+    """('ok', Benutzer) | ('expired', None) – echt, aber abgelaufen/gesperrt | ('idle', None) – echt, aber zu lange
+    ohne Bedienung | ('invalid', None) – gefälscht."""
+    p = _parse_session(token)
+    if not p:
         return "invalid", None
+    _, exp, uid, gen, idle, _conf = p
     now = time.time()
     # Ablauf in der Zukunft: bis 1 Tag Toleranz (anderer Pi mit noch nicht gestellter Uhr), mehr ist verdächtig
     if exp < now or exp > now + SESSION_HOURS * 3600 + 86400:
         return "expired", None
+    if idle and idle < now:
+        return "idle", None
     user = auth.lookup(uid)
     if not user or int(user.get("gen", 0)) != gen:
         return "expired", None                      # gesperrt, gelöscht oder neues Passwort: neu anmelden
     return "ok", user
+
+
+def refresh_session(token: str, user: dict) -> dict | None:
+    """Nach Bedienung: neues Token mit neuer Frist, gleichem Ablauf (Höchstdauer bleibt). None: Token nicht gültig."""
+    p = _parse_session(token)
+    if not p or session_user(token)[0] != "ok":
+        return None
+    _, exp, uid, gen, _, conf = p
+    return issue_session(uid, gen, idle_seconds(user), exp, conf)
+
+
+def confirm_session(token: str, user: dict, seconds: int) -> dict | None:
+    """Kritische Aktionen bestätigt (twofa.py): neues Token, bestätigt für «seconds», Frist ohne Bedienung neu."""
+    p = _parse_session(token)
+    if not p or session_user(token)[0] != "ok":
+        return None
+    _, exp, uid, gen, _, _ = p
+    return issue_session(uid, gen, idle_seconds(user), exp, int(time.time()) + seconds)
+
+
+def session_confirmed(request: Request, user: dict) -> bool:
+    """Darf diese Anfrage eine kritische Aktion ausführen? Token: bestätigt und noch nicht abgelaufen. Basic Auth:
+    schickt das Passwort mit – gilt als bestätigt, ausser der Benutzer hat einen zweiten Faktor."""
+    scheme, _, cred = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() == "basic":
+        return not user.get("totp_on")
+    p = _parse_session(cred.strip()) if scheme.lower() == "bearer" else None
+    return bool(p) and p[5] > time.time()
 
 
 def security_warnings() -> list[str]:
@@ -287,7 +382,7 @@ def security_warnings() -> list[str]:
     out = []
     p = emergency_problem()
     if p:
-        out.append(f"admin_pw_{p}")                 # admin_pw_placeholder | admin_pw_short
+        out.append(f"admin_pw_{p}")                 # admin_pw_placeholder | admin_pw_short | admin_pw_short_locked
     if Config.cluster_secret_derived:
         out.append("secret_derived")                # Prüfsummen hängen am Server-Zertifikat
     return out
@@ -297,22 +392,39 @@ def session_state(token: str) -> str:
     return session_user(token)[0]
 
 
-# Notfall-Passwort aus festpos.conf: Platzhalter sperren den Notfall-Login, kurze Passwörter geben eine Warnung
-PLACEHOLDER_PASSWORDS = frozenset({"", "admin", "bitte-aendern"})
-PW_WARN_LEN = 10
+# Notfall-Passwort aus festpos.conf (Prüfwert, app/emergency.py): Platzhalter sperren den Notfall-Login; kürzer als
+# 16 Zeichen sperrt ihn, sobald es einen eigenen Admin-Benutzer gibt (sonst nur Warnung – niemand ausgesperrt)
+PLACEHOLDER_PASSWORDS = emergency.PLACEHOLDERS
+PW_WARN_LEN = emergency.MIN_LEN
+
+
+def _other_admin() -> bool:
+    """Gibt es einen eigenen, aktiven Benutzer mit der Rolle Admin (nicht den Notfall-Login)?"""
+    try:
+        return any(uid and u.get("role") == "admin" and u.get("active") for uid, u in auth._users().items())
+    except Exception:  # noqa: BLE001 – Datenbank gerade nicht da: als «keiner» (nicht aussperren)
+        return False
 
 
 def emergency_problem() -> str | None:
-    """placeholder (Notfall-Login gesperrt) | short (Warnung) | None"""
-    pw = Config.admin_password
-    if pw.strip() in PLACEHOLDER_PASSWORDS:
-        return "placeholder"
-    return "short" if len(pw) < PW_WARN_LEN else None
+    """placeholder (gesperrt) | short_locked (zu kurz, gesperrt: es gibt einen eigenen Admin) | short (Warnung) | None"""
+    if Config.admin_password_hash:
+        n = Config.admin_password_len or PW_WARN_LEN
+    else:
+        if Config.admin_password.strip() in PLACEHOLDER_PASSWORDS:
+            return "placeholder"
+        n = len(Config.admin_password)
+    if n >= PW_WARN_LEN:
+        return None
+    return "short_locked" if _other_admin() else "short"
 
 
 def _password_ok(given: str) -> bool:
-    if emergency_problem() == "placeholder":
+    if emergency_problem() in ("placeholder", "short_locked"):
+        auth._dummy()
         return False
+    if Config.admin_password_hash:
+        return emergency.check(given, Config.admin_password_hash)
     return secrets.compare_digest(given.encode(), Config.admin_password.encode())
 
 
@@ -341,7 +453,7 @@ def check_admin(request: Request) -> tuple[dict | None, bool, str]:
             text = raw.decode("latin-1")
         name, _, pw = text.partition(":")
         login_throttle.check_name(request.client.host if request.client else "?", login_name(name))
-        user = login_user(name, pw)
+        user = login_user(name, pw, request.client.host if request.client else None)
         return user, user is None, login_name(name)
     return None, False, ""
 
@@ -369,16 +481,20 @@ def cross_site_basic(request: Request) -> bool:
     return origin == "null" or urlsplit(origin).netloc.lower() != request.headers.get("host", "").lower()
 
 
-def login_user(name: str, password: str) -> dict | None:
-    """Name + Passwort prüfen. «admin» (oder leer) = Notfall-Login mit dem Passwort aus festpos.conf."""
+def login_user(name: str, password: str, ip: str | None = None) -> dict | None:
+    """Name + Passwort prüfen. «admin» (oder leer) = Notfall-Login mit dem Passwort aus festpos.conf – nur aus dem
+    FestPOS-Netz oder am Pi selbst (ip None: Aufruf ohne Anfrage, z.B. Werkzeuge)."""
     name = (name or "").strip()
     if login_name(name) == auth.EMERGENCY_NAME:
+        if ip is not None and not emergency.local_ok(ip):
+            auth._dummy()
+            return None
         return auth.emergency() if _password_ok(password) else None
     row = None
     if rt.store is not None:
         try:
-            row = rt.store.query_one("SELECT id, name, role, gen, active, pw_hash FROM users WHERE name=? COLLATE NOCASE",
-                                     (name,))
+            row = rt.store.query_one("SELECT id, name, role, gen, active, pw_hash, totp FROM users "
+                                     "WHERE name=? COLLATE NOCASE", (name,))
         except Exception:  # noqa: BLE001 – Datenbank gerade nicht da: nur der Notfall-Login geht
             row = None
     if not row or not row["active"]:
@@ -386,8 +502,10 @@ def login_user(name: str, password: str) -> dict | None:
         return None
     if not auth.verify_password(password, row["pw_hash"]):
         return None
+    from .users import _with_totp
+    t2 = _with_totp({"totp": row["totp"]})
     return {"id": row["id"], "name": row["name"], "role": row["role"], "gen": row["gen"], "active": True,
-            "emergency": False}
+            "emergency": False, **t2}
 
 
 def _unauthorized(request: Request) -> HTTPException:
@@ -412,8 +530,25 @@ def admin(request: Request) -> dict:
             raise _unauthorized(request)
         login_throttle.ok(ip, name)
     # scope["path"] wie das Routing – request.url.path schneidet bei «?»/«#» im Pfad ab (Review 2026-11, S8)
-    if not auth.allowed(user["role"], auth.required(request.method, request.scope.get("path") or request.url.path)):
+    path = request.scope.get("path") or request.url.path
+    if not auth.allowed(user["role"], auth.required(request.method, path)):
         raise HTTPException(403, t("err.login.forbidden"))
+    from . import twofa                              # zweiter Faktor, kritische Aktionen (T-0-N/FestPOS#9)
+    basic = request.headers.get("authorization", "").lower().startswith("basic ")
+    if twofa.setup_blocked(user) and not twofa.setup_allowed(path):
+        raise HTTPException(403, {"code": "totp_setup", "text": t("err.totp.setup_first")})
+    if basic and user.get("totp_on") and request.method in UNSAFE_METHODS:
+        raise HTTPException(403, t("err.totp.basic"))          # mit zweitem Faktor: Basic Auth nur zum Lesen
+    if auth.critical(request.method, path) and getattr(request.state, "critical_ok", None) is None:
+        if not session_confirmed(request, user):
+            raise HTTPException(428, {"code": "confirm_needed", "text": t("err.login.confirm_needed")})
+        request.state.critical_ok = True
+        try:                                         # Protokoll: welche Aktion, wer, bestätigt
+            from . import ledger_base
+            ledger_base.audit(rt.store, user.get("name"), "critical", method=request.method, path=path,
+                              how="basic" if basic else "confirmed")
+        except Exception:  # noqa: BLE001 – Protokoll darf die Aktion nicht verhindern
+            log.exception("Protokoll (kritische Aktion)")
     request.state.user = user
     return user
 
@@ -474,7 +609,7 @@ def current_user(request: Request) -> dict | None:
 MB = 1024 * 1024
 BODY_LIMITS = (                                   # (Pfadanfang, Höchstgrösse) – erster Treffer gilt
     ("/api/admin/restore", 260 * MB),
-    ("/api/admin/update/upload", 210 * MB),          # Update-Paket (heute ~25 MB, höchstens 200 MB)
+    ("/api/admin/update/upload", 610 * MB),          # Update-Paket (release.MAX_ZIP, mit Updates des Systems)
     ("/api/admin/fully/apk", 210 * MB),              # Fully-APK (heute ~25 MB, höchstens 200 MB: fully.APK_MAX)
     ("/api/admin/payrexx/apk", 31 * MB),             # Begleit-App «FestPOS Tap» (T13, wenige MB)
     ("/api/admin/import/images", 70 * MB),
@@ -510,7 +645,7 @@ class RequestGate:
             i18n.current.reset(token)
 
     async def _handle(self, scope, receive, send, path: str, request: Request) -> None:
-        if path.startswith("/api/admin/") and path != "/api/admin/login":
+        if path.startswith("/api/admin/") and path not in ("/api/admin/login", "/api/admin/login/totp"):
             try:
                 await asyncio.to_thread(admin, request)      # Datenbank/scrypt: nicht im Event-Loop (blockiert sonst alles)
             except HTTPException as e:

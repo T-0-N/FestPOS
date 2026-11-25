@@ -2,7 +2,7 @@
    schaltet sofort, «Bearbeiten» und «+ Drucker» öffnen ein Fenster (dlg.js). Bons & Quittung: Kasse & App (bondesign.js).
    «Offene Bons umleiten» steht auch unter Druckaufträge (jobs.js). Darunter das Drucker-Netz (Drucker in eigenem VLAN,
    app/printer_net.py; nur Admin). */
-import { $, $$, api, can, errLabel, esc, guard, LANGS, piName, toast } from "./core.js";
+import { $, $$, api, can, errLabel, esc, guard, LANGS, netEx, piName, toast } from "./core.js";
 import { pageHead, RENDER, view } from "./shell.js";
 import { editDialog } from "./dlg.js";
 import { switchHTML } from "./monitor.js";
@@ -46,7 +46,7 @@ function body(p, printers) {
   return `<div class="form printer" data-id="${p ? p.id : ""}">
       <label>${th("admin.printers.name")}<input name="name" value="${esc(p?.name || "")}" required maxlength="32"
         placeholder="${th("admin.printers.name_placeholder")}"></label>
-      <label>${th("admin.printers.ip")}<input name="host" value="${esc(p?.host || "")}" required placeholder="${esc(PN?.vlan ? `${PN.net}.21` : "192.168.55.21")}" style="width:160px"></label>
+      <label>${th("admin.printers.ip")}<input name="host" value="${esc(p?.host || "")}" required placeholder="${esc(PN?.vlan ? `${PN.net}.21` : netEx("printer"))}" style="width:160px"></label>
       <label>${th("admin.printers.port")}<input name="port" type="number" value="${p?.port || 9100}" style="width:90px"></label>
       ${p ? `<label>${th("admin.printers.chars")}<select name="chars_per_line">${CHARS.map(([v, k]) =>
         `<option value="${v}" ${v === (p.chars_per_line ?? 48) ? "selected" : ""}>${th(k)}</option>`).join("")}</select></label>

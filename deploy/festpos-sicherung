@@ -40,7 +40,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True                         # nichts als root in /opt/festpos schreiben
 DEST = Path(os.environ.get("FESTPOS_DEST", "/opt/festpos"))
 sys.path.insert(0, os.environ.get("FESTPOS_RELEASE_LIB", str(DEST)))
-from app import backup  # noqa: E402  (gehört root wie dieses Programm)
+from app import backup, secretbox  # noqa: E402  (gehört root wie dieses Programm)
 from app.version import APP_VERSION  # noqa: E402
 
 QUELLE = os.environ.get("FESTPOS_SICHERUNG_QUELLE", "http://127.0.0.1:4001/db/backup")   # rqlite (nur lokal)
@@ -125,7 +125,9 @@ def database() -> bytes:
     return backup.no_wal(data)
 
 
-def password_of(db: bytes) -> str:
+def password_of(db: bytes, secret: str | None = None) -> str:
+    """Sicherungs-Passwort aus der Datenbank – verschlüsselt abgelegt (app/secretbox.py, Schlüssel aus CLUSTER_SECRET)
+    oder noch im Klartext (ältere Version)."""
     con = sqlite3.connect(":memory:")
     try:
         con.deserialize(db)
@@ -136,7 +138,10 @@ def password_of(db: bytes) -> str:
         con.close()
     if not row or not row[0]:
         raise Fehler("password", "kein Sicherungs-Passwort in der Datenbank")
-    return row[0]
+    pw = secretbox.unseal("backup_password", row[0], conf_now()[0]["cluster_secret"] if secret is None else secret)
+    if not pw:
+        raise Fehler("password", "Sicherungs-Passwort nicht lesbar (CLUSTER_SECRET geändert?)")
+    return pw
 
 
 def conf_now() -> tuple[dict, Path]:
@@ -151,6 +156,10 @@ def conf_now() -> tuple[dict, Path]:
             secret = backup.derived_secret((tls / "server.key").read_bytes())
         except OSError:
             pass
+    h = backup.conf_value(env, "FESTPOS_ADMIN_PASSWORD_HASH") or ""
+    if h:                                                       # Notfall-Passwort als Prüfwert (T-0-N/FestPOS#15)
+        return {"cluster_secret": secret, "admin_password_hash": h,
+                "admin_password_len": backup.conf_value(env, "FESTPOS_ADMIN_PASSWORD_LEN") or "0"}, tls
     return {"cluster_secret": secret, "admin_password": backup.conf_value(env, "FESTPOS_ADMIN_PASSWORD") or ""}, tls
 
 

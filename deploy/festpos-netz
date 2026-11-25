@@ -1,0 +1,340 @@
+#!/opt/festpos/venv/bin/python3 -I
+"""FestPOS – Netz umziehen (T-0-N/FestPOS#2, Teil 2). Läuft als root, Aufträge der App über festpos-wiederherstellen.
+
+  festpos-netz --vorbereiten  (JSON auf stdin) neue festpos.conf und Zertifikate auf der Boot-Partition bereitlegen
+                              (festpos.conf.umzug, festpos-tls.umzug/), das Umstellen zur Zeit «at» planen
+  festpos-netz --umstellen    zur Zeit «at»: bisherige Dateien sichern (*.vor-umzug), neue an ihren Platz, die alten
+                              Zertifikate für die Übergangszeit nach festpos-tls-alt/, rqlite: raft/peers.json mit den
+                              neuen Adressen (so findet sich der Cluster nach dem Neustart), Neustart
+  festpos-netz --bestaetigt   über die neue Adresse bestätigt: kein Rückfall mehr, Sicherungskopien weg
+  festpos-netz --zurueck      vor dem Umstellen: verwerfen; danach: bisherige Dateien zurück, peers.json mit den alten
+                              Adressen, Neustart
+  festpos-netz --wache        jede Minute (festpos-netz.timer): Frist zum Bestätigen abgelaufen -> zurück; verpasstes
+                              Umstellen (Pi war gerade aus) innert 5 Minuten nachholen, sonst verwerfen
+
+Die neue festpos.conf entsteht aus der bisherigen: Netz, VIP, Pi und DHCP neu (app/netz.py), Adressen des alten Netzes in
+INTERNET_GATEWAY, INTERNET_DNS, DHCP_GATEWAY, DHCP_DNS, SSH_FROM, ADMIN_FROM umgerechnet (gleicher Abstand zur
+Netzadresse), dazu NET_ALT … für die Übergangszeit (festpos-node: alte Adressen zusätzlich bis NET_ALT_BIS). Alles
+andere – auch «im-container» bei verschlüsselten Daten – bleibt, wie es ist. Der Server-Schlüssel bleibt gleich.
+Stand: /var/lib/festpos-netz/umzug.json. Tests: FESTPOS_TEST_ROOT, FESTPOS_BOOT, FESTPOS_SYSTEMCTL, FESTPOS_SYSTEMD_RUN.
+"""
+from __future__ import annotations
+
+import fcntl
+import ipaddress
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.dont_write_bytecode = True                         # nichts als root in /opt/festpos schreiben
+DEST = Path(os.environ.get("FESTPOS_DEST", "/opt/festpos"))
+sys.path.insert(0, os.environ.get("FESTPOS_RELEASE_LIB", str(DEST)))
+from app import backup, netz  # noqa: E402  (gehört root wie dieses Programm)
+
+R = os.environ.get("FESTPOS_TEST_ROOT", "")
+_boot = os.environ.get("FESTPOS_BOOT") or ("/boot/firmware" if os.path.isdir("/boot/firmware") else "/boot")
+BOOT = Path(_boot)
+CONF, CONF_NEU, CONF_VOR = BOOT / "festpos.conf", BOOT / "festpos.conf.umzug", BOOT / "festpos.conf.vor-umzug"
+TLS, TLS_NEU, TLS_VOR, TLS_ALT = (BOOT / "festpos-tls", BOOT / "festpos-tls.umzug", BOOT / "festpos-tls.vor-umzug",
+                                  BOOT / "festpos-tls-alt")
+STATE = Path(f"{R}/var/lib/festpos-netz/umzug.json")
+LOCK = STATE.with_name(".sperre")
+RQ_DATA = Path(f"{R}/var/lib/festpos/rqlite")
+SYSTEMCTL = os.environ.get("FESTPOS_SYSTEMCTL", "systemctl")
+SYSTEMD_RUN = os.environ.get("FESTPOS_SYSTEMD_RUN", "systemd-run")
+SELF = os.environ.get("FESTPOS_NETZ_BIN", "/usr/local/sbin/festpos-netz")
+RAFT_PORT = 4002
+MISSED_S = 300                      # verpasstes Umstellen so lange nachholen
+TRANSLATE = ("INTERNET_GATEWAY", "INTERNET_DNS", "DHCP_GATEWAY", "DHCP_DNS", "SSH_FROM", "ADMIN_FROM", "DHCP_POOL")
+ALT_KEYS = ("NET_ALT", "VIP_ALT", "NODE_A_IP_ALT", "NODE_B_IP_ALT", "NODE_C_IP_ALT", "NET_ALT_BIS")
+
+
+class Fehler(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def log(msg: str) -> None:
+    print(f"festpos-netz: {msg}", file=sys.stderr, flush=True)
+
+
+def melde(res: dict) -> int:
+    print(json.dumps(res))
+    return 0 if res.get("ok") else 1
+
+
+def schreibe(path: Path, data: bytes, mode: int = 0o644) -> None:
+    tmp = path.with_name(f".{path.name}.neu")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def text(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="surrogateescape")
+
+
+def state() -> dict:
+    try:
+        d = json.loads(STATE.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(d: dict) -> None:
+    STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    schreibe(STATE, json.dumps(d).encode(), 0o600)
+
+
+def neu_starten() -> None:
+    log("Pi startet neu")
+    subprocess.run([SYSTEMCTL, "reboot", "--no-block"], capture_output=True, timeout=60)
+
+
+# -- neue festpos.conf --------------------------------------------------------------------------------------------
+def new_conf(cur: str, job: dict) -> str:
+    """festpos.conf für das neue Netz aus der bisherigen (siehe oben)."""
+    old, new = job["old"], job["new"]
+    on, nn = ipaddress.IPv4Network(old["net"]), ipaddress.IPv4Network(new["net"])
+    pis = {}
+    for k in ("a", "b", "c"):
+        v = new.get(k) or netz.move_ip(backup.conf_value(cur, f"NODE_{k.upper()}_IP") or "", on, nn)
+        pis[k] = v or netz.defaults(str(nn))[k]
+    d = netz.defaults(str(nn))
+    lines = netz.conf_lines(str(nn), new["vip"], pis["a"], pis["b"], pis["c"], new.get("dhcp_from") or d["dhcp_from"],
+                            new.get("dhcp_to") or d["dhcp_to"])
+    keep_pool = not (new.get("dhcp_from") and new.get("dhcp_to"))
+    for k in ALT_KEYS:
+        cur = backup.conf_remove(cur, k)
+    for k, v in lines.items():
+        if k == "DHCP_POOL" and keep_pool and backup.conf_value(cur, k):
+            continue
+        if k == "SSH_FROM" and backup.conf_value(cur, k):
+            continue                                       # eigener Wert: unten umgerechnet
+        cur = backup.conf_set(cur, k, v)
+    for k in TRANSLATE:
+        v = backup.conf_value(cur, k)
+        if v:
+            moved, missing = netz.move_text(v, on, nn)
+            if missing:
+                raise Fehler("ip_no_room")
+            cur = backup.conf_set(cur, k, moved)
+    alt = {"NET_ALT": str(on), "VIP_ALT": old["vip"], "NET_ALT_BIS": str(int(job["until"]))}
+    for k in ("a", "b", "c"):
+        if old.get(k):
+            alt[f"NODE_{k.upper()}_IP_ALT"] = old[k]
+    for k, v in alt.items():
+        cur = backup.conf_set(cur, k, v)
+    return cur
+
+
+def check_certs(ca_pem: bytes, srv_pem: bytes, new_net: str) -> None:
+    """Neue CA gilt fürs neue Netz, Serverzertifikat von ihr und für den bisherigen Server-Schlüssel."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+    try:
+        ca = x509.load_pem_x509_certificate(ca_pem)
+        srv = x509.load_pem_x509_certificate(srv_pem)
+        cur = x509.load_pem_x509_certificate((TLS / "server.crt").read_bytes())
+    except (OSError, ValueError):
+        raise Fehler("tls") from None
+
+    def pub(c):
+        return c.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    if srv.issuer != ca.subject or pub(srv) != pub(cur):
+        raise Fehler("tls")
+    try:
+        nc = ca.extensions.get_extension_for_class(x509.NameConstraints).value
+    except x509.ExtensionNotFound:
+        raise Fehler("tls") from None
+    nets = {str(x.value) for x in nc.permitted_subtrees or [] if isinstance(x, x509.IPAddress)}
+    if new_net not in nets:
+        raise Fehler("tls")
+
+
+# -- Aufträge -----------------------------------------------------------------------------------------------------
+def vorbereiten(job: dict) -> dict:
+    try:
+        old, new = job["old"], job["new"]
+        at, deadline, until = int(job["at"]), int(job["deadline"]), int(job["until"])
+        mid = str(job["id"])
+    except (KeyError, TypeError, ValueError):
+        raise Fehler("job") from None
+    nn = netz.parse(new.get("net", ""))
+    if not nn or not netz.parse(old.get("net", "")) or nn.overlaps(ipaddress.IPv4Network(old["net"])):
+        raise Fehler("net")
+    st = state()
+    if st.get("phase") in ("wechsel", "umgestellt"):
+        raise Fehler("running")
+    check_certs(str(job.get("ca_crt") or "").encode(), str(job.get("server_crt") or "").encode(), str(nn))
+    try:
+        conf = new_conf(text(CONF), job)
+    except OSError:
+        raise Fehler("conf") from None
+    except ValueError:
+        raise Fehler("conf_value") from None
+    shutil.rmtree(TLS_NEU, ignore_errors=True)
+    TLS_NEU.mkdir()
+    for e in sorted(TLS.iterdir()):
+        if e.is_file() and not e.is_symlink():
+            schreibe(TLS_NEU / e.name, e.read_bytes(), 0o600 if e.name.endswith(".key") else 0o644)
+    schreibe(TLS_NEU / "ca.crt", job["ca_crt"].encode())
+    schreibe(TLS_NEU / "server.crt", job["server_crt"].encode())
+    schreibe(CONF_NEU, conf.encode("utf-8", errors="surrogateescape"))
+    save_state({"id": mid, "phase": "vorbereitet", "at": at, "deadline": deadline, "until": until, "old": old,
+                "new": new})
+    wait = max(1, at - int(time.time()))
+    subprocess.run([SYSTEMD_RUN, "--unit=festpos-netz-umstellen", "--collect", f"--on-active={wait}s", SELF,
+                    "--umstellen"], capture_output=True, timeout=30)
+    log(f"vorbereitet: {old['net']} -> {new['net']} in {wait} s")
+    return {"ok": True}
+
+
+def peers_json(pis: dict) -> None:
+    """rqlite: Adressen der Pi beim nächsten Start (raft/peers.json, liest rqlite einmal und löscht sie dann)."""
+    raft = RQ_DATA / "raft"
+    if not raft.is_dir():
+        return
+    data = [{"id": k, "address": f"{v}:{RAFT_PORT}", "non_voter": False} for k, v in sorted(pis.items()) if v]
+    schreibe(raft / "peers.json", json.dumps(data).encode())
+    try:
+        shutil.chown(raft / "peers.json", "festpos", "festpos")
+    except (LookupError, OSError):
+        pass
+
+
+def _pis(plan: dict) -> dict:
+    return {k: plan[k] for k in ("a", "b", "c") if plan.get(k)}
+
+
+def umstellen() -> int:
+    """Phase «vorbereitet» -> (Sicherung der jetzigen Dateien) «wechsel» -> (neue Dateien) «umgestellt». Bricht es in
+    «wechsel» ab (Strom, Absturz), macht der nächste Lauf dort weiter: die Sicherung bleibt die der ursprünglichen
+    Dateien, zurueck() stellt sie wieder her."""
+    st = state()
+    if st.get("phase") not in ("vorbereitet", "wechsel") or not CONF_NEU.is_file() or not TLS_NEU.is_dir():
+        log("nichts umzustellen")
+        return 0
+    if time.time() < st["at"] - 5:
+        return 0
+    if st["phase"] == "vorbereitet":                      # nur beim ersten Versuch: Sicherung des jetzigen Stands
+        schreibe(CONF_VOR, CONF.read_bytes())
+        shutil.rmtree(TLS_VOR, ignore_errors=True)
+        shutil.copytree(TLS, TLS_VOR)
+        shutil.rmtree(TLS_ALT, ignore_errors=True)
+        TLS_ALT.mkdir()
+        for name in ("ca.crt", "server.crt"):             # Übergangszeit: alte Adressen mit den alten Zertifikaten
+            if (TLS / name).is_file():
+                schreibe(TLS_ALT / name, (TLS / name).read_bytes())
+        st = {**st, "phase": "wechsel"}
+        save_state(st)
+    for e in TLS_NEU.iterdir():
+        schreibe(TLS / e.name, e.read_bytes(), 0o600 if e.name.endswith(".key") else 0o644)
+    schreibe(CONF, CONF_NEU.read_bytes())
+    peers_json(_pis(st["new"]))
+    save_state({**st, "phase": "umgestellt", "switched": int(time.time())})
+    log(f"umgestellt auf {st['new']['net']} – Neustart")
+    neu_starten()
+    return 0
+
+
+def zurueck(reason: str = "manual") -> dict:
+    st = state()
+    if st.get("phase") == "vorbereitet":
+        subprocess.run([SYSTEMCTL, "stop", "festpos-netz-umstellen.timer", "festpos-netz-umstellen.service"],
+                       capture_output=True, timeout=30)
+        CONF_NEU.unlink(missing_ok=True)
+        shutil.rmtree(TLS_NEU, ignore_errors=True)
+        STATE.unlink(missing_ok=True)
+        log("Umzug verworfen (noch nicht umgestellt)")
+        return {"ok": True}
+    if st.get("phase") not in ("wechsel", "umgestellt"):
+        return {"ok": True}
+    if CONF_VOR.is_file():
+        schreibe(CONF, CONF_VOR.read_bytes())
+    if TLS_VOR.is_dir():
+        for e in TLS_VOR.iterdir():
+            schreibe(TLS / e.name, e.read_bytes(), 0o600 if e.name.endswith(".key") else 0o644)
+    shutil.rmtree(TLS_ALT, ignore_errors=True)
+    peers_json(_pis(st["old"]))
+    for p in (CONF_NEU, CONF_VOR):
+        p.unlink(missing_ok=True)
+    for d in (TLS_NEU, TLS_VOR):
+        shutil.rmtree(d, ignore_errors=True)
+    STATE.unlink(missing_ok=True)
+    log(f"zurück ins alte Netz {st['old']['net']} ({reason}) – Neustart")
+    neu_starten()
+    return {"ok": True, "restart": True}
+
+
+def bestaetigt(job: dict) -> dict:
+    st = state()
+    if st.get("phase") == "umgestellt" and (not job.get("id") or job.get("id") == st.get("id")):
+        for p in (CONF_NEU, CONF_VOR):
+            p.unlink(missing_ok=True)
+        for d in (TLS_NEU, TLS_VOR):
+            shutil.rmtree(d, ignore_errors=True)
+        STATE.unlink(missing_ok=True)
+        log("Umzug bestätigt")
+    return {"ok": True}
+
+
+def wache() -> int:
+    st = state()
+    now = time.time()
+    if st.get("phase") == "umgestellt" and now > st.get("deadline", 0):
+        log("nicht bestätigt – zurück ins alte Netz")
+        zurueck("timeout")
+    elif st.get("phase") == "wechsel":                    # Umstellen unterbrochen: fertig machen oder zurück
+        if now <= st.get("deadline", 0):
+            umstellen()
+        else:
+            zurueck("interrupted")
+    elif st.get("phase") == "vorbereitet" and now >= st.get("at", 0):
+        if now <= st["at"] + MISSED_S:
+            umstellen()                                   # geplanter Termin verpasst (z.B. Neustart dazwischen)
+        else:
+            zurueck("missed")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    LOCK.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(LOCK, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)                  # ein Auftrag nach dem anderen (Umstellen, Wache, App)
+        return _main(argv)
+
+
+def _main(argv: list[str]) -> int:
+    try:
+        if argv == ["--vorbereiten"]:
+            return melde(vorbereiten(json.loads(sys.stdin.read() or "{}")))
+        if argv == ["--umstellen"]:
+            return umstellen()
+        if argv == ["--zurueck"]:
+            return melde(zurueck())
+        if argv == ["--bestaetigt"]:
+            return melde(bestaetigt(json.loads(sys.stdin.read() or "{}")))
+        if argv == ["--wache"]:
+            return wache()
+    except Fehler as e:
+        return melde({"ok": False, "code": e.code})
+    except ValueError:
+        return melde({"ok": False, "code": "job"})
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

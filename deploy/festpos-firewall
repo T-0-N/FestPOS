@@ -1,0 +1,237 @@
+#!/usr/bin/python3
+"""FestPOS – Firewall für Verbindungen der Pi ins Internet (T-0-N/FestPOS#10). Läuft als root.
+
+  festpos-firewall             Modus anwenden (Wunsch der App), Namen höchstens alle 10 Minuten neu auflösen,
+                               Stand schreiben (festpos-firewall.timer jede Minute, festpos-firewall.path bei Änderung)
+  festpos-firewall --ohne-dns  nur mit den zuletzt aufgelösten Adressen (festpos-node beim Start, noch ohne Netz)
+
+Ablauf: zuerst die Regeln des gültigen Modus mit den bekannten Adressen laden (ein abgelaufenes «open» wird sofort
+strikt, ohne auf DNS zu warten), dann die Namen auflösen (höchstens 15 s) und bei neuen Adressen nochmals laden.
+Geladen wird nur, wenn sich die Regeln ändern; beim Neuladen gehen Zähler und Sets verloren – darum werden die
+Beobachtungen vorher gelesen und im Zwischenspeicher weitergezählt (bis zum nächsten Moduswechsel).
+
+Wunsch der App: /run/festpos/firewall/modus.json {"mode": strict|watch|open, "until": Zeit} (gehört festpos, wird nur
+gelesen, ohne Verknüpfungen zu folgen). Fehlt er oder ist er ungültig: «strict». «watch»/«open» nach «until»: «strict».
+Stand für die App: /run/festpos/firewall-stand/stand.json (Modus, Zähler, zuletzt verworfene Ziele).
+Liste und Regeln: app/ausgehend.py.
+Tests: FESTPOS_TEST_ROOT (Pfade), FESTPOS_NFT (Ersatz für nft), FESTPOS_FW_RESOLVE (JSON {Name: [Adressen]} statt DNS).
+"""
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.environ.get("FESTPOS_DEST", "/opt/festpos"))
+from app import ausgehend  # noqa: E402  (gehört root wie dieses Programm)
+
+R = os.environ.get("FESTPOS_TEST_ROOT", "")
+WISH = Path(f"{R}/run/festpos/firewall/modus.json")
+OUT = Path(f"{R}/run/festpos/firewall-stand/stand.json")
+CACHE = Path(f"{R}/var/lib/festpos-firewall/adressen.json")
+RESOLV = Path(f"{R}/etc/resolv.conf")
+NFT = os.environ.get("FESTPOS_NFT", "nft")
+RESOLVE_S = 600                        # Namen neu auflösen
+KEEP_S = 24 * 3600                     # aufgelöste Adressen so lange behalten (DNS-Wechsel, Verbindungen laufen weiter)
+SEEN_MAX = 20
+SEEN_TIMEOUT = 86400                   # wie lange nft ein fremdes Ziel im Set behält (app/ausgehend.py: timeout 1d)
+DNS_WAIT_S = 15                        # höchstens so lange auf DNS warten (alle Namen zusammen)
+
+
+def log(msg: str) -> None:
+    print(f"festpos-firewall: {msg}", file=sys.stderr)
+
+
+def wish() -> tuple[str, int]:
+    """Gewünschter Modus -> (Modus, bis). Ungültig, abgelaufen oder fehlend: strict."""
+    try:
+        fd = os.open(WISH, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as f:
+            d = json.loads(f.read(4096) or b"{}")
+    except (OSError, ValueError):
+        return ausgehend.DEFAULT, 0
+    if not isinstance(d, dict):
+        return ausgehend.DEFAULT, 0
+    mode = d.get("mode")
+    try:
+        until = int(d.get("until") or 0)
+    except (TypeError, ValueError):
+        until = 0
+    if mode not in ausgehend.MODES:
+        return ausgehend.DEFAULT, 0
+    if mode != "strict" and (until <= time.time() or until > time.time() + ausgehend.MAX_HOURS * 3600 + 600):
+        return ausgehend.DEFAULT, 0
+    return mode, until if mode != "strict" else 0
+
+
+def _lookup(host: str) -> list[str]:
+    fake = os.environ.get("FESTPOS_FW_RESOLVE")
+    if fake:
+        return list(json.loads(Path(fake).read_text()).get(host) or [])
+    try:
+        return sorted({i[4][0] for i in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)})
+    except OSError:
+        return []
+
+
+def resolve(cache: dict, use_dns: bool) -> dict:
+    """{Name: {Adresse: zuletzt gesehen}} – neu auflösen (parallel, mit Frist), alte Adressen bis KEEP_S behalten."""
+    now = int(time.time())
+    hosts = {h: dict(cache.get("hosts", {}).get(h) or {}) for h in ausgehend.HOSTS}
+    if use_dns and now - int(cache.get("at") or 0) >= RESOLVE_S:
+        got: dict[str, list[str]] = {}
+
+        def one(h: str) -> None:
+            try:
+                got[h] = _lookup(h)
+            except Exception:  # noqa: BLE001 – kein DNS gerade: die bisherigen Adressen bleiben
+                pass
+        threads = [threading.Thread(target=one, args=(h,), daemon=True) for h in hosts]
+        for t in threads:
+            t.start()
+        end = time.monotonic() + DNS_WAIT_S
+        for t in threads:                                  # hängt ein Name, wird nicht auf ihn gewartet
+            t.join(max(0.0, end - time.monotonic()))
+        for h, addrs in list(got.items()):
+            for a in addrs:
+                hosts[h][a] = now
+        cache = {**cache, "at": now}
+    hosts = {h: {a: t for a, t in v.items() if now - int(t) < KEEP_S} for h, v in hosts.items()}
+    return {**cache, "hosts": hosts}
+
+
+def dns_servers() -> list[str]:
+    try:
+        lines = RESOLV.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    return [p[1] for p in (ln.split() for ln in lines) if len(p) >= 2 and p[0] == "nameserver"]
+
+
+def nft(args: list[str], script: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run([NFT, *args], input=script, capture_output=True, text=True, timeout=30)
+
+
+def counters() -> tuple[int | None, list[dict]]:
+    """Zähler «unknown» und die zuletzt gesehenen fremden Ziele (aus den Sets seen4/seen6)."""
+    p = nft(["-j", "list", "table", "inet", ausgehend.TABLE])
+    if p.returncode:
+        return None, []
+    try:
+        items = json.loads(p.stdout).get("nftables", [])
+    except ValueError:
+        return None, []
+    count, seen = None, []
+    for it in items:
+        if "counter" in it and it["counter"].get("name") == "unknown":
+            count = int(it["counter"].get("packets") or 0)
+        s = it.get("set")
+        if s and s.get("name") in ("seen4", "seen6"):
+            for el in s.get("elem") or []:
+                val = el.get("elem", {}).get("val") if isinstance(el, dict) and "elem" in el else el
+                parts = val.get("concat") if isinstance(val, dict) else None
+                if isinstance(parts, list) and len(parts) == 3:
+                    seen.append({"ip": str(parts[0]), "proto": str(parts[1]), "port": parts[2],
+                                 "left": (el.get("elem") or {}).get("expires") if isinstance(el, dict) else None})
+    seen.sort(key=lambda x: -(x["left"] or 0))                   # die zuletzt gesehenen zuerst (längste Restzeit)
+    return count, seen[:SEEN_MAX]
+
+
+def table_exists() -> bool:
+    return nft(["list", "table", "inet", ausgehend.TABLE]).returncode == 0
+
+
+def remember(cache: dict, count: int | None, seen: list[dict]) -> None:
+    """Beobachtungen der Tabelle (vor dem Ersetzen) in den Zwischenspeicher übernehmen."""
+    obs = cache.setdefault("obs", {"count": 0, "seen": []})
+    obs["count"] = int(obs.get("count") or 0) + int(count or 0)
+    obs["seen"] = merged_seen(obs.get("seen") or [], seen)
+
+
+def merged_seen(old: list[dict], live: list[dict]) -> list[dict]:
+    """[{ip, proto, port, at}] – je Ziel der letzte Zeitpunkt, die neusten zuerst, älter als ein Tag weg."""
+    now = int(time.time())
+    out: dict[tuple, int] = {}
+    for x in old:
+        out[(x.get("ip"), x.get("proto"), x.get("port"))] = int(x.get("at") or 0)
+    for x in live:
+        at = now - (SEEN_TIMEOUT - int(x["left"])) if x.get("left") is not None else now
+        k = (x.get("ip"), x.get("proto"), x.get("port"))
+        out[k] = max(out.get(k, 0), at)
+    items = [{"ip": k[0], "proto": k[1], "port": k[2], "at": at} for k, at in out.items() if now - at < SEEN_TIMEOUT]
+    return sorted(items, key=lambda x: -x["at"])[:SEEN_MAX]
+
+
+def apply(mode: str, cache: dict, same_mode: bool) -> str:
+    """Regeln laden, wenn sie sich geändert haben -> Fehlertext ("" = in Ordnung)."""
+    addrs = sorted({a for v in cache["hosts"].values() for a in v})
+    script = ausgehend.rules(mode, addrs, dns_servers())
+    sha = hashlib.sha256(script.encode()).hexdigest()
+    if cache.get("sha") == sha and same_mode and (mode == "open" or table_exists()):
+        return ""                                           # unverändert: Zähler und Sets bleiben
+    seen = counters() if same_mode and mode != "open" else None   # Tabelle wird ersetzt: vorher lesen …
+    p = nft(["-f", "-"], script)
+    if p.returncode:
+        err = (p.stderr or "nft").strip().splitlines()[-1][:200] if (p.stderr or "").strip() else "nft"
+        log(f"Regeln nicht geladen: {err}")
+        cache.pop("sha", None)
+        return err                                          # alte Tabelle bleibt mit ihren Zählern: nichts doppelt
+    if seen:
+        remember(cache, *seen)                              # … und erst nach dem Ersetzen übernehmen
+    cache["sha"] = sha
+    return ""
+
+
+def write_out(d: dict) -> None:
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(OUT.parent, 0o755)
+    tmp = OUT.with_name(".stand.neu")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(d, f)
+    os.replace(tmp, OUT)
+
+
+def main(argv: list[str]) -> int:
+    use_dns = "--ohne-dns" not in argv
+    mode, until = wish()
+    try:
+        cache = json.loads(CACHE.read_text())
+        cache = cache if isinstance(cache, dict) else {}
+    except (OSError, ValueError):
+        cache = {}
+    same_mode = cache.get("mode") == mode
+    if not same_mode:
+        cache["at"] = 0                                       # neuer Modus: gleich neu auflösen
+        cache["obs"] = {"count": 0, "seen": []}               # Beobachtungen gelten pro Modus
+    cache = resolve(cache, False)                             # 1. sofort mit den bekannten Adressen
+    err = apply(mode, cache, same_mode)
+    cache["mode"] = mode
+    if use_dns:                                               # 2. Namen auflösen (begrenzt), neue Adressen laden
+        cache = resolve(cache, True)
+        err = apply(mode, cache, True) or err
+    addrs = sorted({a for v in cache["hosts"].values() for a in v})
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(CACHE.parent, 0o700)
+    CACHE.write_text(json.dumps(cache))
+    count, seen, total = None, [], None
+    if mode != "open" and not err:
+        count, live = counters()
+        obs = cache.get("obs") or {}
+        total = None if count is None else int(obs.get("count") or 0) + count
+        now = int(time.time())
+        seen = [{"ip": x["ip"], "proto": x["proto"], "port": x["port"], "left": SEEN_TIMEOUT - (now - x["at"])}
+                for x in merged_seen(obs.get("seen") or [], live)]
+    write_out({"mode": mode, "until": until, "at": int(time.time()), "error": err,
+               "hosts": sum(1 for v in cache["hosts"].values() if v), "addrs": len(addrs),
+               "unknown": total, "seen": seen, "resolved_at": int(cache.get("at") or 0)})
+    return 1 if err else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

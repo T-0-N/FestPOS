@@ -269,7 +269,7 @@ def test_keep_connected_through_own_device_or_another_pi(net, monkeypatch):
     m._keep.clear()
     monkeypatch.setattr(m, "SYS_NET", u["tmp"] / "leer")
     monkeypatch.setattr(core.rt.monitor, "peers", {"b": {"at": time.time(), "data": {"internet": {
-        "up": True, "share": True, "ip": "192.168.55.12"}}}}, raising=False)
+        "up": True, "share": True, "device": True, "ip": "192.168.55.12"}}}}, raising=False)
     m.keep_tick()
     up = u["helper"].reqs[-1]
     assert up["via"] == "lan" and up["gateway"] == "192.168.55.12" and up["keep"] is True and "share" not in up
@@ -329,7 +329,7 @@ def test_keep_shares_only_to_handhelds_and_pis(net, monkeypatch):
     m._keep.clear()
     monkeypatch.setattr(m, "SYS_NET", u["tmp"] / "leer")
     monkeypatch.setattr(core.rt.monitor, "peers", {"b": {"at": time.time(), "data": {"internet": {
-        "up": True, "share": True, "ip": "192.168.55.12"}}}}, raising=False)
+        "up": True, "share": True, "device": True, "ip": "192.168.55.12"}}}}, raising=False)
     m.keep_tick()
     up = u["helper"].reqs[-1]
     assert up["via"] == "lan" and up["gateway"] == "192.168.55.12" and up["share"] is True and up["allow"]
@@ -372,3 +372,181 @@ def test_internet_status_for_display_and_handhelds(net, monkeypatch):
     finally:
         m._keep.clear()
         _keep(u, False)
+
+
+# -- Stabil halten (T-0-N/FestPOS#1): übernehmen statt abbauen, Fehlversuche mit Pause, Grund ----------------------
+def _status_file(u, data: dict) -> None:
+    (u["status"] / "internet.json").write_text(json.dumps(data))
+
+
+def test_keep_adopts_running_connection_after_restart(net, monkeypatch):
+    """Neustart der App (auch beim Update): die dauerhafte Verbindung steht noch -> übernehmen, nicht abbauen."""
+    import sys
+    u, m = net, net["net"]
+    monkeypatch.setattr(sys.modules["app.main"], "_keep_last", [time.time() + 3600])
+    configure(u, via="wlan")
+    _keep(u)
+    try:
+        _status_file(u, {"via": "wlan", "dev": "wlan0", "keep": True, "at": 1700000000, "share": True,
+                         "ssid": "Fest-Hotspot"})
+        m._keep.clear()
+        n = len(u["helper"].reqs)
+        m.keep_tick()
+        assert u["helper"].actions()[n:] in ([], ["net_share"])            # kein net_up, kein net_down
+        v = m.keep_view()
+        assert v["state"] == "up" and v["since"] == 1700000000 and m._keep.get("adopted") is True
+        # anderes WLAN eingestellt: nicht übernehmen
+        _status_file(u, {"via": "wlan", "dev": "wlan0", "keep": True, "at": 1, "ssid": "Alter-Hotspot"})
+        m._keep.clear()
+        assert m._adopt(m._raw(), time.time()) is False
+        # anderer Weg eingestellt (USB statt WLAN): nicht übernehmen, neu verbinden
+        _status_file(u, {"via": "wlan", "dev": "wlan0", "keep": True, "at": 1})
+        configure(u, via="usb")
+        m._keep.clear()
+        assert m._adopt(m._raw(), time.time()) is False
+        # nur kurz verbunden (Update aus dem Internet, ohne keep): nicht übernehmen
+        configure(u, via="wlan")
+        _status_file(u, {"via": "wlan", "dev": "wlan0", "keep": False})
+        assert m._adopt(m._raw(), time.time()) is False
+        # (c) aus, aber der Helfer hält noch eine dauerhafte Verbindung (aus vor dem Neustart): abbauen
+        _status_file(u, {"via": "wlan", "dev": "wlan0", "keep": True})
+        _keep(u, False)
+        m._keep.clear()
+        m.keep_tick()
+        assert u["helper"].reqs[-1]["action"] == "net_down"
+    finally:
+        m._keep.clear()
+        (u["status"] / "internet.json").unlink(missing_ok=True)
+        _keep(u, False)
+
+
+def test_keep_reconnects_only_after_several_failures_with_growing_pause(net, monkeypatch):
+    """Schwaches Netz: nicht bei jeder gescheiterten Prüfung neu verbinden, sondern erst nach KEEP_FAILS, dann mit
+    Pause 1, 2, 4 … 15 Minuten. Der Grund steht dabei (kein DNS, Uhrzeit, keine Antwort, WLAN nicht gefunden)."""
+    import sys
+    u, m = net, net["net"]
+    monkeypatch.setattr(sys.modules["app.main"], "_keep_last", [time.time() + 3600])
+    configure(u, via="wlan")
+    _keep(u)
+    clock = [time.time()]
+    monkeypatch.setattr(m.time, "time", lambda: clock[0])
+    try:
+        m._keep.clear()
+        m.keep_tick()
+        assert u["helper"].reqs[-1]["action"] == "net_up" and m.keep_view()["state"] == "up"
+        monkeypatch.setattr(m, "_probe", lambda timeout=5.0: "dns")
+        n = len(u["helper"].reqs)
+        for i in range(1, m.KEEP_FAILS):
+            clock[0] += 60
+            m.keep_tick()
+            assert len(u["helper"].reqs) == n, i                           # noch nicht neu verbinden
+            v = m.keep_view()
+            assert v["online"] is False and v["reason"] == "dns" and v["fails"] == i
+        clock[0] += 60
+        m.keep_tick()                                                      # 3. Mal: neu verbinden
+        assert u["helper"].reqs[-1]["action"] == "net_up" and len(u["helper"].reqs) == n + 1
+        assert m.keep_view()["reason"] == "dns" and m.keep_view()["tries"] == 1
+        for _ in range(m.KEEP_FAILS):                                      # weiter offline, Pause noch nicht um
+            clock[0] += 15
+            m.keep_tick()
+        assert len(u["helper"].reqs) == n + 1
+        # Verbinden scheitert: Grund und wachsende Pause
+        u["helper"].code = "net_wlan_not_found"
+        clock[0] += 60
+        m.keep_tick()
+        v = m.keep_view()
+        assert v["state"] == "failed" and v["reason"] == "wlan_not_found" and v["tries"] == 2
+        assert v["next"] - clock[0] == m.BACKOFF[1]
+        clock[0] += m.BACKOFF[1] - 1
+        k = len(u["helper"].reqs)
+        m.keep_tick()
+        assert len(u["helper"].reqs) == k                                  # Pause noch nicht um
+        clock[0] += 2
+        m.keep_tick()
+        assert m.keep_view()["tries"] == 3 and m.keep_view()["next"] - clock[0] == m.BACKOFF[2]
+        # wieder da: alles zurück
+        u["helper"].code = None
+        monkeypatch.setattr(m, "_probe", lambda timeout=5.0: None)
+        clock[0] += m.BACKOFF[2] + 1
+        m.keep_tick()
+        v = m.keep_view()
+        assert v["state"] == "up" and v["online"] is True and v["reason"] is None and v["tries"] == 0
+        assert m.keep_status()["reason"] is None
+    finally:
+        m._keep.clear()
+        _keep(u, False)
+
+
+def test_keep_wlan_only_one_pi_at_the_hotspot(net, monkeypatch):
+    """3 Pi mit WLAN: nur der Pi mit der VIP verbindet sich mit dem Hotspot, die anderen gehen über ihn."""
+    import sys
+    from app import core
+    u, m = net, net["net"]
+    monkeypatch.setattr(sys.modules["app.main"], "_keep_last", [time.time() + 3600])
+    monkeypatch.setattr(core.Config, "peers", ["https://192.168.55.12:8443"])
+    monkeypatch.setattr(m, "_holds_vip", lambda: False)
+    monkeypatch.setattr(core.rt.monitor, "peers", {"b": {"at": time.time(), "data": {"internet": {
+        "up": True, "share": True, "device": True, "ip": "192.168.55.12"}}}}, raising=False)
+    configure(u, via="wlan")
+    _keep(u)
+    try:
+        m._keep.clear()
+        m.keep_tick()
+        up = u["helper"].reqs[-1]
+        assert up["via"] == "lan" and up["gateway"] == "192.168.55.12" and m.keep_view()["peer"] == "b"
+        monkeypatch.setattr(core.rt.monitor, "peers", {}, raising=False)  # noch keiner verbunden: trotzdem nicht selbst
+        m._keep.clear()
+        n = len(u["helper"].reqs)
+        m.keep_tick()
+        assert len(u["helper"].reqs) == n and m.keep_view()["state"] == "no_way"
+        monkeypatch.setattr(m, "_holds_vip", lambda: True)                # mit der VIP: selbst ans WLAN
+        m._keep.clear()
+        m.keep_tick()
+        assert u["helper"].reqs[-1]["via"] == "wlan" and m.keep_report()["device"] is True
+        # beide gleichzeitig gestartet: wer die VIP nicht (mehr) hat, überlässt das WLAN dem anderen
+        monkeypatch.setattr(m, "_holds_vip", lambda: False)
+        monkeypatch.setattr(core.rt.monitor, "peers", {
+            "a": {"at": time.time(), "data": {"internet": {"up": True, "share": True, "device": False,   # reicht nur weiter
+                                                           "ip": "192.168.55.11"}}},
+            "a2": {"at": time.time(), "data": {"internet": {"up": True, "share": True,   # älter: ohne «device»
+                                                            "ip": "192.168.55.13"}}},
+            "b": {"at": time.time(), "data": {"internet": {"up": True, "share": True, "device": True,
+                                                           "ip": "192.168.55.12"}}}}, raising=False)
+        m.keep_tick()
+        up = u["helper"].reqs[-1]
+        assert up["action"] == "net_up" and up["via"] == "lan" and up["gateway"] == "192.168.55.12"   # nie A (Kreis)
+    finally:
+        m._keep.clear()
+        _keep(u, False)
+
+
+def test_probe_reasons(monkeypatch):
+    """«Online» = DNS und HTTPS mit gültigem Zertifikat; sonst dns, time (Uhr falsch) oder https."""
+    import socket
+    import ssl
+    from app import update_net as m
+    monkeypatch.setenv("FESTPOS_HOST_CHECKS", "1")
+
+    def no_dns(*a, **k):
+        raise socket.gaierror("kein DNS")
+    monkeypatch.setattr(socket, "getaddrinfo", no_dns)
+    assert m._probe() == "dns"
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [("x",)])
+
+    def refused(*a, **k):
+        raise ConnectionRefusedError()
+    monkeypatch.setattr(socket, "create_connection", refused)
+    assert m._probe() == "https"
+
+    class Raw:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def early(*a, **k):
+        raise ssl.SSLCertVerificationError(1, "certificate verify failed: certificate is not yet valid")
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: Raw())
+    monkeypatch.setattr(ssl.SSLContext, "wrap_socket", lambda self, raw, server_hostname=None: early())
+    assert m._probe() == "time"

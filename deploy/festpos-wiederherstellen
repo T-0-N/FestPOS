@@ -22,8 +22,11 @@ Aufträge:
   einrichtung, einrichtung_neustart
               Ersteinrichtung im Browser (T11), nur ohne festpos.conf: festpos.conf, node.conf und festpos-tls/
               schreiben (neu, aus einer Sicherung oder aus dem Kartenpaket), dann neu starten
+  ca_key_usb  Ersteinrichtung: den VERSCHLÜSSELTEN ca.key (PKCS#8, von der App mit dem Passwort verschlüsselt) samt
+              ca.crt auf den ersten USB-Stick schreiben (Ordner festpos-ca/) – nie unverschlüsselt
 Jede Datei wird geprüft, bevor etwas ersetzt wird.
 """
+import hashlib
 import io
 import json
 import os
@@ -40,7 +43,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True                         # nichts als root in /opt/festpos schreiben
 DEST = Path(os.environ.get("FESTPOS_DEST", "/opt/festpos"))
 sys.path.insert(0, os.environ.get("FESTPOS_RELEASE_LIB", str(DEST)))
-from app import backup, kartenboot  # noqa: E402  (gehört root wie dieses Programm)
+from app import backup, geheim, kartenboot, netz, usbstick  # noqa: E402  (gehört root wie dieses Programm)
 
 ANFRAGEN = Path(os.environ.get("FESTPOS_WH_DIR", "/run/festpos/wiederherstellen"))
 ERGEBNISSE = Path(os.environ.get("FESTPOS_WH_ERGEBNIS", "/run/festpos/wiederherstellen-ergebnis"))
@@ -49,6 +52,8 @@ BOOT = Path(_boot)
 ETC = Path(os.environ.get("FESTPOS_ETC", "/etc/festpos"))
 SICHERUNG = os.environ.get("FESTPOS_SICHERUNG_BIN", "/usr/local/sbin/festpos-sicherung")
 KARTE_BIN = os.environ.get("FESTPOS_KARTE_BIN", "/usr/local/sbin/festpos-karte")
+KRYPT_BIN = os.environ.get("FESTPOS_KRYPT_BIN", "/usr/local/sbin/festpos-krypt")
+NETZ_BIN = os.environ.get("FESTPOS_NETZ_BIN", "/usr/local/sbin/festpos-netz")
 TROCKEN = os.environ.get("FESTPOS_WH_TROCKEN") == "1"          # nur Tests: nicht neu starten, nicht chown
 NAME_RE = re.compile(r"auftrag-([0-9a-f]{16})\.json")
 MAX_JOB = 2 * 1024 * 1024
@@ -97,14 +102,34 @@ def schreibe(path: Path, data: bytes, mode: int = 0o644) -> None:
 
 
 def conf_text() -> str:
+    """festpos.conf, wie sie gilt – bei verschlüsselten Daten mit den Werten aus dem Container (T-0-N/FestPOS#3)."""
     try:
-        return (BOOT / "festpos.conf").read_text(encoding="utf-8", errors="surrogateescape")
+        return geheim.merged((BOOT / "festpos.conf").read_text(encoding="utf-8", errors="surrogateescape"))
     except OSError:
         raise Fehler("conf") from None
 
 
 def conf_schreiben(text: str) -> None:
+    """festpos.conf schreiben, dann (verschlüsselt) die Geheimnisse in den Container. Alle Aufrufer starten danach neu;
+    scheitert das Verschieben, erledigt es festpos-krypt beim Start – der Auftrag gilt trotzdem (nie halb: neue
+    festpos.conf ohne Neustart)."""
     schreibe(BOOT / "festpos.conf", text.encode("utf-8", errors="surrogateescape"))
+    try:
+        einziehen()
+    except Fehler:
+        print("festpos-wiederherstellen: Geheimnisse nicht verschoben – beim Neustart", file=sys.stderr)
+
+
+def einziehen() -> None:
+    """Daten verschlüsselt: geheime Werte und Schlüssel gleich wieder von der Boot-Partition in den Container."""
+    if not os.path.exists(KRYPT_BIN):
+        return
+    try:
+        r = subprocess.run([KRYPT_BIN, "--einziehen"], capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        raise Fehler("krypt") from None                    # festpos.conf ist geschrieben; verschoben wird beim Start
+    if r.returncode:
+        raise Fehler("krypt")
 
 
 def wirksames_geheimnis(text: str) -> str:
@@ -138,8 +163,9 @@ def einzelbetrieb(text: str) -> bool:
 
 
 # -- Prüfen ---------------------------------------------------------------------------------------------------------
-def pruefe_tls(files: dict[str, bytes]) -> None:
-    """Nur bekannte Namen, gültiges PEM, Schlüssel passt zum Zertifikat, Server-Zertifikat von der Server-CA."""
+def pruefe_tls(files: dict[str, bytes], net: str | None = None) -> None:
+    """Nur bekannte Namen, gültiges PEM, Schlüssel passt zum Zertifikat, Server-Zertifikat von der Server-CA – und
+    (net) die Server-CA gilt für dieses Netz (sonst: Sicherung/Karte aus einem anderen Netz, T-0-N/FestPOS#2)."""
     from cryptography import x509
     from cryptography.hazmat.primitives import serialization
     if not set(files) <= set(backup.TLS_FILES) or not {"ca.crt", "server.crt", "server.key"} <= set(files):
@@ -162,6 +188,9 @@ def pruefe_tls(files: dict[str, bytes]) -> None:
         raise Fehler("tls_issuer")
     if "device-ca.key" in keys and ("device-ca.crt" not in certs or pub(certs["device-ca.crt"]) != pub(keys["device-ca.key"])):
         raise Fehler("tls_pair")
+    from app import zertifikate
+    if zertifikate.other_net(files["ca.crt"], net):
+        raise Fehler("tls_net")
 
 
 # -- Aufträge -------------------------------------------------------------------------------------------------------
@@ -174,17 +203,16 @@ def auftrag_keys(job: dict) -> dict:
         update_keys = sorted(str(n) for n in (job.get("update_keys") or {}))
     except (AttributeError, UnicodeEncodeError):
         raise Fehler("job") from None
-    pruefe_tls(files)
+    pruefe_tls(files, str(netz.from_conf(text) or ""))
     conf = job.get("conf") or {}
     if not isinstance(conf, dict):
         raise Fehler("job")
     # festpos.conf fertig rechnen, BEVOR etwas ersetzt wird (ein Wert mit Zeilenumbruch wird abgewiesen)
-    secret, pw = str(conf.get("cluster_secret") or ""), str(conf.get("admin_password") or "")
+    secret = str(conf.get("cluster_secret") or "")
     try:
         if secret.strip() not in backup.PLACEHOLDER_SECRETS:
             text = backup.conf_set(text, "CLUSTER_SECRET", secret)
-        if pw.strip() not in {"", "admin", "bitte-aendern"}:
-            text = backup.conf_set(text, "ADMIN_PASSWORD", pw)
+        text = backup.conf_admin(text, conf)                   # Prüfwert (oder älterer Klartext)
     except ValueError:
         raise Fehler("conf_value") from None
     alt_behalten(time.strftime("%Y%m%d-%H%M%S"))
@@ -241,30 +269,33 @@ EINRICHTUNG_RUN = Path(os.environ.get("FESTPOS_EINRICHTUNG_RUN", "/run/festpos/e
 EINRICHTUNG_DATA = Path(os.environ.get("FESTPOS_EINRICHTUNG_DATA", "/var/lib/festpos/einrichtung"))
 CONF_EXAMPLE = DEST / "deploy" / "festpos.conf.example"
 IP_RE = re.compile(r"^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$")
-PREFIX_RE = re.compile(r"^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){2}$")
 TZ_RE = re.compile(r"^[A-Za-z0-9_/+-]{1,40}$")
-CONF_KEYS = ("CLUSTER_SIZE", "NET_PREFIX", "VIP", "NODE_A_IP", "NODE_B_IP", "NODE_C_IP", "TZ", "RTC_AKKU", "DHCP")
 
 
 def einrichtung_werte(v: dict) -> dict:
-    """Werte aus dem Browser prüfen -> Einträge für festpos.conf (und Buchstabe, Netz für die Zertifikate)."""
-    prefix = str(v.get("prefix") or "")
-    if not PREFIX_RE.match(prefix):
+    """Werte aus dem Browser prüfen -> Einträge für festpos.conf (und Buchstabe, Netz für die Zertifikate).
+    Netz mit Grösse frei wählbar (T-0-N/FestPOS#2, app/netz.py); ältere Form «prefix» = /24."""
+    net = str(v.get("net") or (f"{v.get('prefix')}.0/24" if v.get("prefix") else ""))
+    if not netz.parse(net):
         raise Fehler("prefix")
     ips = {k: str(v.get(k) or "") for k in ("vip", "a", "b", "c")}
-    if not all(IP_RE.match(x) and x.rsplit(".", 1)[0] == prefix for x in ips.values()) or len(set(ips.values())) != 4:
+    if not all(IP_RE.match(x) for x in ips.values()):
         raise Fehler("ips")
     size, node = str(v.get("cluster_size") or "1"), str(v.get("node") or "a").lower()
     if size not in ("1", "3") or node not in ("a", "b", "c") or (size == "1" and node != "a"):
         raise Fehler("node")
+    d = netz.defaults(net)
+    lo, hi = str(v.get("dhcp_from") or d["dhcp_from"]), str(v.get("dhcp_to") or d["dhcp_to"])
+    errs = netz.plan_errors(net, ips["vip"], ips["a"], ips["b"], ips["c"], lo, hi, int(size), v.get("dhcp") is not False)
+    if errs:
+        raise Fehler("ips" if errs[0].startswith("ip") else "prefix")
     tz = str(v.get("tz") or "Europe/Zurich")
     if not TZ_RE.match(tz) or not Path("/usr/share/zoneinfo", tz).exists() and not TROCKEN:
         raise Fehler("tz")
-    return {"node": node, "prefix": prefix, "ips": [ips["vip"], ips["a"], ips["b"], ips["c"]],
-            "conf": {"CLUSTER_SIZE": size, "NET_PREFIX": prefix, "NET_CIDR": "24", "VIP": ips["vip"],
-                     "NODE_A_IP": ips["a"], "NODE_B_IP": ips["b"], "NODE_C_IP": ips["c"], "TZ": tz,
-                     "RTC_AKKU": "1" if v.get("rtc_akku") else "0", "DHCP": "0" if v.get("dhcp") is False else "1",
-                     "SSH_FROM": f"{prefix}.200-{prefix}.254"}}
+    lines = netz.conf_lines(net, ips["vip"], ips["a"], ips["b"], ips["c"], lo, hi)
+    return {"node": node, "net": lines["NET"], "ips": [ips["vip"], ips["a"], ips["b"], ips["c"]],
+            "conf": {"CLUSTER_SIZE": size, **lines, "TZ": tz, "RTC_AKKU": "1" if v.get("rtc_akku") else "0",
+                     "DHCP": "0" if v.get("dhcp") is False else "1"}}
 
 
 def einrichtung_vorlage() -> str:
@@ -297,39 +328,44 @@ def auftrag_einrichtung(job: dict) -> dict:
             tls = {n: str(x).encode("latin-1") for n, x in (job.get("tls") or {}).items()}
         except (AttributeError, UnicodeEncodeError):
             raise Fehler("job") from None
-        pruefe_tls(tls)
+        pruefe_tls(tls, str(netz.from_conf(conf) or ""))
     else:
         w = einrichtung_werte(job.get("values") or {})
         node, conf = w["node"], einrichtung_vorlage()
         for k, x in w["conf"].items():
             conf = backup.conf_set(conf, k, x)
-        for k in ("admin_password", "cluster_secret"):       # aus der Sicherung: kein Zeilenumbruch in festpos.conf
+        for k in ("admin_password", "cluster_secret", "admin_password_hash", "admin_password_len"):   # kein Zeilenumbruch
             if any(ord(ch) < 32 or ord(ch) == 127 for ch in str(job.get(k) or "")):
                 raise Fehler("password")
         if mode == "neu":
             pw = str((job.get("values") or {}).get("admin_password") or "")
-            if len(pw) < 10 or len(pw) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in pw):
+            from app import emergency
+            if len(pw) < emergency.MIN_LEN or len(pw) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in pw):
                 raise Fehler("password")
             from app import zertifikate
             try:
-                made = zertifikate.make_all(w["prefix"], 24, w["ips"])
+                made = zertifikate.make_all(w["net"], w["ips"])
             except ValueError:
                 raise Fehler("ips") from None
             out["ca_key"] = made.pop("ca.key").decode()
             out["ca_crt"] = made["ca.crt"].decode()
             tls = made
-            conf = backup.conf_set(conf, "ADMIN_PASSWORD", pw)
-            conf = backup.conf_set(conf, "CLUSTER_SECRET", secrets.token_urlsafe(32))
+            secret = secrets.token_urlsafe(32)
+            from app import emergency                          # nie im Klartext auf die Karte (T-0-N/FestPOS#15)
+            conf = backup.conf_set(conf, "CLUSTER_SECRET", secret)
+            conf = backup.conf_admin(conf, {"admin_password_hash": emergency.make_hash(pw, secret),
+                                            "admin_password_len": str(len(pw))})
         elif mode == "sicherung":
             try:
                 tls = {n: str(x).encode("latin-1") for n, x in (job.get("tls") or {}).items()}
             except (AttributeError, UnicodeEncodeError):
                 raise Fehler("job") from None
-            pruefe_tls(tls)
+            pruefe_tls(tls, w["net"])                       # Sicherung aus einem anderen Netz: klare Meldung
             secret, pw = str(job.get("cluster_secret") or ""), str(job.get("admin_password") or "")
-            if not pw.strip() or pw in ("admin", "bitte-aendern"):
+            if not backup.HASH_RE.match(str(job.get("admin_password_hash") or "")) and \
+                    (not pw.strip() or pw in ("admin", "bitte-aendern")):
                 raise Fehler("password")
-            conf = backup.conf_set(conf, "ADMIN_PASSWORD", pw)
+            conf = backup.conf_admin(conf, job)
             if secret.strip() and secret.strip() not in backup.PLACEHOLDER_SECRETS:
                 conf = backup.conf_set(conf, "CLUSTER_SECRET", secret)
         else:
@@ -361,6 +397,180 @@ def auftrag_einrichtung_neustart(_job: dict) -> dict:
     return {"restart": True}
 
 
+CA_DIR = "festpos-ca"
+STICK_ORDNER = os.environ.get("FESTPOS_STICK_ORDNER", "")      # nur Tests: statt eines Sticks in diesen Ordner
+
+
+def alter_inhalt(p: Path, n: int) -> bytes | None:
+    """Inhalt einer Datei auf dem (fremden) Stick: nur eine gewöhnliche Datei, ohne Verknüpfung zu folgen und ohne auf
+    eine Pipe zu warten, höchstens n+1 Bytes. None: keine gewöhnliche Datei."""
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return os.read(fd, n + 1)
+    finally:
+        os.close(fd)
+
+
+def ca_auf_ordner(ziel: Path, key: bytes, crt: bytes) -> str:
+    """festpos-ca/ca.key und ca.crt in den Ordner; liegt dort schon ein anderer ca.key, mit Datum daneben."""
+    d = ziel / CA_DIR
+    if d.is_symlink() or (d.exists() and not d.is_dir()):
+        raise Fehler("stick_write")
+    d.mkdir(exist_ok=True)
+    name = "ca.key"
+    if os.path.lexists(d / name) and alter_inhalt(d / name, len(key)) != key:
+        name = f"ca-{time.strftime('%Y%m%d-%H%M%S')}.key"
+    for n, data in ((name, key), (name.replace(".key", ".crt"), crt)):
+        tmp = d / f".{n}.neu"
+        tmp.unlink(missing_ok=True)
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, d / n)
+    return f"{CA_DIR}/{name}"
+
+
+def auftrag_ca_key_usb(job: dict) -> dict:
+    """Ersteinrichtung: verschlüsselten ca.key auf den USB-Stick. Nur während der Ersteinrichtung, nur verschlüsselt."""
+    if not EINRICHTUNG_RUN.exists():
+        raise Fehler("not_setup")
+    key, crt = str(job.get("key") or ""), str(job.get("crt") or "")
+    if not key.startswith("-----BEGIN ENCRYPTED PRIVATE KEY-----") or "-----BEGIN PRIVATE KEY" in key or \
+            not crt.startswith("-----BEGIN CERTIFICATE-----") or len(key) > 8192 or len(crt) > 8192:
+        raise Fehler("job")
+    if STICK_ORDNER:
+        return {"device": "test", "path": ca_auf_ordner(Path(STICK_ORDNER), key.encode(), crt.encode())}
+    try:
+        with usbstick.first_stick() as (dev, mnt):
+            if not dev:
+                raise Fehler("no_stick")
+            try:
+                path = ca_auf_ordner(mnt, key.encode(), crt.encode())
+            except OSError:
+                raise Fehler("stick_write") from None
+    except (OSError, subprocess.SubprocessError):
+        raise Fehler("stick_write") from None
+    return {"device": dev, "path": path}
+
+
+ARCHIV_DIR = Path(os.environ.get("FESTPOS_ARCHIV_DIR", "/var/lib/festpos/archiv"))   # schreibt die App (saison.py)
+ARCHIV_STICK = "festpos-archiv"
+ARCHIV_RE = re.compile(r"^festpos-saison-[0-9-]{10}_[0-9-]{10}(-[0-9]{1,3})?\.festpos$")
+ARCHIV_MAX = 500 * 1024 * 1024
+
+
+def archiv_auf_ordner(ziel: Path, name: str, data: bytes) -> tuple[str, str]:
+    """Archiv in ziel/festpos-archiv/ schreiben (vorhandenes nie überschreiben) und zurücklesen -> (Pfad, SHA-256)."""
+    d = ziel / ARCHIV_STICK
+    if d.is_symlink() or (d.exists() and not d.is_dir()):   # nie über einen Verweis woandershin schreiben
+        raise Fehler("stick_write")
+    d.mkdir(exist_ok=True)
+    out, n = d / name, 1
+    while os.path.lexists(out):                                    # gleicher Name schon da: daneben, nichts überschreiben
+        out = d / name.replace(".festpos", f"-{n}.festpos")
+        n += 1
+    schreibe(out, data)
+    with open(out, "rb") as f:                               # zurücklesen: so steht es wirklich auf dem Stick
+        sha = hashlib.sha256(f.read()).hexdigest()
+    return f"{ARCHIV_STICK}/{out.name}", sha
+
+
+def auftrag_archiv_usb(job: dict) -> dict:
+    """Saison abschliessen (T-0-N/FestPOS#12): verschlüsseltes Archiv aus dem Ordner der App auf den USB-Stick."""
+    name = str(job.get("name") or "")
+    if not ARCHIV_RE.match(name):
+        raise Fehler("job")
+    try:
+        fd = os.open(ARCHIV_DIR / name, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise Fehler("job") from None
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_size > ARCHIV_MAX:
+            raise Fehler("job")
+        data = f.read()
+    if not data.startswith(backup.MAGIC):                      # nur verschlüsselte Dateien von FestPOS
+        raise Fehler("job")
+    if STICK_ORDNER:
+        path, sha = archiv_auf_ordner(Path(STICK_ORDNER), name, data)
+        return {"device": "test", "path": path, "sha": sha}
+    try:
+        with usbstick.first_stick() as (dev, mnt):
+            if not dev:
+                raise Fehler("no_stick")
+            try:
+                path, sha = archiv_auf_ordner(mnt, name, data)
+            except OSError:
+                raise Fehler("stick_write") from None
+    except (OSError, subprocess.SubprocessError):
+        raise Fehler("stick_write") from None
+    return {"device": dev, "path": path, "sha": sha}
+
+
+OS_UPDATE_BIN = os.environ.get("FESTPOS_OS_UPDATE_BIN", "/usr/local/sbin/festpos-os-update")
+
+
+def auftrag_os_online(_job: dict) -> dict:
+    """Sicherheitsupdates des Betriebssystems mit Internet (T-0-N/FestPOS#5): festpos-os-update --online."""
+    try:
+        r = subprocess.run([OS_UPDATE_BIN, "--online"], capture_output=True, text=True, timeout=3600)
+    except (OSError, subprocess.TimeoutExpired):
+        raise Fehler("os_update") from None
+    if r.returncode:
+        raise Fehler("os_update")
+    return {}
+
+
+def krypt(arg: str, job: dict | None = None, timeout: float = 600, binary: str = "") -> dict:
+    """festpos-krypt (Daten verschlüsselt, T-0-N/FestPOS#3) oder festpos-netz (Netz umziehen, #2) aufrufen -> seine
+    Antwort (JSON, letzte Zeile)."""
+    try:
+        r = subprocess.run([binary or KRYPT_BIN, arg], input=json.dumps(job or {}), capture_output=True, text=True,
+                           timeout=timeout)
+        res = json.loads((r.stdout.strip().splitlines() or ["null"])[-1])
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise Fehler("krypt") from None
+    if not isinstance(res, dict) or not res.get("ok"):
+        raise Fehler(str((res or {}).get("code") or "krypt") if isinstance(res, dict) else "krypt")
+    return res
+
+
+def auftrag_krypt_umstellen(job: dict) -> dict:
+    """Daten verschlüsseln: beim nächsten Start (bevor FestPOS läuft), darum gleich neu starten."""
+    krypt("--umstellen", {"recovery": str(job.get("recovery") or "")})
+    return {"restart": True}
+
+
+def auftrag_krypt_bestaetigen(_job: dict) -> dict:
+    krypt("--bestaetigen")
+    return {}
+
+
+NETZ_JOB = ("id", "at", "deadline", "until", "old", "new", "ca_crt", "server_crt")
+
+
+def auftrag_netz_vorbereiten(job: dict) -> dict:
+    """Netz umziehen (T-0-N/FestPOS#2): neue Dateien bereitlegen, Umstellen planen (festpos-netz)."""
+    krypt("--vorbereiten", {k: job.get(k) for k in NETZ_JOB}, 120, NETZ_BIN)
+    return {}
+
+
+def auftrag_netz_bestaetigt(job: dict) -> dict:
+    krypt("--bestaetigt", {"id": job.get("id")}, 60, NETZ_BIN)
+    return {}
+
+
+def auftrag_netz_zurueck(_job: dict) -> dict:
+    krypt("--zurueck", None, 120, NETZ_BIN)                # startet selbst neu, wenn schon umgestellt
+    return {}
+
+
 def karte(arg: str, job: dict | None = None, timeout: float = 60) -> dict:
     """festpos-karte aufrufen (T10: SD-Karte im USB-Kartenleser schreiben) -> seine Antwort (JSON)."""
     try:
@@ -389,7 +599,10 @@ def auftrag_karte_abbrechen(_job: dict) -> dict:
 AUFTRAEGE = {"keys": auftrag_keys, "kartenpaket": auftrag_kartenpaket, "cluster3": auftrag_cluster3,
              "apk": auftrag_apk, "karten": auftrag_karten, "karte_schreiben": auftrag_karte_schreiben,
              "karte_abbrechen": auftrag_karte_abbrechen, "einrichtung": auftrag_einrichtung,
-             "einrichtung_neustart": auftrag_einrichtung_neustart}
+             "einrichtung_neustart": auftrag_einrichtung_neustart, "ca_key_usb": auftrag_ca_key_usb, "archiv_usb": auftrag_archiv_usb,
+             "os_online": auftrag_os_online, "krypt_umstellen": auftrag_krypt_umstellen,
+             "krypt_bestaetigen": auftrag_krypt_bestaetigen, "netz_vorbereiten": auftrag_netz_vorbereiten,
+             "netz_bestaetigt": auftrag_netz_bestaetigt, "netz_zurueck": auftrag_netz_zurueck}
 
 
 def melde(job_id: str, res: dict) -> None:

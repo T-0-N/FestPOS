@@ -85,7 +85,14 @@ def test_monitor_list_keeps_mac_and_ignores_a_forged_one(client):
      ["dhcp-range=192.168.55.163,192.168.55.175,255.255.255.0,2m"]),
     (("192.168.55", "24", "eth0", "150-189", "192.168.55.10", "", "c", "3"), True,
      ["dhcp-range=192.168.55.176,192.168.55.189,255.255.255.0,2m"]),
-    (("10.0", "16", "wlan0", "10-20", "10.0.0.1", "", "a", "1"), True, ["dhcp-range=10.0.10,10.0.20,255.255.0.0,2m"]),
+    (("10.0.0.0/16", "wlan0", "10-20", "10.0.0.1", "", "a", "1"), True, ["dhcp-range=10.0.0.10,10.0.0.20,255.255.0.0,2m"]),
+    # Netz frei wählbar (T-0-N/FestPOS#2): ganze Adressen, /22 und /26
+    (("10.20.0.0/22", "eth0", "10.20.1.1-10.20.3.200", "10.20.0.10", "", "b", "3"), True,
+     ["dhcp-range=10.20.1.238,10.20.2.218,255.255.252.0,2m"]),
+    (("172.16.5.0/26", "eth0", "32-62", "172.16.5.10", "", "a", "1"), True,
+     ["dhcp-range=172.16.5.32,172.16.5.62,255.255.255.192,2m"]),
+    (("172.16.5.0/26", "eth0", "32-63", "172.16.5.10", "", "a", "1"), False, []),         # Broadcast
+    (("10.20.0.0/22", "eth0", "10.20.4.1-10.20.4.9", "10.20.0.10", "", "a", "1"), False, []),   # ausserhalb
     (("192.168.55", "24", "eth0", "150-189", "auto:192.168.55.10", "", "a", "1"), True,    # Gateway folgt dem Internet
      ["dhcp-optsdir=/var/lib/festpos/dhcp-opts", "dhcp-hostsdir=/var/lib/festpos/dhcp"]),
     (("192.168.55", "24", "eth0", "150-189", "auto:kein-gateway", "", "a", "1"), False, []),
@@ -100,7 +107,7 @@ def test_dnsmasq_conf(args, ok, want):
     assert (r.returncode == 0) == ok, r.stderr
     for line in want:
         assert line in r.stdout.splitlines(), (line, r.stdout)
-    if args[4].startswith("auto:") and ok:
+    if args[-4].startswith("auto:") and ok:
         assert "option:router" not in r.stdout                                  # kommt aus der Datei der App
 
 

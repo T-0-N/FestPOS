@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from . import auth, certs, device_ids, i18n, ledger_base as lb, qr, timesync
+from . import auth, certs, device_ids, i18n, ledger_base as lb, netz, qr, timesync
 from .core import APP_VERSION, Config, Throttle, admin, current_user, db, log, rt
 
 router = APIRouter()
@@ -497,7 +497,7 @@ async def issue_device_cert(c: CertIn, request: Request):
     if c.role and c.role != "service":
         await db(rt.store.batch, set_role(r["device_id"], c.role))
     await db(lb.audit, rt.store, _actor(request), "device_cert", name=name, expires_at=r["expires_at"], renew=bool(dev))
-    host = (request.headers.get("host") or "192.168.55.10").split(":")[0]
+    host = (request.headers.get("host") or netz.vip()).split(":")[0]
     port = f":{Config.admin_port}" if Config.admin_port and Config.admin_port != 443 else ""
     url = f"https://{host}{port}/api/device-cert/{r['token']}"
     return {"password": r["password"], "url": url, "svg": qr.qr_svg(url), "filename": r["filename"],

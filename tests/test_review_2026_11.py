@@ -42,6 +42,8 @@ def test_basic_auth_refuses_writes_from_other_sites(client):
     assert client.post("/api/admin/users", auth=AUTH, json={**body, "name": "Urs"}).status_code == 200
     # die Verwaltung arbeitet mit dem Sitzungs-Token: das schickt keine fremde Seite mit
     tok = client.post("/api/admin/login", json={"name": "admin", "password": AUTH[1]}).json()["token"]
+    tok = client.post("/api/admin/me/confirm", json={"password": AUTH[1]},            # kritisch: bestätigt (#9)
+                      headers={"Authorization": f"Bearer {tok}"}).json()["token"]
     assert client.post("/api/admin/users", json={**body, "name": "Kai"},
                        headers={"Authorization": f"Bearer {tok}", "Sec-Fetch-Site": "cross-site"}).status_code == 200
 
@@ -331,12 +333,14 @@ def test_phone_cannot_overwrite_a_confirmed_card_payment(client):
     assert r.status_code == 422
 
 
-def test_cancelled_guest_order_keeps_its_follow_up_window(client):
+def test_cancelled_guest_order_keeps_its_follow_up_window(client, monkeypatch):
     """Aufräumen zählt bei abgebrochenen Online-Bestellungen ab dem Abbruch, nicht ab dem Anlegen: sonst fiele die
     Nachkontrolle (2 Stunden) weg, wenn ein Pi lange aus war und eine alte Bestellung erst jetzt abbricht."""
     import time
 
     from app import core, gast as g
+    monkeypatch.setattr(g, "tick", lambda: None)      # der Monitor im Hintergrund räumt hier nicht selbst auf
+    g._cleaned[0] = time.time()                       # ... und ein schon laufender Takt nicht ein zweites Mal
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     for key, cancelled_at in (("key-eben-ab01", now), ("key-lang-ab01", "2020-01-02T10:00:00"), ("key-ohne-ab01", None)):
         core.rt.store.execute("INSERT INTO gast_orders(token, key, table_label, lines, amount_cents, status, created_at, "

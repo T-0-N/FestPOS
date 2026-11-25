@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import backup, i18n, release
+from . import backup, i18n, netz, release
 
 STATIC = Path(os.environ.get("FESTPOS_STATIC", Path(__file__).resolve().parent.parent / "static"))
 CODE_FILE = Path(os.environ.get("FESTPOS_EINRICHTUNG_CODE", "/var/lib/festpos/einrichtung/code"))
@@ -39,8 +39,8 @@ MAX_FAILS, LOCK_S = 10, 300
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
        "font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; "
        "frame-ancestors 'none'")
-DEFAULTS = {"prefix": "192.168.55", "vip": "192.168.55.10", "a": "192.168.55.11", "b": "192.168.55.12",
-            "c": "192.168.55.13", "dhcp": True, "cluster_size": 1, "node": "a", "rtc_akku": False, "tz": "Europe/Zurich"}
+DEFAULTS = {**netz.defaults(), "dhcp": True, "cluster_size": 1, "node": "a", "rtc_akku": False,   # Netz frei (#2)
+            "tz": "Europe/Zurich"}
 
 app = FastAPI(title="FestPOS Ersteinrichtung", docs_url=None, redoc_url=None, openapi_url=None)
 S = {"fails": 0, "locked_until": 0.0, "tokens": set(), "ca_key": None, "ca_crt": None, "done": None}
@@ -160,6 +160,8 @@ async def _job(kind: str, payload: dict, timeout: float = 90.0) -> dict:
     res = await asyncio.to_thread(_wait, job, timeout)
     if not res or not res.get("ok"):
         code = (res or {}).get("code") or "timeout"
+        if code == "tls_net":                              # Sicherung/Karte aus einem anderen Netz (#2)
+            raise HTTPException(409, t("err.setup.tls_net"))
         raise HTTPException(409 if code == "configured" else 502, t("err.setup.failed", code=code))
     return res
 
@@ -203,7 +205,9 @@ async def health():
 @app.get("/api/einrichtung")
 async def info():
     langs = [{"code": c, "name": (i18n.catalog(c).get("_meta") or {}).get("name") or c} for c in sorted(i18n._files())]
+    from . import emergency
     return {"setup": True, "ips": await asyncio.to_thread(_ips), "host": socket.gethostname(), "defaults": DEFAULTS,
+            "pw_min": emergency.MIN_LEN,
             "langs": langs, "server_time": time.time(), "done": S["done"], "locked": S["locked_until"] > time.time()}
 
 
@@ -230,7 +234,10 @@ async def code(c: CodeIn):
 
 
 class Values(BaseModel):
-    prefix: str = Field(max_length=15)
+    net: str = Field("", max_length=18)                 # Netz mit Grösse, z.B. 10.20.0.0/22 (T-0-N/FestPOS#2)
+    prefix: str = Field("", max_length=15)              # ältere Form: die ersten drei Zahlen (/24)
+    dhcp_from: str = Field("", max_length=15)
+    dhcp_to: str = Field("", max_length=15)
     vip: str = Field(max_length=15)
     a: str = Field(max_length=15)
     b: str = Field(max_length=15)
@@ -246,10 +253,36 @@ class NewIn(BaseModel):
     token: str = Field(max_length=80)
     lang: str = Field("", max_length=12)
     time_ms: int | None = None
-    admin_password: str = Field(min_length=10, max_length=128)
+    admin_password: str = Field(max_length=128)          # mindestens emergency.MIN_LEN (16), prüft new()
     values: Values
     # eigener Update-Schlüssel (Inhalt von festpos-update.pub), zusätzlich zum Projekt-Schlüssel aus dem Image
     update_key: str | None = Field(None, max_length=4096)
+
+
+NET_ERRORS = {"net": "err.setup.net_net", "size": "err.setup.net_size", "ip_bad": "err.setup.net_ip_bad",
+              "ip_outside": "err.setup.net_ip_outside", "ip_twice": "err.setup.net_ip_twice",
+              "dhcp_bad": "err.setup.net_dhcp_bad", "dhcp_outside": "err.setup.net_dhcp_outside",
+              "dhcp_small": "err.setup.net_dhcp_small", "dhcp_overlap": "err.setup.net_dhcp_overlap",
+              "overlap_printer": "err.setup.net_overlap_printer", "overlap_setup": "err.setup.net_overlap_setup",
+              "overlap_other": "err.setup.net_overlap_other"}
+
+
+def net_values(v: dict) -> dict:
+    """Netz prüfen und vervollständigen (ältere Form mit prefix: /24; ohne DHCP-Bereich: Vorschlag). 422 mit klarer
+    Meldung, wenn etwas nicht passt."""
+    v = dict(v)
+    if not v.get("net") and v.get("prefix"):
+        v["net"] = f"{v['prefix']}.0/24"
+    v["net"] = str(v.get("net") or netz.DEFAULT).strip()
+    if not v.get("dhcp_from") or not v.get("dhcp_to"):
+        d = netz.defaults(v["net"])
+        v["dhcp_from"], v["dhcp_to"] = d["dhcp_from"], d["dhcp_to"]
+    errs = netz.plan_errors(v["net"], v.get("vip", ""), v.get("a", ""), v.get("b", ""), v.get("c", ""),
+                            v["dhcp_from"], v["dhcp_to"], int(v.get("cluster_size") or 1), v.get("dhcp") is not False)
+    if errs:
+        raise HTTPException(422, t(NET_ERRORS[errs[0]], net=v["net"], printer=netz.PRINTER_NET, setup=netz.SETUP_IP,
+                                   min=netz.MIN_CIDR, max=netz.MAX_CIDR))
+    return v
 
 
 @app.post("/api/einrichtung/neu")
@@ -257,7 +290,10 @@ async def new(n: NewIn):
     _check_token(n.token)
     if configured():
         raise HTTPException(409, t("err.setup.failed", code="configured"))
-    vals = {**n.values.model_dump(), "admin_password": n.admin_password}
+    from . import emergency
+    if len(n.admin_password) < emergency.MIN_LEN:                        # Notfall-Passwort (T-0-N/FestPOS#15)
+        raise HTTPException(422, t("err.setup.admin_pw_short", min=emergency.MIN_LEN))
+    vals = {**net_values(n.values.model_dump()), "admin_password": n.admin_password}
     keys = {}
     if n.update_key and n.update_key.strip():
         try:
@@ -274,14 +310,54 @@ async def new(n: NewIn):
     return {"ok": True, "node": res.get("node"), "ca_key": bool(S["ca_key"])}
 
 
-@app.get("/api/einrichtung/ca.key")
-async def ca_key(token: str):
-    """Schlüssel der Server-CA – nur bis zum Neustart, er kommt nicht auf die Karte."""
-    _check_token(token)
+# Schlüssel der Server-CA (ca.key): nur bis zum Neustart im Arbeitsspeicher, er kommt nicht auf die Karte. Heraus
+# geht er nur verschlüsselt (PKCS#8 mit Passwort, liest OpenSSL: make-certs.sh fragt danach) – als Download oder
+# direkt auf einen USB-Stick am Pi. Wer ihn hat, kann für das FestPOS-Netz Serverzertifikate ausstellen; im
+# Download-Ordner oder in einer Cloud-Sicherung des Handys soll er darum nie im Klartext liegen.
+CA_PW_MIN, CA_PW_MAX = 12, 128
+
+
+class CaKeyIn(BaseModel):
+    token: str = Field(max_length=80)
+    password: str = Field(max_length=CA_PW_MAX)
+
+
+def encrypt_ca_key(pem: str, password: str) -> bytes:
+    """ca.key mit Passwort verschlüsselt (PKCS#8, PBES2: AES-256-CBC, PBKDF2-SHA256 mit 600 000 Runden)."""
+    from . import zertifikate
+    return zertifikate.encrypt_key_pem(pem.encode(), password)
+
+
+def _ca_key_encrypted(c: CaKeyIn) -> bytes:
+    _check_token(c.token)
     if not S["ca_key"]:
         raise HTTPException(404)
-    return Response(S["ca_key"], media_type="application/x-pem-file",
-                    headers={"Content-Disposition": 'attachment; filename="festpos-ca.key"'})
+    pw = c.password
+    if len(pw) < CA_PW_MIN or any(ord(ch) < 32 or ord(ch) == 127 for ch in pw):
+        raise HTTPException(422, t("err.setup.ca_pw", min=CA_PW_MIN))
+    return encrypt_ca_key(S["ca_key"], pw)
+
+
+@app.post("/api/einrichtung/ca.key")
+async def ca_key(c: CaKeyIn):
+    """ca.key verschlüsselt herunterladen."""
+    data = await asyncio.to_thread(_ca_key_encrypted, c)
+    return Response(data, media_type="application/x-pem-file",
+                    headers={"Content-Disposition": 'attachment; filename="ca.key"', "Cache-Control": "no-store"})
+
+
+@app.post("/api/einrichtung/ca.key/usb")
+async def ca_key_usb(c: CaKeyIn):
+    """ca.key verschlüsselt (und ca.crt) auf den ersten USB-Stick am Pi schreiben (Ordner festpos-ca)."""
+    data = await asyncio.to_thread(_ca_key_encrypted, c)
+    job = await asyncio.to_thread(_submit, "ca_key_usb", {"key": data.decode(), "crt": S["ca_crt"] or ""})
+    res = await asyncio.to_thread(_wait, job, 60.0)
+    if not res or not res.get("ok"):
+        code = (res or {}).get("code") or "timeout"
+        if code == "no_stick":
+            raise HTTPException(409, t("err.setup.no_stick"))
+        raise HTTPException(502, t("err.setup.stick_failed", code=code))
+    return {"ok": True, "device": res.get("device"), "path": res.get("path")}
 
 
 def _open_backup(data: bytes, password: str) -> dict[str, bytes]:
@@ -310,6 +386,7 @@ async def from_backup(token: str = Form(...), password: str = Form(...), values:
         vals = Values(**json.loads(values)).model_dump()
     except (ValueError, TypeError):
         raise HTTPException(422, t("err.setup.values")) from None
+    vals = net_values(vals)
     tls = {k[4:]: v.decode("latin-1") for k, v in content.items() if k.startswith("tls/")}
     keys = {k[12:]: v.decode("latin-1") for k, v in content.items() if k.startswith("update-keys/")}
     if not {"ca.crt", "server.crt", "server.key"} <= set(tls):
@@ -318,6 +395,8 @@ async def from_backup(token: str = Form(...), password: str = Form(...), values:
     S["ca_crt"] = tls["ca.crt"].encode("latin-1")
     res = await _job("einrichtung", {"mode": "sicherung", "values": vals, "tls": tls, "update_keys": keys,
                                      "admin_password": conf.get("admin_password") or "",
+                                     "admin_password_hash": conf.get("admin_password_hash") or "",
+                                     "admin_password_len": str(conf.get("admin_password_len") or ""),
                                      "cluster_secret": conf.get("cluster_secret") or "", "time_ms": time_ms or None,
                                      "lang": lang})
     S["done"] = {"mode": "sicherung", "node": res.get("node"), "vip": vals["vip"], "at": time.time()}

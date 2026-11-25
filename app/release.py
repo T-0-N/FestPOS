@@ -13,7 +13,15 @@ anderer Pi, USB-Stick). Ein gestohlenes Admin-Passwort genügt also nicht, um ei
 Benutzt von der App (Vorprüfung beim Hochladen, für eine schnelle Rückmeldung) und vom root-Helfer festpos-update
 (die eigentliche Prüfung vor dem Einspielen). Darum nur Standardbibliothek und cryptography.
 
-Format der Signatur: OpenSSH «SSHSIG» (PROTOCOL.sshsig), nur Ed25519, Hash sha512 oder sha256.
+Format der Signatur: OpenSSH «SSHSIG» (PROTOCOL.sshsig), nur Ed25519, Hash sha512 oder sha256. Die .sig-Datei darf
+mehrere Signaturen hintereinander enthalten (Schlüsselwechsel: mit dem alten und dem neuen Schlüssel signiert) –
+gültig ist das Paket, wenn eine davon mit einem vertrauenswürdigen Schlüssel stimmt.
+
+Schlüssel zurückziehen und ersetzen (T-0-N/FestPOS#13): Auf der Boot-Partition stehen in
+festpos-update-zurueckgezogen.txt die Fingerabdrücke zurückgezogener Schlüssel – diese gelten nie mehr, auch nicht
+für ein Paket vom USB-Stick. Ein Paket kann in deploy/update-keys/ neue öffentliche Schlüssel (*.pub) und
+zurueckgezogen.txt mitbringen; festpos-update übernimmt beides erst, nachdem das Paket (mit einem vertrauenswürdigen
+Schlüssel signiert) erfolgreich eingespielt ist. Ablauf: SECURITY.md.
 """
 from __future__ import annotations
 
@@ -30,9 +38,12 @@ from pathlib import Path
 
 NAMESPACE = "festpos-update"               # ssh-keygen -n …: eine Signatur für etwas anderes gilt hier nicht
 KEY_GLOB = "festpos-update*.pub"           # auf der Boot-Partition (mehrere Schlüssel möglich: Wechsel)
+REVOKED_FILE = "festpos-update-zurueckgezogen.txt"      # Boot-Partition: zurückgezogene Fingerabdrücke
+PACKAGE_KEYS = "deploy/update-keys"                    # im Paket: neue Schlüssel (*.pub) und zurueckgezogen.txt
+FP_RE = re.compile(r"^SHA256:[A-Za-z0-9+/]{43}$")
 MB = 1024 * 1024
-MAX_ZIP = 200 * MB                         # heute ~45 MB (mit den Python-Paketen und rqlite)
-MAX_UNPACKED = 400 * MB
+MAX_ZIP = 600 * MB                         # ~45 MB, mit Updates des Betriebssystems (#5) bis einige 100 MB
+MAX_UNPACKED = 1000 * MB                   # .deb sind schon gepackt: entpackt etwa so gross wie das Paket
 MAX_FILES = 5000
 MAX_SIG = 8 * 1024
 MAX_KEYFILE = 64 * 1024
@@ -126,10 +137,54 @@ def parse_keys(text: str, file: str = "") -> tuple[list[Key], list[str]]:
     return keys, problems
 
 
+def parse_revoked(text: str) -> set[str]:
+    """Fingerabdrücke («SHA256:…», wie ssh-keygen -l) aus einer Liste – pro Zeile einer, danach ein Kommentar."""
+    out = set()
+    for line in text.splitlines():
+        word = (line.split() or [""])[0]
+        if FP_RE.match(word):
+            out.add(word)
+    return out
+
+
+def parse_revoked_strict(text: str) -> set[str]:
+    """Wie parse_revoked, aber jede Zeile ausser leeren und Kommentaren muss ein Fingerabdruck sein (Liste aus einem
+    Paket: ein Tippfehler darf einen Rückzug nicht still übergehen) -> ReleaseError."""
+    out = set()
+    for line in text.splitlines():
+        word = (line.split() or [""])[0]
+        if not word or word.startswith("#"):
+            continue
+        if not FP_RE.match(word):
+            raise ReleaseError("revoked_bad")
+        out.add(word)
+    return out
+
+
+REVOKED_ALL = "*"                       # Liste nicht lesbar: alle zurückgezogen (sicher)
+
+
+def load_revoked(directory: str | Path, strict: bool = False) -> set[str]:
+    """Zurückgezogene Fingerabdrücke. Fehlt die Datei: keine. Ist sie da, aber nicht lesbar (zu gross, Verknüpfung,
+    Lesefehler): strict -> OSError, sonst REVOKED_ALL – dann gilt kein Schlüssel (nie ein zurückgezogener wieder)."""
+    p = Path(directory) / REVOKED_FILE
+    try:
+        return parse_revoked(read_regular(p, MAX_KEYFILE).decode("utf-8", "replace"))
+    except FileNotFoundError:
+        return set()
+    except (OSError, ReleaseError) as e:
+        if strict:
+            raise OSError(f"{REVOKED_FILE} nicht lesbar: {e}") from None
+        return {REVOKED_ALL}
+
+
 def load_keys(directory: str | Path) -> tuple[list[Key], list[str]]:
-    """Alle festpos-update*.pub eines Ordners (die Boot-Partition). Doppelte zählen einmal."""
+    """Alle festpos-update*.pub eines Ordners (die Boot-Partition), ohne zurückgezogene. Doppelte zählen einmal."""
     keys: list[Key] = []
     problems: list[str] = []
+    revoked = load_revoked(directory)
+    if REVOKED_ALL in revoked:
+        return [], [f"{REVOKED_FILE}: nicht lesbar – bis das behoben ist, gilt kein Update-Schlüssel"]
     for p in sorted(Path(directory).glob(KEY_GLOB)):
         try:
             data = read_regular(p, MAX_KEYFILE)
@@ -138,7 +193,11 @@ def load_keys(directory: str | Path) -> tuple[list[Key], list[str]]:
             continue
         found, bad = parse_keys(data.decode("utf-8", "replace"), p.name)
         problems += bad
-        keys += [k for k in found if k.blob not in {x.blob for x in keys}]
+        for k in found:
+            if k.fp in revoked:
+                problems.append(f"{p.name}: Schlüssel {k.fp} ist zurückgezogen – gilt nicht mehr")
+            elif k.blob not in {x.blob for x in keys}:
+                keys.append(k)
     return keys, problems
 
 
@@ -208,8 +267,42 @@ def signed_data(namespace: str, reserved: bytes, alg: str, digest: bytes) -> byt
     return b"SSHSIG" + _put(namespace.encode()) + _put(reserved) + _put(alg.encode()) + _put(digest)
 
 
+def split_signatures(data: bytes) -> list[bytes]:
+    """Eine .sig-Datei mit einer oder mehreren Signaturen (Schlüsselwechsel) -> die einzelnen Blöcke."""
+    if len(data) > MAX_SIG:
+        raise ReleaseError("sig_format")
+    try:
+        text = data.decode("ascii").replace("\r\n", "\n")
+    except UnicodeDecodeError as e:
+        raise ReleaseError("sig_format") from e
+    blocks, cur = [], None
+    for line in text.split("\n"):
+        if line.strip() == _ARMOR_BEGIN:
+            cur = [line.strip()]
+        elif cur is not None:
+            cur.append(line.strip())
+            if line.strip() == _ARMOR_END:
+                blocks.append("\n".join(cur).encode())
+                cur = None
+    if not blocks or len(blocks) > 4:
+        raise ReleaseError("sig_format")
+    return blocks
+
+
 def verify(path: str | Path, sig_data: bytes, keys: list[Key], namespace: str = NAMESPACE) -> Key:
-    """Prüft die Signatur der Datei. -> der Schlüssel, der unterschrieben hat. Sonst ReleaseError."""
+    """Prüft die Signatur(en) der Datei. -> der Schlüssel, der unterschrieben hat (der erste vertrauenswürdige).
+    Sonst ReleaseError – bei mehreren Signaturen der Fehler der ersten."""
+    blocks = split_signatures(sig_data)
+    first: ReleaseError | None = None
+    for b in blocks:
+        try:
+            return _verify_one(path, b, keys, namespace)
+        except ReleaseError as e:
+            first = first or e
+    raise first or ReleaseError("sig_format")
+
+
+def _verify_one(path: str | Path, sig_data: bytes, keys: list[Key], namespace: str) -> Key:
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     s = parse_signature(sig_data)

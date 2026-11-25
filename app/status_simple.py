@@ -26,6 +26,7 @@ MAX_ORDERS = 8
 _SVC = {"rqlited": "status.svc.rqlited", "festpos-redirect": "status.svc.redirect", "chrony": "status.svc.chrony",
         "nftables": "status.svc.nftables", "keepalived": "status.svc.keepalived"}
 _WARN = {"admin_pw_placeholder": "status.warn.admin_pw", "admin_pw_short": "status.warn.admin_pw",
+         "admin_pw_short_locked": "status.warn.admin_pw",
          "backup_none": "status.warn.backup_none", "backup_old": "status.warn.backup_old",
          "backup_failed": "status.warn.backup_failed"}
 _WARN_BAD = {"admin_pw_placeholder", "backup_failed"}

@@ -35,6 +35,9 @@
 /var/lib/festpos-sicherung/status.json
 /var/lib/festpos/update/*
 /var/lib/festpos-update/*
+/var/lib/festpos-ereignisse/*         # Sicherheitsereignisse (Journal-Stand, Prüfsummen der Boot-Partition)
+/var/lib/festpos-netz/*               # laufender Netz-Umzug dieses Pi (#2)
+/var/lib/festpos-krypt/*              # verschlüsselte Daten dieses Pi (#3) – die neue Karte verschlüsselt sich selbst
 
 # Pro Gerät: entsteht beim ersten Start neu (systemd, festpos-node)
 /etc/machine-id                       # leere Datei: systemd erzeugt eine neue

@@ -38,14 +38,14 @@ _cf: dict = {"next": 0.0}                         # nächster Versuch für cloud
 def wanted() -> str | None:
     """Token aus der Verwaltung (None: keiner oder nicht mehr lesbar, z.B. CLUSTER_SECRET geändert)."""
     enc = rt.store.setting(SETTING, "") or ""
-    tok = px.unseal(enc) if enc else None
+    tok = px.unseal(enc, SETTING) if enc else None
     return tok if tok and tunnel_token.parse(tok) else None
 
 
 def configured() -> dict:
     """Für die Verwaltung: Token gesetzt, lesbar und die Tunnel-ID (gekürzt) – nie der Token selbst."""
     enc = rt.store.setting(SETTING, "") or ""
-    tok = px.unseal(enc) if enc else None
+    tok = px.unseal(enc, SETTING) if enc else None
     info = tunnel_token.parse(tok) if tok else None
     return {"set": bool(enc), "ok": info is not None, "id": info["tunnel"][:8] if info else None}
 
@@ -54,7 +54,7 @@ def seal(token: str) -> str:
     """Neuer Token aus der Verwaltung -> verschlüsselt (ValueError, wenn er nicht wie ein Token von Cloudflare aussieht)."""
     if not tunnel_token.parse(token):
         raise ValueError("tunnel_bad")
-    return px.seal(token.strip())
+    return px.seal(token.strip(), SETTING)
 
 
 def _applied() -> str:

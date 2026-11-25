@@ -6,6 +6,8 @@ import { renderDisplay } from "./settings.js";
 import { loadTime, piClock, setTimeChanged, timeActions } from "./clock.js";
 import { startExpand } from "./expand.js";
 import { startCardWrite } from "./cardwrite.js";
+import { bindKrypt, kryptCard } from "./krypt.js";
+import { bindUmzug, umzugCard } from "./umzug.js";
 
 // ------------------------------------------------------------------ System: Pi und Handys herunterfahren / neu starten
 let SYSTEM = null;
@@ -38,11 +40,36 @@ function clockCell(id) {
   return `<span class="nowrap">${c.time} <span class="status ${c.bad ? "bad" : "ok"}">${c.diff}</span></span>
     <div class="hint${c.startBad ? " err" : ""}">${c.start}${c.since !== "–" ? ` · ${c.since}` : ""}</div>`;
 }
+// Start nur von der SD-Karte, Bluetooth aus, keine Anmeldung an der Konsole (festpos-haertung bei Start und Update).
+// boot: ok | pending (wirkt nach dem Neustart) | open | failed | no_tool/unreadable (nicht prüfbar, z.B. kein Pi 5)
+export const hardenOpen = (n) => {
+  const h = n.info?.harden;
+  return !!h && n.reachable && ["open", "pending", "failed"].includes(h.boot);   // Bluetooth/Konsole: nur in der Zeile
+};
+const BOOT_TXT = { ok: ["ok", "admin.harden.boot_ok"], pending: ["pending", "admin.harden.boot_pending"],
+  open: ["pending", "admin.harden.boot_open"], failed: ["bad", "admin.harden.boot_failed"],
+  no_tool: ["", "admin.harden.boot_unknown"], unreadable: ["", "admin.harden.boot_unknown"] };
+function hardenRows(h, row) {
+  if (!h) return "";
+  const [cls, key] = BOOT_TXT[h.boot] || BOOT_TXT.unreadable;
+  const st = (c, k) => `<span class="status ${c}">${th(k)}</span>`;
+  return row("admin.harden.start", st(cls, key))
+    + row("admin.harden.bt", st(h.bt_off ? "ok" : "pending", h.bt_off ? "admin.harden.bt_off" : "admin.harden.bt_on"))
+    + row("admin.harden.console", st(h.console_off ? "ok" : "pending", h.console_off ? "admin.harden.console_off" : "admin.harden.console_on"));
+}
+function hardenBox(n, many) {
+  if (!hardenOpen(n)) return "";
+  const h = n.info.harden, restart = h.boot === "pending";
+  return `<div class="warnbox" id="harden-box"><p>${th(h.boot === "failed" ? "admin.harden.box_failed" : "admin.harden.box", { pi: piName(n.id) })}</p>
+    ${restart && can("system") ? `<div class="form"><button class="btn" data-power="reboot" data-node="${esc(many ? n.id : "all")}">${th("admin.harden.restart", { pi: piName(n.id) })}</button></div>` : ""}
+    <p class="hint">${th("admin.harden.undo")}</p></div>`;
+}
 function roleCell(n) {
   if (!n.reachable) return `<span class="status bad">${th("admin.system.unreachable")}</span>`;
   const down = svcDown(n);
   return `${th(n.leader ? "admin.overview.leader" : "admin.overview.standby")}${down.length
-    ? `<div><span class="status bad">${esc(t("admin.system.svc_down", { list: down.join(", "), count: down.length }))}</span></div>` : ""}`;
+    ? `<div><span class="status bad">${esc(t("admin.system.svc_down", { list: down.join(", "), count: down.length }))}</span></div>` : ""}${
+    hardenOpen(n) ? `<div><span class="status pending">${th("admin.harden.badge")}</span></div>` : ""}`;
 }
 function systemCard(system, cluster, disp) {
   const nodes = system?.nodes || [];
@@ -69,6 +96,8 @@ function systemCard(system, cluster, disp) {
       ${lead ? `<th>${th("admin.time.c_time")}</th>` : ""}<th class="num col-s">${th("admin.system.temp")}</th>
       ${adm ? `<th class="col-s">${th("admin.system.screen")}</th>` : ""}<th class="col-s">${th("admin.system.version")}</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table></div>
+      ${nodes.some(hardenOpen) ? `<div class="warnbox" id="harden-list"><p>${th("admin.harden.list",
+        { pis: nodes.filter(hardenOpen).map((n) => piName(n.id)).join(", "), count: nodes.filter(hardenOpen).length })}</p></div>` : ""}
       <p class="hint">${th("admin.system.tap_pi")}</p>` : ""}
     ${cluster?.mode === "rqlite" ? `<p class="hint">${th(nodes.length === 1 ? "admin.overview.single" : nodes.filter((n) => n.reachable).length >= 2 ? "admin.overview.redundant" : "admin.overview.no_quorum")}
       ${th("admin.overview.served_by", { node: String(cluster.this_node).toUpperCase() })}</p>` : `<p class="hint">${th("admin.overview.local_db")}</p>`}
@@ -101,7 +130,8 @@ function piPage(n, system) {
         ${row("admin.system.disk", esc(of(i.disk_free, i.disk_total)))}${row("admin.system.ram", esc(of(i.ram_free, i.ram_total)))}
         ${row("admin.system.services", svcCell(n))}
         ${c ? row("admin.time.c_time", `${c.time} <span class="status ${c.bad ? "bad" : "ok"}">${c.diff}</span> · ${c.start} · ${c.zone}`) : ""}
-        ${c ? row("admin.time.c_battery", c.battery) : ""}${row("admin.system.backup", bak ? esc(bak) : null)}</dl></div></div>
+        ${c ? row("admin.time.c_battery", c.battery) : ""}${row("admin.system.backup", bak ? esc(bak) : null)}
+        ${hardenRows(i.harden, row)}</dl></div>${hardenBox(n, many)}</div>
     ${adm ? `<div class="card" id="dispcard"><h3>${th("admin.display.title_one")}</h3>
       <div id="disp-body" class="hint">${th("admin.common.loading")}</div></div>` : ""}
     ${lead ? `<div class="card"><h3>${th("admin.system.power_title")}</h3><div class="form">
@@ -215,9 +245,10 @@ function certsCard(sys) {
 }
 RENDER.system = async () => {
   const adm = can("admin");
-  const [system, cluster, , certs, disp] = await Promise.all([api("GET", "/system").catch(() => null),
+  const [system, cluster, , certs, disp, umzug] = await Promise.all([api("GET", "/system").catch(() => null),
     guard(() => api("GET", "/cluster")), loadTime(),
-    adm ? api("GET", "/system/certs").catch(() => null) : null, adm ? api("GET", "/display").catch(() => null) : null]);
+    adm ? api("GET", "/system/certs").catch(() => null) : null, adm ? api("GET", "/display").catch(() => null) : null,
+    adm ? api("GET", "/umzug").catch(() => null) : null]);
   SYSTEM = system;
   if (view !== "system") return;                       // inzwischen andere Seite (REV-048)
   setTimeChanged(() => { if (view === "system") RENDER.system(); });
@@ -230,8 +261,13 @@ RENDER.system = async () => {
   }
   OPEN_PI = null;
   $("#main").innerHTML = `${pageHead()}
+    ${adm && ["prepared", "switching", "back_requested"].includes(umzug?.move?.phase) ? umzugCard(umzug) : ""}
     ${systemCard(system, cluster, disp)}
+    ${adm ? kryptCard(system) : ""}
+    ${adm && !["prepared", "switching", "back_requested"].includes(umzug?.move?.phase) ? umzugCard(umzug) : ""}
     ${certsCard(certs)}`;
+  bindKrypt(() => { if (view === "system") RENDER.system(); });
+  bindUmzug();
   $("#x-open")?.addEventListener("click", (e) => startExpand(!!e.currentTarget.dataset.single, cluster?.this_node));
   $("#c-open")?.addEventListener("click", () => startCardWrite());
   const open = (tr) => { OPEN_PI = tr.dataset.pi; RENDER.system(); scrollTo(0, 0); };

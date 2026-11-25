@@ -3,7 +3,7 @@
    den Namen. Gleichnamige gültige Geräte (Altbestand) sind als «Name doppelt» markiert.
    Liste: Rolle und «Im Einsatz» direkt; alles andere in der Geräteansicht («Bearbeiten»). Ab Festleitung;
    entsperren und löschen nur Admin, die Einstellungen für alle stehen im Reiter «Einstellungen» (settings.js). */
-import { $, $$, api, can, esc, flash, fmtDate, fmtTime, guard, toast } from "./core.js";
+import { $, $$, api, can, esc, flash, fmtDate, fmtTime, guard, NET, netEx, netKnown, toast } from "./core.js";
 import { inDays, pageHead, RENDER, view } from "./shell.js";
 import { apkVersion, FULLY, fullyCa, fullyCert, fullyCheck, fullyCmd, fullyDeviceCert, fullyRestart, fullySettings,
   fullyState, fullyUpdate, fullyWebUrl, fullyWhitelist, pushApk, setFully, webState, webWarn } from "./fully.js";
@@ -179,10 +179,18 @@ function drawList() {
     startAdd({ names, ips, nextName: t("admin.devices.next_name", { n }), nextIp: nextIp(ips) });
   });
 }
-// nächste freie Adresse ab .101 (wie die Vorlage in der Anleitung)
+// nächste freie Adresse ab .101 im FestPOS-Netz (wie die Vorlage in der Anleitung; Netz frei wählbar, #2) – nie im
+// DHCP-Bereich (NET.dhcp), den vergibt der Pi selbst
 function nextIp(ips) {
-  for (let i = 101; i < 250; i++) if (!ips.has(`192.168.55.${i}`)) return `192.168.55.${i}`;
-  return "";
+  if (!netKnown()) return "";                                         // Netz nicht geladen: von Hand eingeben
+  const num = (a) => String(a || "").split(".").reduce((s, x) => s * 256 + +x, 0);
+  const [addr, bits] = NET.net.split("/"), base = num(addr), lo = num(NET.dhcp?.from), hi = num(NET.dhcp?.to);
+  const size = 2 ** (32 - +bits), ip = (n) => [24, 16, 8, 0].map((s) => Math.floor(n / 2 ** s) % 256).join(".");
+  for (let i = Math.min(101, size / 2); i < Math.min(250, size - 1); i++) {
+    const n = base + i;
+    if (!(lo && n >= lo && n <= hi) && !ips.has(ip(n)) && ip(n) !== NET.vip) return ip(n);   // auch nie die VIP
+  }
+  return "";                                                          // nichts frei: Adresse von Hand eingeben
 }
 async function onListChange(e) {
   const role = e.target.closest("[data-role]");
@@ -217,7 +225,7 @@ function drawDetail(x) {
     <form class="card" id="dev-data"><h3>${th("admin.devices.data_title")}</h3>
       <div class="form">
         <label>${th("admin.devices.name")}<input name="name" maxlength="30" value="${esc(x.cert ? x.name : x.phone?.name || x.name)}" ${x.cert && !valid ? "readonly" : ""} style="width:200px"></label>
-        <label>${th("admin.devices.fixed_ip")}<input name="ip" maxlength="63" inputmode="decimal" value="${esc(x.phone?.ip || "")}" placeholder="192.168.55.101" style="width:170px"></label>
+        <label>${th("admin.devices.fixed_ip")}<input name="ip" maxlength="63" inputmode="decimal" value="${esc(x.phone?.ip || "")}" placeholder="${esc(netEx("phone"))}" style="width:170px"></label>
         <button class="btn pri">${th("admin.common.save")}</button></div>
       <p class="hint">${th(!x.cert ? "admin.devices.data_hint" : valid ? "admin.devices.name_rename_hint" : "admin.devices.name_in_cert")}</p>
       ${quick(x)}

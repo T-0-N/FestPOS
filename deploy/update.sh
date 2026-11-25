@@ -147,7 +147,7 @@ if [ -z "$R" ]; then
   BOOTDIR=/boot/firmware; [ -d "$BOOTDIR" ] || BOOTDIR=/boot
   festpos_fstab_private /etc/fstab "$BOOTDIR" && echo "==> Boot-Partition: ab jetzt nur für root lesbar (fstab)"
   festpos_boot_private_now "$BOOTDIR" || echo "HINWEIS: Boot-Partition ist erst nach dem nächsten Neustart nur für root lesbar"
-  festpos_wifi_prepare "$BOOTDIR" && echo "==> WLAN: nicht mehr ganz abgeschaltet, Funk bleibt aus (für «Update aus dem Internet», ab Neustart)"
+  festpos_wifi_prepare "$BOOTDIR" && echo "==> WLAN: vorhanden (Land CH), Funk nur bei Bedarf an (für «Update aus dem Internet», ab Neustart)"
 fi
 
 echo "==> Konfiguration prüfen (wird beim nächsten Neustart angewendet)"
@@ -196,6 +196,13 @@ echo "OK: Server läuft mit Version $NEW. Handys laden die neue App selbst (soba
 echo "    Zurück zur vorherigen Version: sudo bash $DEST/deploy/update.sh --zurueck"
 if [ -z "$R" ] && [ -x "$SBIN/festpos-update" ]; then
   "$SBIN/festpos-update" --schluessel || true      # Updates über die Verwaltung/USB: Schlüssel da?
+fi
+# 6. Sicherheitsupdates des Betriebssystems aus dem Paket (T-0-N/FestPOS#5), ohne Internet. FestPOS läuft schon mit
+#    der neuen Version; ein Fehler hier ändert daran nichts (festpos-os-update repariert apt selbst).
+if [ -d "$SRC/os-updates" ] && [ -x "$SBIN/festpos-os-update" ]; then
+  echo "==> Betriebssystem: Sicherheitsupdates aus dem Paket"
+  "$SBIN/festpos-os-update" --paket "$SRC/os-updates" ||
+    echo "WARNUNG: Updates des Betriebssystems nicht vollständig – Stand unter Wartung › Update. FestPOS läuft."
 fi
 [ -n "$NODE_GEAENDERT" ] && echo "HINWEIS: festpos-node (Netz, Firewall, Start) hat sich geändert – wirkt ab dem nächsten Neustart." \
   "Nicht eilig; im Cluster die Pi einzeln neu starten, den druckenden zuletzt."

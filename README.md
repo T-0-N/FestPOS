@@ -88,7 +88,7 @@ Sicherheitslücken melden: [SECURITY.md](SECURITY.md) · Lizenz: GPLv3 ([LICENSE
   Baustein. Hier auch Drucker, Kopf und Fusszeile der Quittung
 - **Quittung für den Gast** (wahlweise): ganze Bestellung oder pro Person (Einzeln), fortlaufende Nummer, Inhalt
   festgehalten und mit Prüfsumme gesichert, Kopien als KOPIE gekennzeichnet und protokolliert, im Tagesabschluss;
-  MWST nur wenn eingeschaltet (MWST-Nummer, Satz pro Position, MWST pro Satz), über CHF 400 mit Empfänger
+  MWST nur wenn eingeschaltet (MWST-Nummer, Satz pro Position, MWST pro Satz), über CHF 400 mit Name und Ort des Gastes
 - **Kopf** auf allen Seiten: rechts Status-Punkt für Server und Drucker mit Logo (bei Problemen der Hinweis statt
   des Logos, orange/rot; Festleitung auch gelb «Papier fast leer») und Verlauf; Platzwahl links ☰ und Name (Einstellungen); offline mit wartender Bestellung
   alle 2 s neu senden und (Fully) WLAN neu verbinden
@@ -354,9 +354,12 @@ app/
   dhcp.py           DHCP für die Handhelds: feste Zuteilungen (MAC -> IP) für dnsmasq, MAC aus der ARP-Tabelle
   mac_change.py     Neue MAC bei bekanntem Zertifikat: feste IP umschreiben, Alarm bei zwei Geräten (T4)
   rawhttp.py        kleiner HTTPS-Baustein für Fully und Router (Fingerabdruck statt Zertifizierungsstelle)
-  release.py        Update-Pakete: Signatur (OpenSSH «SSHSIG», Ed25519), Versionen, ZIP sicher prüfen/entpacken
+  release.py        Update-Pakete: Signatur (OpenSSH «SSHSIG», Ed25519, auch mehrere in einer .sig), Versionen, ZIP
+                    sicher prüfen/entpacken; zurückgezogene Schlüssel (festpos-update-zurueckgezogen.txt)
   update.py         Verwaltung › Update, Plan im Cluster (wer ist dran, Sperre, Mehrheit), Nachziehen, USB-Stick
-  update_net.py     Update aus dem Internet: GitHub-Release suchen/herunterladen, Internet kurz ein (festpos-update)
+  update_net.py     Update aus dem Internet: GitHub-Release suchen/herunterladen, Internet kurz ein (festpos-update);
+                    «dauerhaft verbunden»: Verbindung nach einem Neustart übernehmen, Prüfung DNS + HTTPS mit Grund,
+                    neu verbinden erst nach 3 Fehlversuchen mit wachsender Pause
   status.py         Statusanzeige (ein Aufruf mit allem)
   status_simple.py  Einfache Statusanzeige als fertiges HTML für alte Browser (/status-einfach, iOS 9; ?teil=1 nur Inhalt)
   ledger.py (T45)   Korrekturen früherer Tage (Tabelle corrections): Rückerstattung einer schon abgeschlossenen
@@ -385,8 +388,32 @@ app/
   main.py           FastAPI: Start, Middleware, Kellner-API (Bootstrap, Bestellungen), Anmeldung, Health für keepalived
   setup_mode.py     Ersteinrichtung im Browser (nur ohne festpos.conf, festpos-einrichtung.service, https 443
                     mit vorläufigem Zertifikat über setup_serve.py, Port 80 leitet um):
-                    Einrichtungscode, neu / Sicherung / Kartenpaket, schreibt über festpos-wiederherstellen (T11)
-  zertifikate.py    Server-CA (mit Namensbeschränkung), Geräte-CA und Server-Zertifikat wie make-certs.sh
+                    Einrichtungscode, neu / Sicherung / Kartenpaket, schreibt über festpos-wiederherstellen (T11);
+                    ca.key nur verschlüsselt (Download oder USB-Stick am Pi)
+  zertifikate.py    Server-CA (mit Namensbeschränkung), Geräte-CA und Server-Zertifikat wie make-certs.sh;
+                    privaten Schlüssel mit Passwort verschlüsseln (PKCS#8, PBES2, 600 000 Runden)
+  usbstick.py       USB-Stick finden und kurz einbinden (root-Helfer, z.B. ca.key auf den Stick)
+  emergency.py      Notfall-Passwort als Prüfwert (festpos.conf ADMIN_PASSWORD_HASH, Salz aus CLUSTER_SECRET),
+                    Umwandeln beim Start (festpos-node), Mindestlänge 16, nur aus dem FestPOS-Netz
+  saison.py         Saison abschliessen: verschlüsseltes Archiv (Abschlüsse, Quittungen, PDF), bestätigen (USB-Stick
+                    oder wieder hochladen), danach Quittungen samt Gastdaten löschen
+  geheim.py         Daten verschlüsselt: geheime Werte aus festpos.conf («im-container») und Schlüssel im Container,
+                    Wiederherstellungs-Schlüssel (Format), gemeinsam für festpos-krypt, festpos-node und Kartenpaket
+  krypt.py          Daten verschlüsselt in der Verwaltung: Stand pro Pi, Umstellen, Schlüssel sichern (an den eigenen
+                    Helfer oder den betroffenen Pi über /api/internal/krypt)
+  umzug.py          Netz umziehen im Betrieb: Plan und Prüfung, neue CA, Ablauf pro Pi (Monitor), Adressen in der
+                    Datenbank umrechnen und zurück, Bestätigen nur über die neue Adresse, Handhelds über Fully
+  netz.py           FestPOS-Netz: Prüfung und Vorschläge bei der Ersteinrichtung, Beispieladressen für die Verwaltung
+  ausgehend.py      Firewall ins Internet: erlaubte Ziele (eine Liste) und nft-Regeln pro Modus (root und App)
+  firewall.py       Modus der Firewall in der Verwaltung, Wunsch an festpos-firewall, Stand pro Pi
+  ereignisse.py     Sicherheitsereignisse sammeln (root-Teil: Journal, Neustart, Prüfsummen der Boot-Partition)
+  sicherheit.py     Sicherheitsereignisse ins Protokoll (alle 10 s), Anmeldesperre, Übersicht bis «Gesehen»
+  totp.py           Codes der Authenticator-App (TOTP, RFC 6238) und Wiederherstellungs-Codes
+  twofa.py          Zweiter Faktor der Verwaltung (Einrichten, Anmeldung in zwei Schritten, Pflicht pro Rolle) und
+                    kritische Aktionen bestätigen (Passwort und Code, 5 Minuten, im Token)
+  secretbox.py      Geheimnisse der Einstellungen verschlüsselt (AES-GCM, Schlüssel pro Zweck aus CLUSTER_SECRET);
+                    Store.setting entschlüsselt selbst, Klartext älterer Versionen wird umgeschrieben, sobald alle Pi
+                    die neue Version haben
   gast.py           QR-Bestellung am Tisch (T22): signierte Tische, Speisekarte, Zahlung bei Payrexx, Bestellung erst
                     nach Bestätigung, automatische Rückerstattung, Storno erstattet zurück, Verwaltung, QR-PDF;
                     Rückerstattungen als Aufträge (gast_refunds, T37): im Batch des Stornos, Timeout = «unklar»,
@@ -422,18 +449,36 @@ deploy/
   festpos-rqlited   startet die Datenbank: Daten da -> normal, leer -> gründen (nur Einzelbetrieb) oder beitreten
   festpos-notfall   status | einzelbetrieb | neu-beitreten | gruenden
   festpos-redirect  http:// -> https://
-  make-certs.sh     eigene CA (mit Namensbeschränkung, ca.key ausserhalb des Projekts) + Serverzertifikat
+  make-certs.sh     eigene CA (mit Namensbeschränkung, ca.key verschlüsselt ausserhalb des Projekts) + Serverzertifikat
   festpos-zertifikate  neue Zertifikate auf einem Pi prüfen und einspielen
   festpos-settime   root-Helfer: Uhrzeit nach Auftrag der App setzen, auch ins RTC (über festpos-settime.path, kein sudo)
   festpos-haertung  root-Helfer (T23, bei jedem Start und Update): SSH nur mit Schlüssel, Schlüssel von der
-                    Boot-Partition (festpos-ssh.pub), sudo nur mit Passwort; «--stand» zeigt den Zustand
+                    Boot-Partition (festpos-ssh.pub), sudo nur mit Passwort; Bootloader nur von der SD-Karte
+                    (EEPROM BOOT_ORDER=0xf1), Bluetooth aus, keine Anmeldung an der Konsole; «--stand» zeigt den
+                    Zustand, /run/festpos-haertung.json für die Verwaltung (Geräte & Netz › Pi)
+  festpos-firewall  root-Helfer (festpos-firewall.timer jede Minute, festpos-firewall.path bei Änderung): Firewall
+                    ins Internet nach dem Modus der Verwaltung (Tabelle inet festpos_out), Namen alle 10 min neu
+                    auflösen, Zähler und verworfene Ziele nach /run/festpos/firewall-stand/stand.json
+  festpos-os-update root-Helfer: Sicherheitsupdates des Betriebssystems aus dem Update-Paket einspielen (update.sh,
+                    ohne Internet), mit Internet nur aus den Sicherheitsquellen (--online), unterbrochenes apt beim
+                    Start reparieren (festpos-node); Stand in /var/lib/festpos-os/stand.json
+  festpos-krypt     root-Helfer: Daten verschlüsselt (festpos-krypt.service beim Start vor festpos-node, rqlite und
+                    FestPOS): Container /var/lib/festpos-krypt/daten.luks öffnen und nach /var/lib/festpos einhängen,
+                    Schlüssel aus dem Chip (rpi-otp-private-key), neuen Pi verschlüsseln, Umstellen mit Rückfall
+                    (festpos-krypt-pruefen.service), Geheimnisse von der Boot-Partition in den Container; Stand in
+                    /run/festpos-krypt/stand.json
+  festpos-netz      root-Helfer: Netz umziehen – neue festpos.conf und Zertifikate bereitlegen, zur gemeinsamen Zeit
+                    umstellen (rqlite raft/peers.json, Neustart), ohne Bestätigung zurück (festpos-netz.timer)
+  festpos-ereignisse root-Helfer (festpos-ereignisse.timer, alle 20 s): SSH-Anmeldung und sudo aus dem Journal,
+                    Neustart, geänderte Boot-Partition -> /var/lib/festpos-ereignisse/ereignisse.json (app/ereignisse.py)
   festpos-handy-usb root-Helfer: Handheld mit USB-Debugging am Pi -> Pi als Zeitserver des Handhelds (adb, udev-Regel)
   festpos-dhcp-reload.py  root-Helfer: geänderte feste DHCP-Zuteilungen und das Gateway der Handhelds übernehmen (über festpos-dhcp-reload.path)
   festpos-druckernetz.py  root-Helfer: VLAN-Schnittstelle der Drucker anlegen/löschen (nmcli; bei jedem Start und über
                     festpos-druckernetz.path)
   festpos-display   root-Helfer: Bildschirm-Treiber und Statusanzeige nach der Verwaltung einrichten
   festpos-update    root-Helfer: signierte Updates prüfen und einspielen (Aufträge der App, USB-Stick, Ordner),
-                    Internet kurz ein/aus für «Update aus dem Internet» (--netz-aus)
+                    Internet kurz ein/aus für «Update aus dem Internet» (--netz-aus); Internet-Aufträge über einen
+                    eigenen Dienst (festpos-update-netz.path, --anfrage-netz), Stand in update-status/internet.json
   festpos-usb.rules udev: USB-Stick eingesteckt -> festpos-usb@<gerät>.service -> festpos-update --usb
   festpos-sicherung root-Helfer: alle 15 min (festpos-sicherung.timer) verschlüsselt auf einen USB-Stick mit dem
                     Ordner «festpos-sicherung» sichern, die letzten 20 behalten, Fully-APK einmal daneben
@@ -467,9 +512,11 @@ tools/              check.sh (alle Prüfungen wie die CI), i18n_check.py (Sprach
                     rqlite für den Pi holen und prüfen), build_zip.py (Update-Paket),
                     schreibzugriffe.py (Raft-Einträge im Leerlauf/Betrieb zählen, echter 3er-Cluster, T9),
                     sd-messung.py (auf dem Pi: wer schreibt wie viel auf die SD-Karte, liest nur),
-                    release_notes.py (Release-Text aus CHANGELOG.md)
+                    release_notes.py (Release-Text aus CHANGELOG.md),
+                    sbom.py (Paketliste CycloneDX für festpos.zip und das Image)
 .github/workflows/  ci.yml: ruff, shellcheck, JS-Syntax, Sprachdateien, pytest mit echtem rqlite und Chromium;
-                    release.yml (Tag vX.Y.Z: prüfen, Update-Paket, Image, App, Release-Entwurf); image.yml
+                    release.yml (Tag vX.Y.Z: prüfen, Update-Paket, Image, App, SBOM, Herkunftsnachweis,
+                    Release-Entwurf); image.yml
                     (SD-Karten-Image, T12), android.yml (Begleit-App festpos-tap.apk, T13)
 android/festpos-tap/  Begleit-App «FestPOS Tap» (T13, Java, ohne Bibliotheken): startet die Payrexx-App über deren
                     App-zu-App-Schnittstelle und meldet das Ergebnis an den Pi (POST /api/tap/result)
@@ -554,7 +601,7 @@ android/festpos-tap/  Begleit-App «FestPOS Tap» (T13, Java, ohne Bibliotheken)
 | POST | `/api/admin/system/power` | `{action: reboot\|poweroff, node: all\|a\|b\|c, phones: none\|restart_app\|reboot\|shutdown\|screen_off}` |
 | GET/POST/PUT/DELETE | `/api/admin/users`, `/users/{id}` | Benutzer anlegen, Rolle/aktiv/Passwort ändern, löschen (nur Admin); `GET` mit allen Rollen und Rechten; der letzte aktive Admin bleibt (422) |
 | POST/PUT/DELETE | `/api/admin/roles`, `/roles/{id}` | Eigene Rolle `{name, perms}` anlegen, ändern, löschen (nur Admin; feste Rollen 422, Rolle mit Benutzern 409) – gespeichert in der Einstellung `user_roles` |
-| GET/POST | `/api/admin/me`, `/me/password`, `/me/logout-all` | Eigener Name und Rolle, eigenes Passwort ändern, überall abmelden |
+| GET/POST | `/api/admin/me`, `/me/password`, `/me/logout-all`, `/me/refresh` | Eigener Name und Rolle, eigenes Passwort ändern, überall abmelden, Sitzung nach Bedienung verlängern |
 | GET | `/api/admin/lamp` | Ampel der Seitenleiste (jede Rolle): `{level: ok\|wait\|bad, bad: [...], wait: [...]}`, Einträge `{key, name}` bzw. `{key, pi}` (Schlüssel `status.*` aus der Sprachdatei) |
 | GET | `/api/logo` | Öffentlich: `{logo: "/media/…" oder null, logo_plate}` (auch in `/api/bootstrap` und `/api/status`) |
 | GET | `/api/nav` | Öffentlich: `{phone, phone_port}` – für die Links zwischen Bestell-App, Verwaltung und Statusanzeige |
@@ -597,7 +644,10 @@ android/festpos-tap/  Begleit-App «FestPOS Tap» (T13, Java, ohne Bibliotheken)
 | POST/DELETE | `/api/admin/logo` | Logo hochladen (Datei, wird verkleinert) / entfernen – nur Admin |
 
 Anmeldung der Verwaltung: `POST /api/admin/login` mit `{"name": …, "password": …}` liefert ein Sitzungs-Token
-(12 Stunden) mit Name und Rolle, danach `Authorization: Bearer <token>`. Name leer oder `admin` = Notfall-Login mit
+(höchstens 12 Stunden) mit Name und Rolle, danach `Authorization: Bearer <token>`. Ohne Bedienung endet die Sitzung
+nach `admin_idle_minutes` (Einstellung, 10–120, Standard 30; Antwort: `idle_in` Sekunden); `POST /api/admin/me/refresh`
+gibt nach Bedienung ein neues Token mit neuer Frist und gleichem Ablauf. Rolle Anzeige ohne diese Frist (Statusanzeige).
+Eine abgelaufene Frist zählt nicht als Fehlversuch. Name leer oder `admin` = Notfall-Login mit
 dem Passwort aus festpos.conf (gesperrt, solange dort der Platzhalter steht). `POST /api/admin/me/logout-all` beendet
 alle Sitzungen des eigenen Kontos. Fehlversuche zählen pro Adresse und Name: eine richtige Anmeldung löscht nur die
 eigenen; nach 30 Fehlversuchen für einen Namen (alle Adressen zusammen, 5 Minuten) geht dieser Name nur noch von
@@ -607,6 +657,65 @@ schreibende Anfrage mit Basic Auth, die ein Browser von einer fremden Seite aus 
 wird abgewiesen (CSRF). `GET /api/admin/settings` (jede Rolle) gibt nie ein Geheimnis zurück (`backup.SECRET_KEYS`).
 Welche Rechte ein Pfad braucht, steht an einer Stelle in `app/auth.py` (nicht aufgeführte Pfade: nur Admin);
 `/api/admin/me` und die Anmeldung liefern dazu `perms` und den Namen einer eigenen Rolle.
+
+**Zweiter Faktor und kritische Aktionen** (`app/twofa.py`, `app/totp.py`): Hat ein Benutzer einen zweiten Faktor
+(TOTP, RFC 6238, 6 Ziffern, 30 s, ±1 Schritt, jeder Code einmal), antwortet `POST /api/admin/login` mit
+`{"second_step": true, "pending": …}` statt eines Tokens; `POST /api/admin/login/totp` `{pending, code}` (Code aus der
+App oder Wiederherstellungs-Code; `pending` gilt 5 Minuten, danach 409) liefert das Token. Einrichten:
+`POST /api/admin/me/totp/start` (QR als SVG, Schlüssel), `/me/totp/confirm` `{code}` (gibt 10
+Wiederherstellungs-Codes zurück, gespeichert nur als HMAC), `/me/totp/later` (Pflicht: dreimal), `/me/totp/off` und
+`/me/totp/codes` `{password, code}`; `GET /api/admin/me` enthält `totp` (`on`, `required`, `later`, `blocked`, `codes`,
+`role_required`). Pflicht pro Rolle: Einstellung `totp_required_roles` (JSON-Liste, Standard `["admin"]`); ist die
+Pflicht offen und kein «Später» mehr übrig, antwortet jede andere Anfrage 403 `{"code": "totp_setup"}`. Das Geheimnis
+liegt verschlüsselt in `users.totp` (secretbox). Ein Admin setzt es mit `PUT /api/admin/users/{id}` `{"totp_reset": true}`
+zurück. Kritische Aktionen (`auth.CRITICAL`, Einstellungen `auth.CRITICAL_SETTINGS`) brauchen ein bestätigtes Token:
+ohne antwortet der Server 428 `{"code": "confirm_needed"}`; `POST /api/admin/me/confirm` `{password, code}` gibt ein
+neues Token, das 5 Minuten als bestätigt gilt (im signierten Token, auf allen Pi gleich, bleibt beim Verlängern).
+Basic Auth gilt als bestätigt, ausser der Benutzer hat einen zweiten Faktor – dann nur lesen.
+
+**Sicherheitsereignisse** (`app/sicherheit.py`, ab Recht «Protokoll»): `GET /api/admin/security` – Ereignisse seit dem
+letzten «Gesehen» (`count`, `events`, `last`); `POST /api/admin/security/seen?upto=<id>` blendet sie für alle aus.
+Im Protokoll stehen sie als `sec_ssh`, `sec_sudo`, `sec_sudo_failed`, `sec_reboot`, `sec_boot_changed`,
+`sec_update_foreign`, `sec_lockout` (dazu `emergency_login`); `GET /api/admin/audit?sec=true` zeigt nur diese.
+
+**Saison abschliessen** (`app/saison.py`, nur Admin): `GET /api/admin/season` (offene Abschlüsse, Archiv in Arbeit,
+letzte Saison, Erinnerung), `POST /api/admin/season/archive` `{password}`, `GET /api/admin/season/archive` (Download),
+`POST /api/admin/season/usb` (Stick, zurückgelesen), `POST /api/admin/season/verify` (Datei und Passwort: prüfen,
+bestätigt bei gleicher SHA-256), `POST /api/admin/season/close` `{sha}` (kritisch: löscht die Quittungen der
+archivierten Abschlüsse), `DELETE /api/admin/season/archive`. Am PC: `tools/archiv.py`.
+
+**Betriebssystem** (T-0-N/FestPOS#5): Beim Release holt `tools/os_updates.py` in einer leeren apt-Umgebung (arm64,
+nur Debian bookworm, bookworm-updates, bookworm-security und Raspberry Pi, signed-by) die Updates für die Pakete aus
+`deploy/os-pakete.txt` (Paketliste des Images, `festpos-pakete.txt` vom Image-Bau; `release.cmd` übernimmt sie nach jedem Release) und `build_zip.py --os-updates`
+legt sie als `os-updates/` ins Paket. Ohne `deploy/os-pakete.txt` entsteht das Paket wie bisher. Stand pro Pi:
+`/api/admin/system` › `info.osup` (Datum, Ergebnis, Kernel, Neustart nötig); `POST /api/admin/os/online` (kritisch)
+holt die Sicherheitsupdates mit Internet.
+
+**Netz** (T-0-N/FestPOS#2, `app/netz.py`): `festpos.conf` hat `NET=Adresse/Grösse` (z.B. `10.20.0.0/22`, bei der
+Ersteinrichtung /16 bis /27); ältere Dateien mit `NET_PREFIX`/`NET_CIDR` gehen weiter (`festpos_net_from_conf` in
+`deploy/festpos-conf.sh`). Firewall, DHCP (`DHCP_POOL` mit ganzen Adressen oder Abstand zur Netzadresse), chrony,
+`make-certs.sh` und die Zertifizierungsstelle rechnen mit `NET`. `GET /api/admin/netinfo` gibt Netz, VIP und
+Beispieladressen für die Verwaltung (statt fester 192.168.55.x).
+
+**Netz umziehen** (T-0-N/FestPOS#2, `app/umzug.py`, nur Admin): `GET /api/admin/umzug` (Zustand, Stand pro Pi),
+`POST /api/admin/umzug/pruefen` `{net, vip, a, b, c, dhcp_from, dhcp_to}` (Fehler, Hindernisse, Checkliste),
+`POST /api/admin/umzug/start` (kritisch), `POST /api/admin/umzug/bestaetigen` (kritisch, nur über eine Adresse im neuen
+Netz), `POST /api/admin/umzug/zurueck` (kritisch), `POST /api/admin/umzug/ca-key` `{password}` (kritisch, neuer ca.key
+verschlüsselt, danach gelöscht), `GET /api/admin/umzug/ca.crt`. Übergangszeit: `festpos.conf` hat `NET_ALT`, `VIP_ALT`,
+`NODE_x_IP_ALT`, `NET_ALT_BIS`; `app/serve.py` lauscht dann pro Adresse (`FESTPOS_LISTEN`, `FESTPOS_LISTEN_ALT`,
+`FESTPOS_TLS_ALT_CERT`).
+
+**Daten verschlüsselt** (T-0-N/FestPOS#3, `app/krypt.py`, nur Admin): Stand pro Pi in `/api/admin/system` ›
+`info.krypt` (`state`: `aus`, `vorlaeufig`, `aktiv`, `kein_chip`, `umstellen`, `gesperrt`; `chip`, `offen`,
+`bestaetigt`, `error`). `POST /api/admin/krypt/schluessel` gibt einen neuen Wiederherstellungs-Schlüssel;
+`POST /api/admin/krypt/{pi}/umstellen` `{recovery, printed}`, `GET /api/admin/krypt/{pi}/offen` (Schlüssel eines neuen
+Pi) und `POST /api/admin/krypt/{pi}/bestaetigen` `{printed}` sind kritisch. Für einen anderen Pi geht der Auftrag über
+`POST /api/internal/krypt` (CLUSTER_SECRET, nur an Adressen aus `FESTPOS_PEERS`).
+
+**Firewall ins Internet** (`app/firewall.py`, nur Admin): `GET /api/admin/firewall` – Modus (`strict`, `watch`,
+`open`), `until`, erlaubte Ziele; `PUT /api/admin/firewall` `{mode}` (kritisch). `watch`/`open` gelten 24 Stunden.
+Der Stand pro Pi (angewendeter Modus, Zähler `unknown`, zuletzt verworfene Ziele) steht in `/api/admin/system` unter
+`info.fw`.
 
 **Verwaltung nur mit Gerätezertifikat** (Benutzer › Zugriff, Einstellung `admin_cert_only`): Port 8443 fragt beim
 TLS-Aufbau nach einem Gerätezertifikat (freiwillig – die Pi untereinander haben keines). Eingeschaltet weist der Server

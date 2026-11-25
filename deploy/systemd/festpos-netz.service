@@ -1,0 +1,7 @@
+[Unit]
+Description=FestPOS: Netz umziehen – Frist prüfen, sonst zurück ins alte Netz (T-0-N/FestPOS#2)
+ConditionPathExists=/var/lib/festpos-netz/umzug.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/festpos-netz --wache

@@ -123,6 +123,7 @@ def test_admin_sets_up_fully_per_phone(server, browser):  # noqa: F811
     page.click("#fullyform button.pri")
     _until(page, "!!document.querySelector('.toast:not(.bad)')")
     assert c.get("/api/admin/settings", auth=AUTH).json()["fully_password_set"]
+    page.wait_for_selector("details:has(#fullyform) .status.ok")  # erst nach dem Neuzeichnen mit gespeichertem Passwort
     # FestPOS-WLAN für den WLAN-QR
     page.fill('#fwlan-form input[name="ssid"]', "FestPOS")
     page.fill('#fwlan-form input[name="wifi_password"]', "wlan-geheim-1")

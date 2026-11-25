@@ -15,7 +15,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from . import i18n, ledger_base as lb, uplink
+from . import i18n, ledger_base as lb, netz, secretbox, uplink
 from .core import admin, current_user, db, rt
 
 router = APIRouter(prefix="/api/admin/uplink", dependencies=[Depends(admin)])
@@ -57,7 +57,7 @@ def _overview() -> dict:
     pub = _public()
     drv = uplink.DRIVERS.get(pub["kind"])
     return {"config": pub, "drivers": _drivers(),
-            "setup": drv.setup(pub["host"] or "192.168.55.1") if drv else "",
+            "setup": drv.setup(pub["host"] or netz.info()["examples"]["router"]) if drv else "",
             "result": rt.monitor.uplink.view(cfg, admin=True)}
 
 
@@ -65,8 +65,7 @@ def _save(c: dict, password: str | None = None) -> None:
     stmts = [("INSERT INTO settings(key,value) VALUES ('uplink', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
               (json.dumps(c, ensure_ascii=False),))]
     if password is not None:
-        stmts.append(("INSERT INTO settings(key,value) VALUES ('uplink_password', ?) "
-                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (password,)))
+        stmts.append(secretbox.put_stmt("uplink_password", password))
     rt.store.batch(stmts)
 
 

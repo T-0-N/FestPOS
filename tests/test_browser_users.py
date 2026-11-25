@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("playwright.sync_api")
 httpx = pytest.importorskip("httpx2")
 
-from tests.test_browser_p4 import AUTH, _start, _watch, browser  # noqa: E402,F401  (browser = Fixture)
+from tests.test_browser_p4 import AUTH, browser, _confirm, _start, _watch  # noqa: E402,F401  (browser = Fixture)
 
 NAV = '.side button[data-page]'
 
@@ -90,6 +90,7 @@ def test_admin_manages_users(server, browser):  # noqa: F811
     page.select_option('#newuser select[name="role"]', "lead")
     page.fill('#newuser input[name="password"]', "max-passwort")
     page.click('dialog[open] [data-dlg="save"]')
+    _confirm(page)                                                         # Benutzer anlegen: kritisch (#9)
     page.wait_for_selector('tr[data-uid]:has-text("Max")')
     users = {u["name"]: u for u in c.get("/api/admin/users", auth=AUTH).json()["users"]}
     assert users["Max"]["role"] == "lead" and users["Max"]["active"]
@@ -278,6 +279,7 @@ def test_admin_builds_a_role_from_rights(server, browser):  # noqa: F811
     for p in ("stock", "printers", "jobs"):
         page.check(f'dialog[open] input[name="perm"][value="{p}"]')
     page.click('dialog[open] [data-dlg="save"]')
+    _confirm(page)                                                         # Rollen: kritisch (#9), danach 5 Minuten
     page.wait_for_selector('#roles-card tr[data-rid]:has-text("Küche")')
     rid = page.locator('#roles-card tr[data-rid]:has-text("Küche")').get_attribute("data-rid")
     assert "Drucker" in page.inner_text(f'#roles-card tr[data-rid="{rid}"]')

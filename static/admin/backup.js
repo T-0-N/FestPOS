@@ -76,7 +76,7 @@ function itemText(i) {
   if (i.id === "time" && i.state === "ok") s = t("admin.restore.time_ok_sub", p);
   if (i.id === "printer" && i.state === "bad") s = `${errLabel(i.reason)} – ${s}`;
   if (i.id === "receipts") s = t(i.case === "new" ? "admin.restore.receipts_new" : "admin.restore.receipts_same", p);
-  if (i.id === "keys") s = t(i.cluster ? "admin.restore.keys_cluster" : "admin.restore.keys_single");
+  if (i.id === "keys") s = t(i.other_net ? "admin.restore.keys_other_net" : i.cluster ? "admin.restore.keys_cluster" : "admin.restore.keys_single");
   return { title: title ? t(title, p) : i.id, sub: s };
 }
 
@@ -97,7 +97,7 @@ function itemExtra(i) {
     return `<form class="form" data-bk-form="receipt"><label>${th("admin.restore.receipt_next")}<input name="next" type="number"
       min="${i.next}" value="${i.next}" style="width:120px"></label><button class="btn sm">${th("admin.restore.receipt_take")}</button></form>`;
   }
-  if (i.id === "keys" && !i.cluster) {
+  if (i.id === "keys" && !i.cluster && !i.other_net) {
     return `<form class="form" data-bk-form="keys"><label>${th("admin.backup.rs_file")}<input type="file" name="file" accept=".festpos" required></label>
       <label>${th("admin.backup.rs_pw")}<input name="password" autocomplete="off" style="width:240px"></label>
       <button class="btn danger sm">${th("admin.restore.keys_take")}</button></form>`;

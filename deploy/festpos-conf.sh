@@ -11,8 +11,8 @@
 #
 # Nur bekannte Namen werden übernommen (sonst könnte eine Zeile z.B. PATH verändern).
 
-FESTPOS_CONF_KEYS="CLUSTER_SIZE NET_PREFIX NET_CIDR IFACE VIP NODE_A_IP NODE_B_IP NODE_C_IP VRRP_ID TZ PHONE_CERTS
-ADMIN_PASSWORD CLUSTER_SECRET NODE NODE_IP JOIN_OTHERS CA_DAYS SERVER_DAYS SSH_FROM ADMIN_FROM RAFT_TLS
+FESTPOS_CONF_KEYS="CLUSTER_SIZE NET NET_PREFIX NET_CIDR IFACE VIP NODE_A_IP NODE_B_IP NODE_C_IP VRRP_ID TZ PHONE_CERTS
+ADMIN_PASSWORD ADMIN_PASSWORD_HASH ADMIN_PASSWORD_LAENGE CLUSTER_SECRET NODE NODE_IP JOIN_OTHERS CA_DAYS SERVER_DAYS SSH_FROM ADMIN_FROM RAFT_TLS
 DHCP DHCP_POOL DHCP_GATEWAY DHCP_DNS RTC_AKKU INTERNET_GATEWAY INTERNET_DNS TUNNEL_TOKEN"
 
 _festpos_unescape() {           # \x -> x (für Werte in doppelten Anführungszeichen)
@@ -122,21 +122,66 @@ festpos_ip2int() { local IFS=. a b c d; read -r a b c d <<< "$1"; echo $(((a << 
 festpos_is_ip() { [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] &&
   ((BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255)); }
 
+festpos_int2ip() { echo "$((($1 >> 24) & 255)).$((($1 >> 16) & 255)).$((($1 >> 8) & 255)).$(($1 & 255))"; }
+
+# Netz (T-0-N/FestPOS#2): NET=Adresse/Grösse (z.B. 10.20.0.0/22), frei wählbar bei der Ersteinrichtung. Ältere
+# festpos.conf haben nur NET_PREFIX (drei Zahlen) und NET_CIDR. festpos_net_from_conf setzt daraus NET (genau die
+# Netzadresse), NET_CIDR, NET_PREFIX (die ersten drei Zahlen der Netzadresse) und gibt 1 zurück, wenn es nicht passt.
+festpos_net_from_conf() {
+  local addr cidr m
+  if [ -n "${NET:-}" ]; then
+    [[ $NET =~ ^([0-9.]+)/([0-9]{1,2})$ ]] || return 1
+    addr=${BASH_REMATCH[1]}; cidr=${BASH_REMATCH[2]}
+  else
+    addr="${NET_PREFIX:-}.0"; cidr=${NET_CIDR:-}
+  fi
+  festpos_is_ip "$addr" && [[ $cidr =~ ^[0-9]{1,2}$ ]] && ((cidr >= 8 && cidr <= 30)) || return 1
+  m=$(((0xFFFFFFFF << (32 - cidr)) & 0xFFFFFFFF))
+  if [ -n "${NET:-}" ] && (($(festpos_ip2int "$addr") & ~m & 0xFFFFFFFF)); then
+    return 1                                              # «10.20.0.5/22»: nicht die Netzadresse
+  fi
+  addr=$(festpos_int2ip $(($(festpos_ip2int "$addr") & m)))
+  NET="$addr/$cidr"; NET_CIDR=$cidr; NET_PREFIX=${addr%.*}
+  export NET NET_CIDR NET_PREFIX
+}
+
+festpos_in_net() {              # festpos_in_net IP NETZ/GRÖSSE -> 0, wenn die Adresse im Netz liegt (nicht Netz/Broadcast)
+  local ip=$1 net=${2%/*} cidr=${2#*/} m i n
+  festpos_is_ip "$ip" || return 1
+  m=$(((0xFFFFFFFF << (32 - cidr)) & 0xFFFFFFFF)); i=$(festpos_ip2int "$ip"); n=$(festpos_ip2int "$net")
+  (((i & m) == n && i != n && i != (n | (~m & 0xFFFFFFFF)))) || return 1
+}
+
 FESTPOS_DHCP_HOSTS=/var/lib/festpos/dhcp          # feste Zuteilungen, schreibt die App (app/dhcp.py)
 FESTPOS_DHCP_LEASES=/var/lib/festpos/dhcp.leases
 FESTPOS_DHCP_OPTS=/var/lib/festpos/dhcp-opts      # Gateway der Handhelds bei «auto», schreibt die App (app/dhcp.py)
 
-# festpos_dhcp_conf NET_PREFIX NET_CIDR IFACE POOL GATEWAY DNS KNOTEN CLUSTER_SIZE -> dnsmasq.conf (nur DHCP)
+# festpos_dhcp_conf NETZ/GRÖSSE IFACE POOL GATEWAY DNS KNOTEN CLUSTER_SIZE [NTP] -> dnsmasq.conf (nur DHCP)
+# (ältere Form: NET_PREFIX NET_CIDR statt NETZ/GRÖSSE – geht weiter)
 # GATEWAY «auto:IP»: das Gateway der Handhelds folgt dem Weg ins Internet (Verwaltung › Internet) – die App
 # schreibt es nach $FESTPOS_DHCP_OPTS (Startwert IP); eine feste IP (DHCP_GATEWAY in festpos.conf) gilt immer.
-# POOL «150-189»: letzte Stelle der Adressen für neue Geräte; bei 3 Pi bekommt jeder ein Drittel (a, b, c), damit
-# nie zwei Pi dieselbe Adresse vergeben. Feste Zuteilungen sind auf allen Pi gleich (aus der Datenbank).
+# POOL «150-189»: Abstand zur Netzadresse (im /24 die letzte Stelle) oder ganze Adressen «10.20.1.1-10.20.3.200»;
+# bei 3 Pi bekommt jeder ein Drittel (a, b, c), damit nie zwei Pi dieselbe Adresse vergeben. Feste Zuteilungen sind
+# auf allen Pi gleich (aus der Datenbank).
 festpos_dhcp_conf() {
-  local prefix=$1 cidr=$2 iface=$3 pool=$4 gw=$5 dns=$6 node=$7 size=$8 ntp=${9:-} von bis n teil idx mask m i auto=""
+  local net cidr iface pool gw dns node size ntp von bis n teil idx m base last mask auto=""
+  if [[ $1 == */* ]]; then net=${1%/*}; cidr=${1#*/}; shift
+  else net="$1.0"; cidr=$2; shift 2; fi
+  iface=$1 pool=$2 gw=$3 dns=$4 node=$5 size=$6 ntp=${7:-}
+  festpos_is_ip "$net" && [[ $cidr =~ ^[0-9]{1,2}$ ]] && ((cidr >= 8 && cidr <= 30)) || return 1
+  m=$(((0xFFFFFFFF << (32 - cidr)) & 0xFFFFFFFF))
+  base=$(($(festpos_ip2int "$net") & m)); last=$((base | (~m & 0xFFFFFFFF)))
   if [[ $gw == auto:* ]]; then auto=1; gw=${gw#auto:}; fi
-  [[ $pool =~ ^([0-9]{1,3})-([0-9]{1,3})$ ]] || return 1
-  von=${BASH_REMATCH[1]}; bis=${BASH_REMATCH[2]}
-  ((von >= 1 && bis <= 254 && von <= bis)) || return 1
+  if [[ $pool =~ ^([0-9]{1,7})-([0-9]{1,7})$ ]]; then
+    von=$((base + BASH_REMATCH[1])); bis=$((base + BASH_REMATCH[2]))
+  elif [[ $pool =~ ^([0-9.]+)-([0-9.]+)$ ]]; then
+    von=${BASH_REMATCH[1]}; bis=${BASH_REMATCH[2]}          # festpos_is_ip überschreibt BASH_REMATCH
+    festpos_is_ip "$von" && festpos_is_ip "$bis" || return 1
+    von=$(festpos_ip2int "$von"); bis=$(festpos_ip2int "$bis")
+  else
+    return 1
+  fi
+  ((von > base && bis < last && von <= bis)) || return 1
   festpos_is_ip "$gw" || return 1
   [ -z "$dns" ] || festpos_is_ip "$dns" || return 1
   [ -z "$ntp" ] || festpos_is_ip "$ntp" || return 1
@@ -145,14 +190,13 @@ festpos_dhcp_conf() {
     case "$node" in a) idx=0 ;; b) idx=1 ;; c) idx=2 ;; *) return 1 ;; esac
     von=$((von + idx * teil)); ((idx == 2)) || bis=$((von + teil - 1))
   fi
-  m=$((0xFFFFFFFF << (32 - cidr) & 0xFFFFFFFF)); mask=""
-  for i in 24 16 8 0; do mask+="$(((m >> i) & 255))"; ((i)) && mask+="."; done
+  mask=$(festpos_int2ip "$m")
   cat <<EOF
 # generiert von festpos-node.sh – nicht von Hand ändern (DHCP, DHCP_POOL, DHCP_GATEWAY, DHCP_DNS in festpos.conf)
 port=0
 interface=$iface
 bind-dynamic
-dhcp-range=$prefix.$von,$prefix.$bis,$mask,2m
+dhcp-range=$(festpos_int2ip "$von"),$(festpos_int2ip "$bis"),$mask,2m
 $( [ -n "$auto" ] && echo "dhcp-optsdir=$FESTPOS_DHCP_OPTS" || echo "dhcp-option=option:router,$gw" )
 $( [ -n "$dns" ] && echo "dhcp-option=option:dns-server,$dns" || echo "dhcp-option=option:dns-server" )
 $( [ -n "$ntp" ] && echo "dhcp-option=option:ntp-server,$ntp" )
@@ -161,6 +205,13 @@ dhcp-leasefile=$FESTPOS_DHCP_LEASES
 user=festpos
 group=festpos
 EOF
+}
+
+# Vorgabe für DHCP_POOL, wenn festpos.conf keinen hat: im /24 und grösser wie bisher .150–.189 (ab der Netzadresse),
+# in kleineren Netzen die zweite Hälfte (ohne Broadcast)
+festpos_dhcp_pool_default() {   # festpos_dhcp_pool_default GRÖSSE -> «von-bis» (Abstand zur Netzadresse)
+  local cidr=$1 n
+  if ((cidr <= 24)); then echo "150-189"; else n=$((1 << (32 - cidr))); echo "$((n / 2))-$((n - 2))"; fi
 }
 
 # RTC-Batterie laden (T2): festpos_rtc_charge CONFIG.TXT 0|1 -> gibt «geändert» aus, wenn config.txt angepasst wurde.
@@ -306,10 +357,18 @@ festpos_boot_private_now() {    # festpos_boot_private_now EINHÄNGEPUNKT -> sof
 festpos_wifi_prepare() {        # festpos_wifi_prepare BOOT -> WLAN nicht mehr ganz abschalten, aber Funk aus
   # Bis 2026.10.10-32 schaltete dtoverlay=disable-wifi das WLAN ganz ab. Für «Update aus dem Internet» bleibt es
   # vorhanden; der Funk ist aus (nmcli/rfkill) und nur während eines Updates an (festpos-update). Wirkt ab Neustart.
-  local cfg="$1/config.txt" rc=1
+  local cfg="$1/config.txt" cmd="$1/cmdline.txt" rc=1
   if [ -f "$cfg" ] && grep -qE '^dtoverlay=disable-wifi[[:space:]]*$' "$cfg"; then
     sed -i -E '/^dtoverlay=disable-wifi[[:space:]]*$/d' "$cfg" && rc=0
   fi
-  if command -v nmcli >/dev/null 2>&1; then nmcli radio wifi off >/dev/null 2>&1 || true; fi
+  # WLAN-Land CH ab dem Start (Kanal 12/13 und 5 GHz; sonst findet der Pi manchen Router oder Hotspot nicht)
+  if [ -f "$cmd" ] && ! grep -q "cfg80211.ieee80211_regdom=" "$cmd"; then
+    sed -i -E '1 s/[[:space:]]*$/ cfg80211.ieee80211_regdom=CH/' "$cmd" && rc=0
+  fi
+  # Funk aus – aber nicht, solange «dauerhaft verbunden» über das WLAN läuft (z.B. mitten in einem Update)
+  if command -v nmcli >/dev/null 2>&1 &&
+     ! nmcli -t -f NAME connection show --active 2>/dev/null | grep -qx festpos-internet; then
+    nmcli radio wifi off >/dev/null 2>&1 || true
+  fi
   return $rc
 }

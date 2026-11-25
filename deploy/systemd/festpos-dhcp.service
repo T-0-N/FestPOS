@@ -1,5 +1,7 @@
 [Unit]
 Description=FestPOS: DHCP für die Handys (feste Zuteilungen aus der Verwaltung)
+After=festpos-krypt.service
+Requires=festpos-krypt.service
 After=network-online.target festpos-node.service
 Wants=network-online.target
 # DHCP=1 in festpos.conf: festpos-node schreibt die Datei; sonst bleibt der Dienst aus

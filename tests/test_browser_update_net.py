@@ -12,7 +12,7 @@ pytest.importorskip("playwright.sync_api")
 from app import release  # noqa: E402
 from tests.release_util import build_bundle, keypair  # noqa: E402
 from tests.test_api import AUTH  # noqa: E402
-from tests.test_browser_p4 import _start, _watch, browser  # noqa: E402,F401  (browser = Fixture)
+from tests.test_browser_p4 import browser, _preconfirm, _start, _watch  # noqa: E402,F401  (browser = Fixture)
 from tests.test_browser_receipt import _until  # noqa: E402
 from tests.test_update_net import FakeGitHub, FakeHelper  # noqa: E402
 
@@ -43,13 +43,17 @@ def env(tmp_path_factory):
     proc.wait(10)
 
 
-def _admin(browser, base, width=1300, where="maint/update"):  # noqa: F811
+def _admin(browser, base, width=1300, where="maint/update", before=None):  # noqa: F811
     ctx = browser.new_context(viewport={"width": width, "height": 1000})
     page = ctx.new_page()
     errs = _watch(page)
+    if before:
+        before(page)
     page.goto(base + f"/admin.html#{where}")
     page.fill("#pw", "geheim")
     page.press("#pw", "Enter")
+    page.wait_for_selector("#net-form")
+    _preconfirm(page)                                    # kritische Aktionen: schon bestätigt (#9)
     page.wait_for_selector("#net-form")
     return ctx, page, errs
 
@@ -117,5 +121,29 @@ def test_phone_width_has_no_overflow(env, browser, width):  # noqa: F811
     ctx, page, errs = _admin(browser, env["base"], width=width, where="devices/net")
     page.check('#net-form input[name="via"][value="lan"]')
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
+    assert not errs, errs
+    ctx.close()
+
+
+def test_keep_line_shows_reason_and_next_try(env, browser):  # noqa: F811
+    """Verwaltung › Netz & Internet: fehlt die Verbindung, steht der Grund dabei und wann der nächste Versuch kommt."""
+    import time as _t
+    now = int(_t.time())
+    keep = {"on": True, "state": "failed", "via": "wlan", "reason": "wlan_not_found", "ssid": "Fest-Hotspot", "tries": 2,
+            "last": now - 30, "next": now + 90, "fails_max": 3, "text": "x"}
+
+    def fake(route):
+        r = route.fetch()
+        data = r.json()
+        data["keep"] = keep
+        route.fulfill(response=r, json=data)
+    ctx, page, errs = _admin(browser, env["base"], where="devices/net", before=lambda p: p.route("**/api/admin/update/net", fake))
+    page.wait_for_selector("#keep-why")
+    assert "WLAN «Fest-Hotspot» nicht gefunden" in page.inner_text("#keep-why")
+    assert "(2. Versuch)" in page.inner_text("#keep-when") and "letzter Versuch" in page.inner_text("#keep-when")
+    keep.update(state="up", online=False, reason="time", fails=1, since=now - 600, checked=now, next=None)
+    page.reload()
+    page.wait_for_selector("#keep-why")
+    assert "Uhrzeit" in page.inner_text("#keep-why") and "(1/3)" in page.inner_text("#keep-when")
     assert not errs, errs
     ctx.close()

@@ -22,7 +22,14 @@ log = logging.getLogger("festpos.monitor")
 IPS_KEPT = 4                # pro Gerät so viele zuletzt gemeldete Adressen (T4, MAC-Wechsel)
 ONLINE_SECONDS = 60          # Handys fragen alle 20 s nach – 60 s ohne Lebenszeichen = offline
 BATTERY_MAX_AGE = 15 * 60    # Akkustand älter als 15 min (App zu, Handy aus) wird nicht mehr angezeigt
-DEFAULT_HOSTS = "Switch=192.168.55.30; Access Point=192.168.55.40"
+def _default_hosts() -> str:
+    """Vorgabe für die Netzwerkgeräte: Switch .30 und Access Point .40 im FestPOS-Netz (T-0-N/FestPOS#2)."""
+    from . import netz
+    ex = netz.info()["examples"]
+    return f"Switch={ex['switch']}; Access Point={ex['ap']}"
+
+
+DEFAULT_HOSTS = _default_hosts()
 
 
 def host_checks() -> bool:

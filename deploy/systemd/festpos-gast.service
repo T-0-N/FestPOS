@@ -1,16 +1,18 @@
 [Unit]
 Description=FestPOS: Gästedienst für die QR-Bestellung am Tisch (T22)
+After=festpos-krypt.service
+Requires=festpos-krypt.service
 Documentation=https://github.com/T-0-N/FestPOS/blob/main/deploy/ANLEITUNG.md
 After=network.target festpos.service
 # Nur, wenn festpos-node die QR-Bestellung eingeschaltet hat (TUNNEL_TOKEN in festpos.conf), nie in der Ersteinrichtung
-ConditionPathExists=/etc/festpos-gast/token
+ConditionPathExists=/run/festpos-gast/token
 ConditionPathExists=!/run/festpos/einrichtung
 
 [Service]
 User=festpos-gast
 Group=festpos-gast
 WorkingDirectory=/opt/festpos
-Environment=FESTPOS_STATIC=/opt/festpos/static FESTPOS_GAST_TOKEN_FILE=/etc/festpos-gast/token PYTHONDONTWRITEBYTECODE=1
+Environment=FESTPOS_STATIC=/opt/festpos/static FESTPOS_GAST_TOKEN_FILE=/run/festpos-gast/token PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/festpos/venv/bin/python -m uvicorn app.gast_proxy:app --host 127.0.0.1 --port 8090 --no-server-header --no-access-log --timeout-keep-alive 5 --limit-concurrency 200
 Restart=always
 RestartSec=3
@@ -43,7 +45,7 @@ IPAddressDeny=any
 IPAddressAllow=localhost
 SocketBindAllow=tcp:8090
 SocketBindDeny=any
-InaccessiblePaths=-/var/lib/festpos -/etc/festpos -/boot -/root -/var/log
+InaccessiblePaths=-/var/lib/festpos -/var/lib/festpos-krypt -/run/festpos-krypt -/run/festpos-geheim -/etc/festpos -/boot -/root -/var/log
 UMask=0077
 MemoryMax=256M
 TasksMax=64

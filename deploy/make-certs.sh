@@ -14,7 +14,11 @@
 #                            NICHT in den Projektordner (REV-026). Sicher aufbewahren, z.B. USB-Stick.
 #                            Anderer Ort: FESTPOS_CA_DIR=/pfad bash make-certs.sh festpos.conf
 #
-# Die Server-CA darf nur Zertifikate für das Festnetz (NET_PREFIX/NET_CIDR), 127.0.0.1, festpos.local und
+# ca.key ist mit einem Passwort verschlüsselt (PKCS#8, AES-256, 600 000 Runden – wie bei der Ersteinrichtung im
+# Browser). make-certs.sh fragt danach; ohne Fragen: FESTPOS_CA_PASS_FILE=/pfad/zur/datei (erste Zeile = Passwort).
+# Ein älterer, unverschlüsselter ca.key geht weiterhin (mit Hinweis, wie man ihn verschlüsselt).
+#
+# Die Server-CA darf nur Zertifikate für das Festnetz (NET, ältere festpos.conf: NET_PREFIX/NET_CIDR), 127.0.0.1, festpos.local und
 # localhost ausstellen (nameConstraints). Selbst mit einem gestohlenen ca.key lassen sich damit keine
 # fremden Webseiten (Bank, Google …) auf den Handys fälschen.
 set -euo pipefail
@@ -27,13 +31,12 @@ NEUE_CA=""; [ "${2:-}" = --neue-ca ] && NEUE_CA=1
 source "$(dirname "$0")/festpos-conf.sh"
 festpos_read_conf "$CONF"
 for v in VIP NODE_A_IP NODE_B_IP NODE_C_IP; do festpos_is_ip "${!v:-}" || { echo "$v ist keine gültige IP-Adresse"; exit 1; }; done
-festpos_is_ip "${NET_PREFIX:-}.0" || { echo "NET_PREFIX ungültig: '${NET_PREFIX:-}'"; exit 1; }
-[[ ${NET_CIDR:-} =~ ^[0-9]{1,2}$ ]] && ((NET_CIDR >= 8 && NET_CIDR <= 30)) || { echo "NET_CIDR ungültig"; exit 1; }
+festpos_net_from_conf || { echo "Netz ungültig (NET=… oder NET_PREFIX/NET_CIDR)"; exit 1; }
 
 ip2int() { local IFS=.; read -r a b c d <<< "$1"; echo $(((a << 24) | (b << 16) | (c << 8) | d)); }
 int2ip() { echo "$((($1 >> 24) & 255)).$((($1 >> 16) & 255)).$((($1 >> 8) & 255)).$(($1 & 255))"; }
 MASK_INT=$(((0xffffffff << (32 - NET_CIDR)) & 0xffffffff))
-NET_INT=$(($(ip2int "$NET_PREFIX.0") & MASK_INT))
+NET_INT=$(($(ip2int "${NET%/*}") & MASK_INT))
 NET=$(int2ip "$NET_INT"); MASK=$(int2ip "$MASK_INT")
 for v in VIP NODE_A_IP NODE_B_IP NODE_C_IP; do
   [ $(($(ip2int "${!v}") & MASK_INT)) = "$NET_INT" ] || { echo "$v=${!v} liegt nicht im Netz $NET/$NET_CIDR"; exit 1; }
@@ -82,13 +85,51 @@ if [ ! -f "$CA_DIR/ca.key" ] && [ -f "$OUT/ca.crt" ] && [ -z "$NEUE_CA" ]; then
   echo "        Nur wenn er verloren ist:          $0 $CONF --neue-ca   (dann ca.crt auf allen Geräten neu installieren)"
   exit 1
 fi
+# Passwort für ca.key: aus FESTPOS_CA_PASS_FILE oder (leer) von OpenSSL am Terminal erfragt
+PASS_IN=()
+if [ -n "${FESTPOS_CA_PASS_FILE:-}" ]; then
+  [ -f "$FESTPOS_CA_PASS_FILE" ] || { echo "FEHLER: FESTPOS_CA_PASS_FILE nicht gefunden: $FESTPOS_CA_PASS_FILE"; exit 1; }
+  PASS_IN=(-passin "file:$FESTPOS_CA_PASS_FILE")
+fi
+# Aufräumen bei jedem Ende (auch Abbruch oder Fehler): KTMP enthält kurz den unverschlüsselten ca.key und das Passwort.
+# Eigene Namen, vorher geleert: «TMP» o.ä. aus der Umgebung (oft /tmp) darf hier nie gelöscht werden.
+KTMP=""
+CERT_TMP=""
+trap 'rm -rf ${KTMP:+"$KTMP"} ${CERT_TMP:+"$CERT_TMP"}' EXIT
 if [ ! -f "$CA_DIR/ca.key" ]; then
+  KTMP=$(mktemp -d)
+  # erst ohne Passwort in einen eigenen Ordner (nur für uns lesbar), dann verschlüsselt nach ca.key
+  chmod 700 "$KTMP"
+  # Neues Passwort: mindestens 12 Zeichen – selbst prüfen (OpenSSL prüft das bei einem vorgegebenen Passwort nicht)
+  if [ -n "${FESTPOS_CA_PASS_FILE:-}" ]; then
+    IFS= read -r NEUPW < "$FESTPOS_CA_PASS_FILE" || true
+    case "$NEUPW" in *$'\r') echo "FEHLER: Passwort-Datei mit Windows-Zeilenende (CR) – als Unix-Text speichern, nichts erzeugt."; exit 1 ;; esac
+  else
+    IFS= read -r -s -p "Passwort für ca.key festlegen (mindestens 12 Zeichen, getrennt vom Schlüssel aufbewahren): " NEUPW; echo
+    IFS= read -r -s -p "Passwort wiederholen: " NEUPW2; echo
+    [ "$NEUPW" = "$NEUPW2" ] || { rm -rf "$KTMP"; echo "FEHLER: Die Passwörter sind verschieden – nichts erzeugt."; exit 1; }
+  fi
+  if [ "${#NEUPW}" -lt 12 ]; then
+    rm -rf "$KTMP"; echo "FEHLER: Das Passwort für ca.key braucht mindestens 12 Zeichen – nichts erzeugt."; exit 1
+  fi
+  ( umask 077; printf '%s\n' "$NEUPW" > "$KTMP/pw" )
+  unset NEUPW NEUPW2
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days "${CA_DAYS:-10950}" \
-    -keyout "$CA_DIR/ca.key" -out "$CA_DIR/ca.crt" -subj "/CN=FestPOS Lokale CA $(date +%Y)/O=FestPOS" \
+    -keyout "$KTMP/ca.key" -out "$CA_DIR/ca.crt" -subj "/CN=FestPOS Lokale CA $(date +%Y)/O=FestPOS" \
     -addext "basicConstraints=critical,CA:TRUE,pathlen:0" -addext "keyUsage=critical,keyCertSign,cRLSign" \
     -addext "nameConstraints=$CONSTRAINTS"
+  if ! openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 600000 -in "$KTMP/ca.key" \
+      -out "$CA_DIR/ca.key" -passout "file:$KTMP/pw"; then
+    rm -rf "$KTMP" "$CA_DIR/ca.key" "$CA_DIR/ca.crt"
+    echo "FEHLER: ca.key nicht verschlüsselt – nichts erzeugt."; exit 1
+  fi
+  rm -rf "$KTMP"
   chmod 600 "$CA_DIR/ca.key"
   NEU=1
+fi
+if ! grep -q "BEGIN ENCRYPTED PRIVATE KEY" "$CA_DIR/ca.key"; then
+  echo "HINWEIS: $CA_DIR/ca.key ist nicht verschlüsselt. Verschlüsseln (fragt nach einem neuen Passwort):"
+  echo "         openssl pkcs8 -topk8 -v2 aes-256-cbc -iter 600000 -in ca.key -out ca.key.neu && mv ca.key.neu ca.key"
 fi
 cp "$CA_DIR/ca.crt" "$OUT/ca.crt"
 if ! openssl x509 -in "$OUT/ca.crt" -noout -ext nameConstraints 2>/dev/null | grep -q Permitted; then
@@ -120,21 +161,25 @@ if [ -n "$GEHEIM_AUS" ] && festpos_secret_fix "$CONF" "$GEHEIM_AUS"; then
   echo "CLUSTER_SECRET in $CONF festgeschrieben (Prüfsummen bleiben prüfbar). Bei 3 Pi: diese festpos.conf auf alle Karten."
 fi
 
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+CERT_TMP=$(mktemp -d)
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-  -keyout "$TMP/server.key" -out "$TMP/server.csr" -subj "/CN=festpos.local/O=FestPOS"
-cat > "$TMP/server.ext" <<EXT
+  -keyout "$CERT_TMP/server.key" -out "$CERT_TMP/server.csr" -subj "/CN=festpos.local/O=FestPOS"
+cat > "$CERT_TMP/server.ext" <<EXT
 basicConstraints=CA:FALSE
 keyUsage=critical,digitalSignature
 extendedKeyUsage=serverAuth,clientAuth          # clientAuth: auch für die Verschlüsselung zwischen den Pi (RAFT_TLS)
 subjectAltName=IP:$VIP,IP:$NODE_A_IP,IP:$NODE_B_IP,IP:$NODE_C_IP,IP:127.0.0.1,DNS:festpos.local,DNS:localhost
 EXT
-openssl x509 -req -in "$TMP/server.csr" -CA "$OUT/ca.crt" -CAkey "$CA_DIR/ca.key" \
-  -CAserial "$CA_DIR/ca.srl" -CAcreateserial -days "$DAYS" -extfile "$TMP/server.ext" -out "$TMP/server.crt" 2>/dev/null
-openssl verify -CAfile "$OUT/ca.crt" "$TMP/server.crt" >/dev/null || { echo "FEHLER: neues Server-Zertifikat ungültig"; exit 1; }
-mv "$TMP/server.key" "$OUT/server.key"
-mv "$TMP/server.crt" "$OUT/server.crt"
+grep -q "BEGIN ENCRYPTED PRIVATE KEY" "$CA_DIR/ca.key" && [ -z "${FESTPOS_CA_PASS_FILE:-}" ] && echo "Passwort für ca.key:"
+if ! openssl x509 -req -in "$CERT_TMP/server.csr" -CA "$OUT/ca.crt" -CAkey "$CA_DIR/ca.key" "${PASS_IN[@]}" \
+    -CAserial "$CA_DIR/ca.srl" -CAcreateserial -days "$DAYS" -extfile "$CERT_TMP/server.ext" -out "$CERT_TMP/server.crt" 2>"$CERT_TMP/err"; then
+  grep -qi "bad decrypt\|unable to load\|could not read\|unable to load CA private key" "$CERT_TMP/err" &&
+    echo "FEHLER: ca.key liess sich nicht lesen – Passwort falsch?" || cat "$CERT_TMP/err"
+  exit 1
+fi
+openssl verify -CAfile "$OUT/ca.crt" "$CERT_TMP/server.crt" >/dev/null || { echo "FEHLER: neues Server-Zertifikat ungültig"; exit 1; }
+mv "$CERT_TMP/server.key" "$OUT/server.key"
+mv "$CERT_TMP/server.crt" "$OUT/server.crt"
 chmod 600 "$OUT/server.key" "$OUT/device-ca.key"
 
 echo

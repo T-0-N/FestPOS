@@ -396,7 +396,8 @@ CREATE TABLE IF NOT EXISTS users (
     gen         INTEGER NOT NULL DEFAULT 1,
     active      INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT,
-    last_login  TEXT
+    last_login  TEXT,
+    totp        TEXT                -- zweiter Faktor (JSON, app/twofa.py)
 );
 INSERT OR IGNORE INTO vat_rates(code, rate_bp, valid_from) VALUES ('normal', 810, '2024-01-01');
 INSERT OR IGNORE INTO vat_rates(code, rate_bp, valid_from) VALUES ('reduced', 260, '2024-01-01');

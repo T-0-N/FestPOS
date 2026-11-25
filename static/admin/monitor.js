@@ -1,5 +1,5 @@
 /* FestPOS – Verwaltung › Netzwerkgeräte auf der Statusanzeige (Geräte & Netz › Netz & Internet). Handys: Reiter «Handhelds & PC» (devices.js). */
-import { $, api, esc, guard, toast } from "./core.js";
+import { $, api, esc, guard, netEx, toast } from "./core.js";
 import { rerender } from "./shell.js";
 
 // ------------------------------------------------------------------ Geräte auf der Statusanzeige (Netzwerk)
@@ -9,7 +9,7 @@ import { rerender } from "./shell.js";
 function monList(s) {
   let mon;
   try { mon = JSON.parse(s.monitor_devices || "null"); } catch { mon = null; }
-  if (!Array.isArray(mon)) mon = String(s.monitor_hosts ?? "Switch=192.168.55.30; Access Point=192.168.55.40")
+  if (!Array.isArray(mon)) mon = String(s.monitor_hosts ?? `Switch=${netEx("switch")}; Access Point=${netEx("ap")}`)
     .split(/[;\n]/).map((x) => x.trim()).filter(Boolean).map((x) => {        // ganz alte Form "Name=IP; …"
       const [n, h = n] = x.split("="), [ip, port] = h.trim().split(":");
       return { name: n.trim(), kind: "net", ip, port: port ? +port : null };
@@ -23,7 +23,7 @@ export const switchHTML = (on, cls, label) => `<label class="sw"><input type="ch
 function monRowHTML(kind, d) {
   return `<tr class="${d.active === false ? "off" : ""}">
     <td><input class="m-name" value="${esc(d.name || "")}" maxlength="30" placeholder="${th("admin.net.name_placeholder")}" style="width:150px"></td>
-    <td><input class="m-ip" value="${esc(d.ip || "")}" maxlength="63" placeholder="192.168.55.30" style="width:150px"></td>
+    <td><input class="m-ip" value="${esc(d.ip || "")}" maxlength="63" placeholder="${esc(netEx("switch"))}" style="width:150px"></td>
     <td><input class="m-port" type="number" min="1" max="65535" value="${d.port ?? ""}" placeholder="${th("admin.monitor.ping")}" style="width:90px"></td>
     <td>${switchHTML(d.active !== false, "m-active", { text: t("admin.common.in_use"), hidden: true })}</td>
     <td><button type="button" class="btn m-del" title="${th("admin.monitor.remove")}" aria-label="${th("admin.monitor.remove")}">✕</button></td></tr>`;

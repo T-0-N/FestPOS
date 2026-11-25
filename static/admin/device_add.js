@@ -2,7 +2,7 @@
    sie braucht. Werksreset: Einrichtungs-QR mit den Einstellungen für alle (Einstellungen › Geräte), danach rollt die
    Verwaltung von selbst aus. Fully auf vorhandenem Handy und Nur Zugang: zuerst der WLAN-QR, dann Fully mit einem
    Einmal-Passwort bzw. das Gerätezertifikat. Ab Festleitung; die Einstellungen für alle ändert nur der Admin. */
-import { $, $$, api, can, esc, fmtDate, guard } from "./core.js";
+import { $, $$, api, can, esc, fmtDate, guard, netEx } from "./core.js";
 import { pairTimer, RENDER, setPairTimer, show } from "./shell.js";
 import { FULLY, provisionState, runRollout, setFully, setHasTemplate, stopRollout } from "./fully.js";
 
@@ -184,7 +184,7 @@ async function drawFully() {
     <div class="bigpw">${esc(r.temp_pw)}</div>
     <ol class="steps fully-steps" start="3"><li>${th("admin.devices.fully_s3")}</li></ol>
     <form class="form" id="wiz-ip" novalidate>
-      <label>${th("admin.devices.phone_ip")}<input name="ip" required maxlength="15" inputmode="decimal" placeholder="192.168.55.123" style="width:170px"></label>
+      <label>${th("admin.devices.phone_ip")}<input name="ip" required maxlength="15" inputmode="decimal" placeholder="${esc(netEx("phone"))}" style="width:170px"></label>
       <button class="btn pri roll-lock">${th("admin.devices.fully_go")}</button></form>
     <ol class="roll-steps" id="froll-steps" hidden></ol>
     <p class="hint">${th("admin.devices.fully_hint")}</p>`, t("admin.devices.done"), { nextKind: "" });

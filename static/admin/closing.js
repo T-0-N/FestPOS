@@ -1,10 +1,11 @@
 /* FestPOS – Verwaltung › Seite «Tagesabschluss»: Kassensturz, PDF/CSV, Prüfung, Protokoll. */
-import { $, api, chf, esc, fmtTime, guard, parsePrice, toast } from "./core.js";
+import { $, api, can, chf, esc, fmtTime, guard, parsePrice, toast } from "./core.js";
 import { PAY_OPTS, payName, pct, vatName, whoName } from "./ledger.js";
 import { page, RENDER, show } from "./shell.js";
+import { loadSeason } from "./season.js";
 
 // ------------------------------------------------------------------ Tagesabschluss (Kassensturz, PDF/CSV, Prüfung, Protokoll)
-let AUDIT_Q = "", auditTimer = null;
+let AUDIT_Q = "", AUDIT_SEC = false, auditTimer = null;
 RENDER.closing = async () => {
   const [o, list] = await Promise.all([guard(() => api("GET", "/closings/open")), guard(() => api("GET", "/closings"))]);
   if (!o || !list || page !== "closing") return;
@@ -105,7 +106,9 @@ RENDER.closing = async () => {
             <button class="btn sm" data-verify="${c.id}">${th("admin.closing.verify")}</button><div class="vres"></div></td></tr>`).join("")}
       </tbody></table></div>
       <p class="hint">${th("admin.closing.list_hint")}</p>` : `<p class="hint">${th("admin.closing.none")}</p>`}
-    </div>`;
+    </div>
+    ${can("admin") ? `<div id="season-slot"></div>` : ""}`;
+  if ($("#season-slot")) loadSeason($("#season-slot"));    // Saison abschliessen (#12, nur Admin)
   const f = $("#cashform");
   if (f) {
     const cents = (name) => { const v = f[name]?.value.trim(); return v ? parsePrice(v) : null; };
@@ -159,10 +162,12 @@ RENDER.closing = async () => {
 RENDER.audit = async () => {
   $("#main").innerHTML = `<h2>${th("admin.nav.audit")}</h2>
     <div class="card"><p class="hint">${th("admin.audit.hint")}</p>
-      <div class="form"><label>${th("admin.audit.search")}<input id="auditq" type="search" value="${esc(AUDIT_Q)}" maxlength="60" autocomplete="off"></label></div>
+      <div class="form"><label>${th("admin.audit.search")}<input id="auditq" type="search" value="${esc(AUDIT_Q)}" maxlength="60" autocomplete="off"></label>
+        <label class="check"><input type="checkbox" id="auditsec" ${AUDIT_SEC ? "checked" : ""}> ${th("admin.audit.only_sec")}</label></div>
       <div id="auditlist"><p class="hint">${th("admin.common.loading")}</p></div>
     </div>`;
   $("#auditq").addEventListener("input", (e) => { AUDIT_Q = e.target.value; clearTimeout(auditTimer); auditTimer = setTimeout(loadAudit, 300); });
+  $("#auditsec").addEventListener("change", (e) => { AUDIT_SEC = e.target.checked; loadAudit(); });   // nur Sicherheit (#11)
   loadAudit();
 };
 
@@ -199,6 +204,11 @@ const AUDIT_ACTIONS = {
   backup_password_bon: "admin.audit.a_backup_password_bon", receipt_gap: "admin.audit.a_receipt_gap",
   restore_keys: "admin.audit.a_restore_keys", restore_check_done: "admin.audit.a_restore_check_done",
   kartenpaket: "admin.audit.a_kartenpaket", cluster_expand: "admin.audit.a_cluster_expand",
+  krypt_umstellen: "admin.audit.a_krypt_umstellen", krypt_bestaetigt: "admin.audit.a_krypt_bestaetigt",
+  net_move_start: "admin.audit.a_net_move_start", net_move_switch: "admin.audit.a_net_move_switch",
+  net_move_aborted: "admin.audit.a_net_move_aborted", net_move_back: "admin.audit.a_net_move_back",
+  net_move_back_requested: "admin.audit.a_net_move_back_requested", net_move_done: "admin.audit.a_net_move_done",
+  net_move_ca_key: "admin.audit.a_net_move_ca_key", net_restore_moved: "admin.audit.a_net_restore_moved",
   card_write: "admin.audit.a_card_write", card_written: "admin.audit.a_card_written", card_failed: "admin.audit.a_card_failed",
   card_cancelled: "admin.audit.a_card_cancelled", device_pin: "admin.audit.a_device_pin",
   payrexx_paid: "admin.audit.a_payrexx_paid", payrexx_settings: "admin.audit.a_payrexx_settings",
@@ -228,6 +238,13 @@ const AUDIT_ACTIONS = {
   update_pi: "admin.audit.a_update_pi", update_net: "admin.audit.a_update_net", update_net_config: "admin.audit.a_update_net_config",
   time_set: "admin.audit.a_time_set", time_confirmed: "admin.audit.a_time_confirmed", rtc_start: "admin.audit.a_rtc_start",
   phone_ntp: "admin.audit.a_phone_ntp", printer_net: "admin.audit.a_printer_net",
+  emergency_login: "admin.audit.a_emergency_login", critical: "admin.audit.a_critical", confirm: "admin.audit.a_confirm",
+  totp_on: "admin.audit.a_totp_on", totp_off: "admin.audit.a_totp_off", totp_later: "admin.audit.a_totp_later",
+  totp_codes_new: "admin.audit.a_totp_codes_new", totp_recovery_used: "admin.audit.a_totp_recovery_used",
+  sec_ssh: "admin.sec.k_ssh", sec_sudo: "admin.sec.k_sudo", sec_sudo_failed: "admin.sec.k_sudo_failed",
+  sec_reboot: "admin.sec.k_reboot", sec_boot_changed: "admin.sec.k_boot_changed", sec_update_foreign: "admin.sec.k_update_foreign",
+  sec_lockout: "admin.sec.k_lockout", firewall: "admin.audit.a_firewall",
+  season_archive: "admin.audit.a_season_archive", season_close: "admin.audit.a_season_close",
 };
 const MONEY_KEYS = /^(amount|net|difference|price_cents|total|gross)$/;
 function auditDetails(d) {
@@ -242,7 +259,7 @@ function auditDetails(d) {
   return Object.entries(d || {}).map(([k, v]) => `<span class="kv"><i>${esc(k)}</i> ${esc(val(k, v))}</span>`).join(" ");
 }
 async function loadAudit() {
-  const r = await guard(() => api("GET", `/audit?q=${encodeURIComponent(AUDIT_Q.trim())}&limit=300`));
+  const r = await guard(() => api("GET", `/audit?q=${encodeURIComponent(AUDIT_Q.trim())}&limit=300${AUDIT_SEC ? "&sec=true" : ""}`));
   const el = $("#auditlist");
   if (!r || !el || page !== "audit") return;
   el.innerHTML = r.entries.length ? `<div class="scroll"><table class="tbl audit"><thead><tr><th>${th("admin.audit.at")}</th>

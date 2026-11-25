@@ -1,0 +1,853 @@
+#!/opt/festpos/venv/bin/python3 -I
+"""FestPOS – Daten verschlüsselt, Schlüssel im Chip des Pi (T-0-N/FestPOS#3). Läuft als root.
+
+  festpos-krypt --oeffnen      beim Start (festpos-krypt.service), vor festpos-node, rqlite und FestPOS: Container
+                               öffnen und einhängen, ein Umstellen ausführen, einen neuen Pi verschlüsseln
+  festpos-krypt --nachpruefen  nach einem Umstellen (festpos-krypt-pruefen.service): läuft FestPOS, die alten,
+                               unverschlüsselten Daten löschen – sonst alles zurück wie vorher
+  festpos-krypt --umstellen    Auftrag der Verwaltung (JSON auf stdin: {"recovery": …}): beim nächsten Start umstellen
+  festpos-krypt --bestaetigen  Wiederherstellungs-Schlüssel eines neuen Pi gesichert: Schlüssel in den Chip
+  festpos-krypt --einziehen    Geheimnisse von der Boot-Partition in den Container (nach festpos-zertifikate usw.)
+  festpos-krypt --stand        nur den Stand schreiben
+
+Aufbau: Container-Datei /var/lib/festpos-krypt/daten.luks (LUKS2, AES-XTS – der Pi 5 rechnet das in Hardware) auf
+der bestehenden Partition, kein neues Kartenlayout. Eingehängt unter /run/festpos-krypt/fs (nur root); daraus
+«daten» nach /var/lib/festpos (Datenbank, Druckaufträge, Gastdaten …) und «geheim» (nur root): die geheimen Werte aus
+festpos.conf, server.key, device-ca.key, Tunnel-Token. Schlüssel: aus dem geheimen Schlüssel im Chip des Pi (OTP,
+rpi-otp-private-key) abgeleitet – einmal pro Pi zufällig geschrieben, nie überschrieben. Dazu ein zweiter Schlüssel,
+der Wiederherstellungs-Schlüssel, für eine Karte, deren Pi defekt ist.
+
+Ein Pi bekommt den Schlüssel im Chip erst, wenn der Wiederherstellungs-Schlüssel gesichert ist:
+  - Bestehender Pi (Verwaltung › Pi › Umstellen): Schlüssel anzeigen, «ausgedruckt» bestätigen; beim nächsten Start
+    Daten in den Container kopieren und prüfen, Schlüssel in den Chip, Neustart; geht der Container dann mit dem Chip
+    auf und läuft FestPOS, werden die alten Daten gelöscht. Sonst alles zurück wie vorher.
+  - Neuer Pi (nach der Ersteinrichtung, Karte aus «SD-Karte schreiben», Ersatz-Pi): verschlüsselt sich beim ersten
+    Start selbst – vorläufig mit einem Schlüssel auf der Karte, bis der Wiederherstellungs-Schlüssel in der
+    Verwaltung bestätigt ist; dann Schlüssel in den Chip, der vorläufige wird gelöscht.
+  - Karte eines defekten Pi in einem anderen Pi: Wiederherstellungs-Schlüssel als festpos-wiederherstellung.txt auf
+    die Boot-Partition legen – der neue Pi öffnet die Karte damit und nimmt sie mit seinem Chip-Schlüssel an.
+Stand für die App: /run/festpos-krypt/stand.json. Tests: FESTPOS_TEST_ROOT, FESTPOS_CRYPTSETUP, FESTPOS_OTP, …
+"""
+from __future__ import annotations
+
+import grp
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import ssl
+import subprocess
+import sys
+import time
+import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
+
+sys.dont_write_bytecode = True                         # nichts als root in /opt/festpos schreiben
+DEST = Path(os.environ.get("FESTPOS_DEST", "/opt/festpos"))
+sys.path.insert(0, os.environ.get("FESTPOS_RELEASE_LIB", str(DEST)))
+from app import emergency, geheim  # noqa: E402  (gehört root wie dieses Programm)
+
+R = os.environ.get("FESTPOS_TEST_ROOT", "")
+DATA = Path(f"{R}/var/lib/festpos")
+KDIR = Path(f"{R}/var/lib/festpos-krypt")
+CONTAINER = KDIR / "daten.luks"
+ALT = KDIR / "alt"                  # unverschlüsselte Daten nach dem Umstellen, bis FestPOS läuft (Rückfall)
+TEMP_KEY = KDIR / "vorlaeufig.key"  # neuer Pi: Schlüssel auf der Karte, bis der Wiederherstellungs-Schlüssel gesichert ist
+AUFTRAG = KDIR / "auftrag.json"     # Umstellen beim nächsten Start
+PRUEFEN = KDIR / "pruefen"          # umgestellt: beim nächsten Start nur mit dem Chip öffnen
+GESUND = KDIR / "gesund"            # geöffnet: warten, bis FestPOS läuft
+BESTAETIGT = KDIR / "bestaetigt"    # Datum: Wiederherstellungs-Schlüssel gesichert
+FEHLER = KDIR / "fehler"            # letzter Fehler (Code für die Verwaltung)
+BAUT = KDIR / "im-bau"              # Container wird gerade angelegt (Strom weg: beim nächsten Start wegräumen)
+NEU_ALT = KDIR / "neu-alt"          # neuer Pi: unverschlüsselte Daten, bis der Container eingehängt ist
+RUN = Path(f"{R}/run/festpos-krypt")
+FS = RUN / "fs"                     # Container eingehängt (nur root)
+GEHEIM = FS / "geheim"
+EINGEHAENGT = RUN / "eingehaengt"
+STAND = RUN / "stand.json"
+GRUN = Path(f"{R}/run/festpos-geheim")                 # Arbeitskopien (Arbeitsspeicher), festpos-node
+QUELLE = Path(os.environ.get("FESTPOS_GEHEIM_RUN", str(GRUN / "quelle")))
+OFFEN_APP = GRUN / "wiederherstellung"                 # noch nicht bestätigter Schlüssel, für die Verwaltung
+ETC = Path(f"{R}/etc/festpos")
+_boot = os.environ.get("FESTPOS_BOOT") or ("/boot/firmware" if os.path.isdir("/boot/firmware") else "/boot")
+BOOT = Path(_boot)
+RECOVERY_FILE = BOOT / "festpos-wiederherstellung.txt"
+NAME = "festpos-daten"
+MAPPER = Path(os.environ.get("FESTPOS_KRYPT_MAPPER", "/dev/mapper")) / NAME
+CRYPTSETUP = os.environ.get("FESTPOS_CRYPTSETUP", "cryptsetup")
+OTP = os.environ.get("FESTPOS_OTP", "rpi-otp-private-key")
+MOUNT = os.environ.get("FESTPOS_MOUNT", "mount")
+UMOUNT = os.environ.get("FESTPOS_UMOUNT", "umount")
+MKFS = os.environ.get("FESTPOS_MKFS", "mkfs.ext4")
+FSTRIM = os.environ.get("FESTPOS_FSTRIM", "fstrim")
+SYSTEMCTL = os.environ.get("FESTPOS_SYSTEMCTL", "systemctl")
+HEALTH = os.environ.get("FESTPOS_KRYPT_HEALTH", "https://127.0.0.1:8443/api/health")
+WAIT_S = int(os.environ.get("FESTPOS_KRYPT_WAIT", "600"))
+SIZE = int(os.environ.get("FESTPOS_KRYPT_SIZE", "0"))  # Tests: feste Grösse
+GIB, MIB = 1 << 30, 1 << 20
+# Daten benutzen (nur zum Zurückfallen nach dem Start anhalten); festpos-node und rqlite starten erst danach
+SERVICES = ("festpos.service", "festpos-gast.service", "rqlited.service", "festpos-dhcp.service")
+FAST = ["--pbkdf", "pbkdf2", "--pbkdf-force-iterations", "1000"]           # Schlüssel aus dem Chip: 256 Bit zufällig
+SLOW = ["--pbkdf", "argon2id", "--pbkdf-memory", "262144", "--iter-time", "2000"]   # Wiederherstellungs-Schlüssel
+
+
+class Fehler(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def log(msg: str) -> None:
+    print(f"festpos-krypt: {msg}", flush=True)
+
+
+def run(cmd: list[str], timeout: int = 600, data: bytes | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, input=data, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(cmd, 99, b"", type(e).__name__.encode())
+
+
+def must(cmd: list[str], code: str, timeout: int = 600) -> None:
+    p = run(cmd, timeout)
+    if p.returncode:
+        log(f"{cmd[0]} {cmd[1] if len(cmd) > 1 else ''}: {(p.stderr or p.stdout).decode(errors='replace')[-300:]}")
+        raise Fehler(code)
+
+
+def write(path: Path, data: bytes, mode: int = 0o600, gid: int = -1) -> None:
+    tmp = path.with_name(f".{path.name}.neu")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if gid >= 0:
+        try:
+            os.chown(tmp, -1, gid)
+        except OSError:
+            pass
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def festpos_gid() -> int:
+    try:
+        return grp.getgrnam("festpos").gr_gid
+    except KeyError:
+        return -1
+
+
+def text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return ""
+
+
+# -- Schlüssel ---------------------------------------------------------------------------------------------------
+def tool_ok() -> bool:
+    return bool(shutil.which(CRYPTSETUP) and shutil.which(MKFS))
+
+
+def otp_read() -> bytes | None:
+    """Geheimer Schlüssel im Chip: Bytes, b"" (noch keiner) oder None (dieser Pi kann das nicht)."""
+    p = run([OTP], 30)
+    if p.returncode:
+        return None
+    h = p.stdout.decode(errors="replace").strip().lower()
+    if len(h) < 64 or any(c not in "0123456789abcdef" for c in h):
+        return None
+    b = bytes.fromhex(h[:64])
+    return b"" if not any(b) else b
+
+
+def otp_write() -> bytes:
+    """Neuen, zufälligen Schlüssel in den Chip schreiben (einmalig; nur wenn noch keiner drin ist)."""
+    if otp_read() != b"":
+        raise Fehler("otp")
+    key = os.urandom(32)
+    p = run([OTP, "-y", "-w", key.hex()], 60)
+    got = otp_read()
+    if p.returncode or got != key:
+        log("Schlüssel im Chip nicht geschrieben")
+        raise Fehler("otp")
+    log("Schlüssel in den Chip geschrieben (einmalig)")
+    return key
+
+
+def chip_key(otp: bytes) -> bytes:
+    return hmac.new(otp, b"festpos-daten-luks-v1", hashlib.sha256).digest()
+
+
+@contextmanager
+def keyfile(data: bytes):
+    """Schlüssel als Datei im Arbeitsspeicher (nur root), für cryptsetup."""
+    d = RUN / "tmp"
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    p = d / os.urandom(8).hex()
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, data)
+        os.close(fd)
+        yield str(p)
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def luks_open(key: bytes) -> bool:
+    with keyfile(key) as kf:
+        return run([CRYPTSETUP, "open", "--type", "luks2", "--key-file", kf, str(CONTAINER), NAME], 120).returncode == 0
+
+
+def luks_test(key: bytes) -> bool:
+    with keyfile(key) as kf:
+        return run([CRYPTSETUP, "open", "--test-passphrase", "--key-file", kf, str(CONTAINER)], 120).returncode == 0
+
+
+def luks_add(old: bytes, new: bytes, slow: bool = False) -> None:
+    with keyfile(old) as kf_old, keyfile(new) as kf_new:
+        must([CRYPTSETUP, "luksAddKey", "--batch-mode", "--key-file", kf_old, *(SLOW if slow else FAST), str(CONTAINER),
+              kf_new], "luks", 300)
+
+
+def luks_remove(key: bytes) -> None:
+    with keyfile(key) as kf:
+        must([CRYPTSETUP, "luksRemoveKey", "--batch-mode", str(CONTAINER), kf], "luks", 120)
+
+
+def is_open() -> bool:
+    return run([CRYPTSETUP, "status", NAME], 30).returncode == 0
+
+
+def aktiv() -> bool:
+    return CONTAINER.exists() and EINGEHAENGT.exists() and is_open()
+
+
+# -- Container ---------------------------------------------------------------------------------------------------
+def du(path: Path) -> int:
+    total = 0
+    for top, _dirs, files in os.walk(path):
+        for n in files:
+            try:
+                total += os.lstat(os.path.join(top, n)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def groesse(src: Path) -> int:
+    """Grösse des Containers: Platz für die Daten mehrfach (Datenbank, Archiv, Fully-APK), mindestens 2 GiB,
+    höchstens 60 % des freien Platzes."""
+    used = du(src)
+    if SIZE:
+        return SIZE
+    want = max(2 * GIB, 3 * used + GIB)
+    free = shutil.disk_usage(KDIR if KDIR.exists() else KDIR.parent).free
+    size = min(want, int(free * 0.6))
+    if size < used * 1.5 + 256 * MIB:
+        raise Fehler("space")
+    return size // MIB * MIB
+
+
+def tree(path: Path) -> dict[str, tuple]:
+    """Alles unter path: {relativer Pfad: (Art, Grösse/Ziel, SHA-256)} zum Vergleichen nach dem Kopieren."""
+    out = {}
+    for top, dirs, files in os.walk(path):
+        rel = os.path.relpath(top, path)
+        for n in dirs + files:
+            p = os.path.join(top, n)
+            r = os.path.normpath(os.path.join(rel, n))
+            if r == "lost+found":
+                continue
+            st = os.lstat(p)
+            if os.path.islink(p):
+                out[r] = ("l", os.readlink(p))
+            elif os.path.isdir(p):
+                out[r] = ("d",)
+            else:
+                h = hashlib.sha256()
+                with open(p, "rb") as f:
+                    while chunk := f.read(1 << 20):
+                        h.update(chunk)
+                out[r] = ("f", st.st_size, h.hexdigest())
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(top, d)) and
+                   os.path.normpath(os.path.join(rel, d)) != "lost+found"]
+    return out
+
+
+def kopieren(src: Path, dst: Path) -> None:
+    """Alles mit Besitzer und Rechten kopieren und Datei für Datei vergleichen."""
+    must(["cp", "-a", f"{src}/.", f"{dst}/"], "copy", 3600)
+    if tree(src) != tree(dst):
+        raise Fehler("verify")
+
+
+def gleiche_rechte(src: Path, dst: Path) -> None:
+    st = os.stat(src)
+    try:
+        os.chown(dst, st.st_uid, st.st_gid)
+    except OSError:
+        pass
+    os.chmod(dst, st.st_mode & 0o7777)
+
+
+def einhaengen() -> None:
+    """Container (offen) unter FS einhängen, «daten» nach /var/lib/festpos."""
+    FS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    must([MOUNT, "-o", "noatime,nodev,nosuid", str(MAPPER), str(FS)], "mount", 120)
+    DATA.mkdir(exist_ok=True)
+    p = run([MOUNT, "--bind", str(FS / "daten"), str(DATA)], 60)
+    if p.returncode:
+        run([UMOUNT, str(FS)], 60)
+        raise Fehler("mount")
+    EINGEHAENGT.touch()
+
+
+def aushaengen() -> None:
+    run([UMOUNT, str(DATA)], 120)
+    run([UMOUNT, str(FS)], 120)
+    EINGEHAENGT.unlink(missing_ok=True)
+
+
+def erzeugen(key: bytes, recovery: str, src: Path, offen: bool) -> None:
+    """Container anlegen (Schlüssel und Wiederherstellungs-Schlüssel), Daten aus src hinein und prüfen. Danach zu.
+    offen: Wiederherstellungs-Schlüssel bis zur Bestätigung im Container behalten (neuer Pi). Die Markierung BAUT
+    löscht der Aufrufer erst, wenn die Daten beiseite sind (beiseite): bis dahin räumt der nächste Start auf."""
+    KDIR.mkdir(mode=0o700, exist_ok=True)
+    size = groesse(src)
+    neu = RUN / "neu"
+    write(BAUT, b"1")
+    try:
+        fd = os.open(CONTAINER, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.posix_fallocate(fd, 0, size)                   # ganz belegen: die Karte läuft nie halb voll
+        except OSError:
+            raise Fehler("space") from None
+        finally:
+            os.close(fd)
+        with keyfile(key) as kf:
+            must([CRYPTSETUP, "luksFormat", "--batch-mode", "--type", "luks2", "--cipher", "aes-xts-plain64",
+                  "--key-size", "512", "--sector-size", "4096", *FAST, "--key-file", kf, str(CONTAINER)], "luks", 300)
+        luks_add(key, recovery.encode(), slow=True)
+        if not luks_open(key):
+            raise Fehler("luks")
+        must([MKFS, "-q", "-L", NAME, "-m", "0", str(MAPPER)], "mkfs", 600)
+        neu.mkdir(mode=0o700, parents=True, exist_ok=True)
+        must([MOUNT, "-o", "noatime,nodev,nosuid", str(MAPPER), str(neu)], "mount", 120)
+        try:
+            (neu / "daten").mkdir(exist_ok=True)
+            (neu / "geheim").mkdir(mode=0o700, exist_ok=True)
+            gleiche_rechte(src, neu / "daten")
+            kopieren(src, neu / "daten")
+            if offen:
+                write(neu / "geheim" / "wiederherstellung", recovery.encode())
+            shutil.rmtree(neu / "lost+found", ignore_errors=True)
+        finally:
+            run([UMOUNT, str(neu)], 120)
+        run([CRYPTSETUP, "close", NAME], 60)          # BAUT bleibt, bis der Aufrufer die Daten beiseite hat
+    except BaseException:
+        run([UMOUNT, str(neu)], 60)
+        run([CRYPTSETUP, "close", NAME], 60)
+        CONTAINER.unlink(missing_ok=True)
+        BAUT.unlink(missing_ok=True)
+        raise
+
+
+def halb_angelegt_wegraeumen() -> None:
+    """Strom weg (oder Abbruch) beim Anlegen: halben Container löschen – die Daten liegen noch unverändert da."""
+    if not BAUT.exists():
+        return
+    log("Container wurde nicht fertig angelegt – weggeräumt, die Daten sind unverändert")
+    run([UMOUNT, str(RUN / "neu")], 60)
+    run([CRYPTSETUP, "close", NAME], 60)
+    CONTAINER.unlink(missing_ok=True)
+    TEMP_KEY.unlink(missing_ok=True)
+    BAUT.unlink(missing_ok=True)
+    for weg in (NEU_ALT, ALT):                            # schon beiseite (auch halb: Ordner fehlt): zurück
+        if weg.exists() and DATA.is_dir() and not DATA.is_symlink() and not any(DATA.iterdir()):
+            DATA.rmdir()
+        if weg.exists() and not DATA.exists():
+            os.rename(weg, DATA)
+    fehler("aborted")
+
+
+def beiseite(src: Path, ziel: Path) -> None:
+    """Datenordner wegschieben und einen leeren mit denselben Rechten hinstellen (Einhängepunkt)."""
+    os.rename(src, ziel)
+    src.mkdir()
+    gleiche_rechte(ziel, src)
+
+
+# -- Geheimnisse -------------------------------------------------------------------------------------------------
+def einziehen() -> bool:
+    """Geheime Werte und Schlüssel von der Boot-Partition in den Container. Ein neuer Wert (am PC eingetragen) gilt.
+    -> etwas verschoben?"""
+    if not aktiv():
+        return False
+    (GEHEIM / "tls").mkdir(mode=0o700, parents=True, exist_ok=True)
+    conf = BOOT / "festpos.conf"
+    boot_text = text(conf)
+    stored_path = GEHEIM / "festpos.conf"
+    stored = geheim.read_stored(stored_path)
+    moved = False
+    if boot_text:
+        full = geheim.merge(boot_text, stored)
+        keyp = BOOT / "festpos-tls" / "server.key"
+        keyp = keyp if keyp.is_file() else GEHEIM / "tls" / "server.key"
+        new = emergency.convert_text(full, emergency.effective_secret(full, keyp))   # Notfall-Passwort: Prüfwert (#15)
+        full = new or full
+        values = geheim.secret_values(full)
+        if values != stored:
+            write(stored_path, geheim.stored_text(values).encode("utf-8", errors="surrogateescape"))
+        masked = geheim.mask(full)
+        if masked != boot_text:
+            write(conf, masked.encode("utf-8", errors="surrogateescape"), 0o644)
+            moved = True
+    for name in geheim.KEY_FILES:
+        p = BOOT / "festpos-tls" / name
+        if p.is_file():
+            write(GEHEIM / "tls" / name, p.read_bytes())
+            p.unlink()
+            moved = True
+    app_env = ETC / "tunnel-app.env"                       # Tunnel-Token aus der Verwaltung (festpos-update)
+    if app_env.is_file() and not app_env.is_symlink():
+        write(GEHEIM / "tunnel-app.env", app_env.read_bytes())
+        app_env.unlink()
+        moved = True
+    if moved:
+        log("Geheimnisse von der Boot-Partition in den verschlüsselten Bereich verschoben")
+        run([FSTRIM, str(BOOT)], 120)                      # gelöschte Blöcke der Karte freigeben
+    return moved
+
+
+def entpacken() -> None:
+    """Arbeitskopien für den laufenden Pi (Arbeitsspeicher, nur root): festpos-node liest festpos.conf und die
+    Schlüssel hier; die Verwaltung den noch nicht bestätigten Wiederherstellungs-Schlüssel."""
+    GRUN.mkdir(mode=0o750, parents=True, exist_ok=True)
+    gid = festpos_gid()
+    if gid >= 0:
+        try:
+            os.chown(GRUN, 0, gid)
+        except OSError:
+            pass
+    QUELLE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    on = aktiv()
+    for name in ("festpos.conf", *geheim.KEY_FILES, "tunnel-app.env"):
+        src = GEHEIM / ("tls" if name in geheim.KEY_FILES else "") / name if on else None
+        if src and src.is_file():
+            write(QUELLE / name, src.read_bytes())
+        else:
+            (QUELLE / name).unlink(missing_ok=True)
+    rec = GEHEIM / "wiederherstellung"
+    if on and rec.is_file():
+        write(OFFEN_APP, rec.read_bytes(), 0o640, gid)
+    else:
+        OFFEN_APP.unlink(missing_ok=True)
+
+
+# -- Stand -------------------------------------------------------------------------------------------------------
+def stand() -> dict:
+    otp = otp_read()
+    if AUFTRAG.exists() or PRUEFEN.exists() or GESUND.exists():
+        state = "umstellen"
+    elif not CONTAINER.exists():
+        state = "aus"
+    elif not aktiv():
+        state = "gesperrt"
+    elif TEMP_KEY.exists():
+        state = "kein_chip" if BESTAETIGT.exists() else "vorlaeufig"
+    else:
+        state = "aktiv"
+    d = {"state": state, "chip": "none" if otp is None else ("set" if otp else "empty"), "tool": tool_ok(),
+         "offen": aktiv() and (GEHEIM / "wiederherstellung").is_file(), "bestaetigt": text(BESTAETIGT).strip() or None,
+         "error": text(FEHLER).strip() or None, "at": int(time.time())}
+    try:
+        d["size"] = CONTAINER.stat().st_size
+        if aktiv():
+            u = shutil.disk_usage(DATA)
+            d["used"], d["free"] = u.used, u.free
+    except OSError:
+        pass
+    RUN.mkdir(mode=0o755, parents=True, exist_ok=True)
+    os.chmod(RUN, 0o755)
+    write(STAND, json.dumps(d).encode(), 0o644)
+    return d
+
+
+def fehler(code: str) -> None:
+    KDIR.mkdir(mode=0o700, exist_ok=True)
+    write(FEHLER, code.encode())
+    log(f"Fehler: {code}")
+
+
+def gesperrt_melden() -> None:
+    msg = ("FestPOS: Die Daten auf dieser Karte sind verschlüsselt und gehören zu einem anderen Pi (oder der Schlüssel\n"
+           "im Chip fehlt). Mit dem Wiederherstellungs-Schlüssel lesbar: Datei festpos-wiederherstellung.txt mit dem\n"
+           "Schlüssel auf die Boot-Partition legen und neu starten. Oder: Ersatz-Pi neu einrichten und die Sicherung\n"
+           "einspielen. Anleitung: Kapitel «Daten verschlüsselt».\n")
+    try:
+        (BOOT / "festpos-gesperrt.txt").write_text(msg.replace("\n", "\r\n"), encoding="utf-8")
+        issue = Path(f"{R}/etc/issue.d")
+        issue.mkdir(parents=True, exist_ok=True)
+        (issue / "festpos-krypt.issue").write_text("\n" + msg + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def gesperrt_aufheben() -> None:
+    (BOOT / "festpos-gesperrt.txt").unlink(missing_ok=True)
+    Path(f"{R}/etc/issue.d/festpos-krypt.issue").unlink(missing_ok=True)
+
+
+def neu_starten() -> None:
+    log("Pi startet neu")
+    run([SYSTEMCTL, "reboot", "--no-block"], 60)
+
+
+# -- Abläufe -----------------------------------------------------------------------------------------------------
+def recovery_from_boot() -> str | None:
+    try:
+        return geheim.recovery_norm(RECOVERY_FILE.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None
+
+
+def oeffnen_mit_schluessel() -> str | None:
+    """Container öffnen -> womit: chip, vorlaeufig, recovery (None: geht nicht)."""
+    if is_open():
+        return "schon"
+    otp = otp_read()
+    if otp and luks_open(chip_key(otp)):
+        return "chip"
+    if TEMP_KEY.is_file() and luks_open(TEMP_KEY.read_bytes()):
+        return "vorlaeufig"
+    rec = recovery_from_boot()
+    if rec and luks_open(rec.encode()):
+        return "recovery"
+    return None
+
+
+def uebernehmen(rec: str) -> None:
+    """Karte eines anderen (defekten) Pi mit dem Wiederherstellungs-Schlüssel geöffnet: ab jetzt mit dem Chip dieses
+    Pi (der Schlüssel ist ja gesichert)."""
+    otp = otp_read()
+    if otp is None:
+        key = os.urandom(32)                               # kann keinen Chip: Schlüssel auf der Karte
+        write(TEMP_KEY, key)
+        write(BESTAETIGT, time.strftime("%Y-%m-%d").encode(), 0o644)
+    else:
+        key = chip_key(otp or otp_write())
+        TEMP_KEY.unlink(missing_ok=True)
+    if not luks_test(key):
+        luks_add(rec.encode(), key)
+    RECOVERY_FILE.unlink(missing_ok=True)
+    log("Karte mit dem Wiederherstellungs-Schlüssel geöffnet und für diesen Pi übernommen")
+
+
+def neuer_pi() -> bool:
+    """Eingerichtet, aber noch nie gelaufen (keine Datenbank): beim ersten Start gleich verschlüsseln."""
+    if not (BOOT / "festpos.conf").is_file() or ALT.exists():
+        return False
+    rq = DATA / "rqlite"
+    if (rq / ".festpos-node").exists():
+        return False
+    try:
+        return not any(rq.iterdir())
+    except OSError:
+        return True
+
+
+def neu_verschluesseln() -> None:
+    """Neuer Pi: vorläufig mit einem Schlüssel auf der Karte, Wiederherstellungs-Schlüssel bis zur Bestätigung im
+    Container; den Schlüssel im Chip gibt es erst danach (bestaetigen)."""
+    DATA.mkdir(exist_ok=True)
+    KDIR.mkdir(mode=0o700, exist_ok=True)
+    rec = geheim.recovery_new()
+    temp = os.urandom(32)
+    write(TEMP_KEY, temp)
+    try:
+        erzeugen(temp, rec, DATA, offen=True)
+    except BaseException:
+        TEMP_KEY.unlink(missing_ok=True)
+        raise
+    weg = NEU_ALT
+    shutil.rmtree(weg, ignore_errors=True)
+    beiseite(DATA, weg)
+    BAUT.unlink(missing_ok=True)                          # ab hier: Rückfall unten statt Wegräumen beim Start
+    try:
+        if not luks_open(temp):
+            raise Fehler("luks")
+        einhaengen()
+    except (Fehler, OSError):                              # zurück: unverschlüsselt weiter wie bisher
+        aushaengen()
+        run([CRYPTSETUP, "close", NAME], 60)
+        if DATA.is_dir() and not DATA.is_symlink() and not any(DATA.iterdir()):
+            DATA.rmdir()
+        if not DATA.exists():
+            os.rename(weg, DATA)
+        CONTAINER.unlink(missing_ok=True)
+        TEMP_KEY.unlink(missing_ok=True)
+        raise
+    shutil.rmtree(weg, ignore_errors=True)
+    run([FSTRIM, f"{R}/" if R else "/"], 600)
+    log("neuer Pi: Daten verschlüsselt (vorläufig, bis der Wiederherstellungs-Schlüssel bestätigt ist)")
+
+
+def umstellen_beim_start() -> int:
+    """Auftrag der Verwaltung: Daten in den Container, Schlüssel in den Chip, neu starten (FestPOS startet dazwischen
+    nicht: Rückgabe 1 hält festpos-node, rqlite und FestPOS an)."""
+    try:
+        job = json.loads(AUFTRAG.read_text())
+    except (OSError, ValueError):
+        job = {}
+    AUFTRAG.unlink(missing_ok=True)
+    rec = geheim.recovery_norm(str(job.get("recovery") or ""))
+    try:
+        if not rec:
+            raise Fehler("job")
+        if CONTAINER.exists() or ALT.exists():
+            raise Fehler("exists")
+        if not tool_ok():
+            raise Fehler("no_tool")
+        otp = otp_read()
+        if otp is None:
+            key = os.urandom(32)
+            write(TEMP_KEY, key)
+        else:
+            key = chip_key(otp or otp_write())
+        log("Umstellen: Daten in den verschlüsselten Container kopieren")
+        erzeugen(key, rec, DATA, offen=False)
+        beiseite(DATA, ALT)
+        BAUT.unlink(missing_ok=True)
+        write(BESTAETIGT, time.strftime("%Y-%m-%d").encode(), 0o644)
+        PRUEFEN.touch()
+        FEHLER.unlink(missing_ok=True)
+    except Fehler as e:
+        if not CONTAINER.exists():
+            TEMP_KEY.unlink(missing_ok=True)
+        fehler(e.code)
+        stand()
+        return 0                                           # weiter wie bisher, unverschlüsselt
+    stand()
+    neu_starten()
+    return 1
+
+
+def zurueck_ohne_container(code: str) -> None:
+    """Der neue Container geht nicht auf: die alten Daten gelten wieder (es hat noch nichts darin geschrieben)."""
+    run([CRYPTSETUP, "close", NAME], 60)
+    CONTAINER.unlink(missing_ok=True)
+    TEMP_KEY.unlink(missing_ok=True)
+    if ALT.exists() and DATA.exists():                    # Einhängepunkt (leer oder mit Resten) wegschieben
+        if any(DATA.iterdir()):
+            os.rename(DATA, KDIR / f"rest-{int(time.time())}")
+        else:
+            DATA.rmdir()
+    if ALT.exists() and not DATA.exists():
+        os.rename(ALT, DATA)
+    for f in (PRUEFEN, GESUND, BESTAETIGT):
+        f.unlink(missing_ok=True)
+    fehler(code)
+    log("Rückfall: die bisherigen, unverschlüsselten Daten gelten wieder")
+
+
+def oeffnen() -> int:
+    RUN.mkdir(mode=0o755, parents=True, exist_ok=True)
+    halb_angelegt_wegraeumen()
+    if AUFTRAG.exists():
+        return umstellen_beim_start()
+    if not CONTAINER.exists():
+        for f in (PRUEFEN, GESUND):
+            f.unlink(missing_ok=True)
+        if neuer_pi() and tool_ok():
+            try:
+                neu_verschluesseln()
+                FEHLER.unlink(missing_ok=True)
+            except Fehler as e:
+                fehler(e.code)
+            except OSError as e:
+                log(f"neuer Pi nicht verschlüsselt: {type(e).__name__}")
+                fehler("io")
+        einziehen()
+        entpacken()
+        stand()
+        return 0
+    how = oeffnen_mit_schluessel()
+    otp = otp_read()
+    if PRUEFEN.exists() and (how not in ("chip", "schon") and not (otp is None and how == "vorlaeufig")):
+        if how:
+            run([CRYPTSETUP, "close", NAME], 60)
+        zurueck_ohne_container("verify")                 # geht nicht mit dem Chip auf: nichts riskieren
+        entpacken()
+        stand()
+        return 0
+    if not how:
+        log("Container lässt sich nicht öffnen – FestPOS startet nicht (Karte eines anderen Pi?)")
+        gesperrt_melden()
+        stand()
+        return 1
+    if not EINGEHAENGT.exists():
+        try:
+            einhaengen()
+        except Fehler as e:
+            fehler(e.code)
+            stand()
+            return 1
+    gesperrt_aufheben()
+    if how == "recovery":
+        try:
+            uebernehmen(recovery_from_boot() or "")
+        except Fehler as e:
+            fehler(e.code)
+    shutil.rmtree(NEU_ALT, ignore_errors=True)            # Strom weg nach dem Anlegen (neuer Pi): Rest löschen
+    if ALT.exists() and not PRUEFEN.exists() and not GESUND.exists():
+        GESUND.touch()                                     # Strom weg zwischen Kopieren und Neustart: wie geprüft
+    if PRUEFEN.exists():
+        PRUEFEN.unlink()
+        GESUND.touch()                                     # festpos-krypt-pruefen.service prüft, ob FestPOS läuft
+        log("umgestellt: Container geht mit dem Chip auf – warte, bis FestPOS läuft")
+    if not GESUND.exists():
+        einziehen()
+    entpacken()
+    stand()
+    return 0
+
+
+def gesund() -> bool:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE                       # nur 127.0.0.1
+    try:
+        with urllib.request.urlopen(HEALTH, timeout=5, context=ctx):
+            return True                                    # Fehler (4xx, 5xx, keine Verbindung) -> Ausnahme
+    except Exception:  # noqa: BLE001 – läuft (noch) nicht
+        return False
+
+
+def nachpruefen() -> int:
+    if not GESUND.exists():
+        return 0
+    end = time.monotonic() + WAIT_S
+    while time.monotonic() < end:
+        if gesund():
+            shutil.rmtree(ALT, ignore_errors=True)
+            GESUND.unlink(missing_ok=True)
+            FEHLER.unlink(missing_ok=True)
+            einziehen()
+            entpacken()
+            run([FSTRIM, f"{R}/" if R else "/"], 600)      # gelöschte, unverschlüsselte Blöcke freigeben
+            log("umgestellt: FestPOS läuft – alte, unverschlüsselte Daten gelöscht")
+            stand()
+            return 0
+        time.sleep(min(5, max(0.1, WAIT_S / 20)))
+    log("umgestellt, aber FestPOS läuft nicht – alles zurück wie vorher")
+    for s in SERVICES:
+        run([SYSTEMCTL, "stop", s], 120)
+    neu = KDIR / "alt-neu"
+    shutil.rmtree(neu, ignore_errors=True)
+    try:
+        neu.mkdir()
+        gleiche_rechte(DATA, neu)
+        kopieren(DATA, neu)                               # was inzwischen geschrieben wurde, bleibt
+    except (Fehler, OSError):
+        shutil.rmtree(neu, ignore_errors=True)
+        neu = ALT
+    aushaengen()
+    run([CRYPTSETUP, "close", NAME], 60)
+    if neu != ALT:
+        shutil.rmtree(ALT, ignore_errors=True)
+        os.rename(neu, ALT)
+    zurueck_ohne_container("health")
+    stand()
+    neu_starten()
+    return 1
+
+
+def umstellen(job: dict) -> int:
+    """Auftrag der Verwaltung ablegen: umgestellt wird beim nächsten Start, bevor FestPOS läuft."""
+    rec = geheim.recovery_norm(str(job.get("recovery") or ""))
+    if not rec:
+        return melde({"ok": False, "code": "job"})
+    if CONTAINER.exists() or ALT.exists():
+        return melde({"ok": False, "code": "exists"})
+    if not tool_ok():
+        return melde({"ok": False, "code": "no_tool"})
+    try:
+        groesse(DATA)
+    except Fehler as e:
+        return melde({"ok": False, "code": e.code})
+    KDIR.mkdir(mode=0o700, exist_ok=True)
+    write(AUFTRAG, json.dumps({"recovery": rec, "at": int(time.time())}).encode())
+    FEHLER.unlink(missing_ok=True)
+    run([SYSTEMCTL, "start", "festpos-sicherung.service"], 300)   # Sicherung auf den USB-Stick (wenn einer steckt)
+    stand()
+    return melde({"ok": True, "restart": True})
+
+
+def bestaetigen() -> int:
+    """Neuer Pi: Wiederherstellungs-Schlüssel gesichert -> Schlüssel in den Chip, vorläufigen löschen."""
+    if not aktiv() or not TEMP_KEY.is_file():
+        return melde({"ok": False, "code": "state"})
+    temp = TEMP_KEY.read_bytes()
+    otp = otp_read()
+    try:
+        if otp is not None:
+            key = chip_key(otp or otp_write())
+            if not luks_test(key):
+                luks_add(temp, key)
+            if not luks_test(key):
+                raise Fehler("luks")
+            if luks_test(temp):                            # wiederholbar: nach einem Abbruch schon entfernt
+                luks_remove(temp)
+            TEMP_KEY.unlink(missing_ok=True)
+            run([FSTRIM, f"{R}/" if R else "/"], 600)
+    except Fehler as e:
+        fehler(e.code)
+        stand()
+        return melde({"ok": False, "code": e.code})
+    (GEHEIM / "wiederherstellung").unlink(missing_ok=True)
+    write(BESTAETIGT, time.strftime("%Y-%m-%d").encode(), 0o644)
+    FEHLER.unlink(missing_ok=True)
+    entpacken()
+    stand()
+    log("Wiederherstellungs-Schlüssel bestätigt" + ("" if otp is None else " – Schlüssel im Chip"))
+    return melde({"ok": True})
+
+
+def melde(res: dict) -> int:
+    print(json.dumps(res))
+    return 0 if res.get("ok") else 1
+
+
+def main(argv: list[str]) -> int:
+    if argv == ["--oeffnen"]:
+        return oeffnen()
+    if argv == ["--nachpruefen"]:
+        return nachpruefen()
+    if argv == ["--umstellen"]:
+        try:
+            job = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            job = {}
+        return umstellen(job if isinstance(job, dict) else {})
+    if argv == ["--bestaetigen"]:
+        return bestaetigen()
+    if argv == ["--einziehen"]:
+        einziehen()
+        entpacken()
+        stand()
+        return 0
+    if argv == ["--stand"]:
+        stand()
+        return 0
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

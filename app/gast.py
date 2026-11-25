@@ -54,7 +54,7 @@ LANGS = ("de", "fr", "it", "en", "rm")
 SETTINGS = ("gast_open", "gast_domain", "gast_max_cents", "gast_refund_min", "gast_instance", "gast_key_enc",
             "gast_tunnel_enc")
 # Schlüssel des Gästedienstes: pro Pi zufällig (festpos-node), lesbar für festpos-gast und festpos
-TOKEN_FILE = Path(os.environ.get("FESTPOS_GAST_TOKEN_FILE", "/etc/festpos-gast/token"))
+TOKEN_FILE = Path(os.environ.get("FESTPOS_GAST_TOKEN_FILE", "/run/festpos-gast/token"))
 
 router = APIRouter(prefix="/api/gast")
 admin_router = APIRouter(prefix="/api/admin", dependencies=[Depends(admin)])

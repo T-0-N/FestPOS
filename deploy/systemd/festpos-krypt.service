@@ -1,0 +1,16 @@
+[Unit]
+Description=FestPOS: verschlüsselte Daten öffnen (Schlüssel im Chip, T-0-N/FestPOS#3)
+# Vor allem, was /var/lib/festpos braucht. Geht der Container nicht auf, starten festpos-node, rqlite und FestPOS
+# nicht (Requires=) – nie mit einer leeren Datenbank.
+After=local-fs.target
+Before=festpos-node.service rqlited.service festpos.service festpos-dhcp.service festpos-gast.service festpos-einrichtung.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/festpos-krypt --oeffnen
+# Umstellen kopiert alle Daten in den Container
+TimeoutStartSec=2h
+
+[Install]
+WantedBy=multi-user.target

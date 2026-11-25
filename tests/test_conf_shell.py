@@ -96,4 +96,24 @@ def test_wifi_prepare_removes_only_the_wifi_overlay(tmp_path):
     assert run().returncode == 0
     assert cfg.read_text() == "[all]\ndtoverlay=disable-bt\n"
     assert run().returncode == 1                                         # schon so: nichts geändert
-    assert (tmp_path / "nmcli.log").read_text() == "radio wifi off\nradio wifi off\n"
+    assert (tmp_path / "nmcli.log").read_text().count("radio wifi off") == 2
+
+
+def test_wifi_prepare_country_and_radio_stays_on_while_connected(tmp_path):
+    """WLAN-Land CH in cmdline.txt (einmal, in der einen Zeile); läuft «dauerhaft verbunden» über das WLAN
+    (Verbindung festpos-internet aktiv, z.B. mitten in einem Update), bleibt der Funk an."""
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "nmcli").write_text(f'#!/bin/sh\necho "$*" >> "{tmp_path}/nmcli.log"\n'
+                                '[ "$*" = "-t -f NAME connection show --active" ] && echo "${FAKE_ACTIVE:-}"\nexit 0\n')
+    (stub / "nmcli").chmod(0o755)
+    cmd = tmp_path / "cmdline.txt"
+    cmd.write_text("console=serial0,115200 root=PARTUUID=abc rootwait\n")
+    env = {"PATH": f"{stub}:{os.environ['PATH']}", "FAKE_ACTIVE": "festpos-internet"}
+    run = lambda: subprocess.run(["bash", "-c", f'source "{LIB}"; festpos_wifi_prepare "{tmp_path}"'], env=env)  # noqa: E731
+    assert run().returncode == 0 and run().returncode == 1
+    assert cmd.read_text() == "console=serial0,115200 root=PARTUUID=abc rootwait cfg80211.ieee80211_regdom=CH\n"
+    assert "radio wifi off" not in (tmp_path / "nmcli.log").read_text()
+    env["FAKE_ACTIVE"] = "Wired connection 1"
+    run()
+    assert "radio wifi off" in (tmp_path / "nmcli.log").read_text()

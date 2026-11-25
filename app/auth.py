@@ -70,8 +70,17 @@ _RULES = """
 GET /api/admin/me base
 POST /api/admin/me/password base
 POST /api/admin/me/logout-all base
+POST /api/admin/me/refresh base
+POST /api/admin/me/confirm base
+GET /api/admin/me/totp base
+POST /api/admin/me/totp/start base
+POST /api/admin/me/totp/confirm base
+POST /api/admin/me/totp/later base
+POST /api/admin/me/totp/off base
+POST /api/admin/me/totp/codes base
 GET /api/admin/stats base
 GET /api/admin/lamp base
+GET /api/admin/netinfo base
 GET /api/admin/cluster base
 GET /api/admin/printers base
 GET /api/admin/settings base
@@ -103,6 +112,8 @@ GET /api/admin/closings/{id}/pdf closing
 GET /api/admin/closings/{id}/csv closing
 GET /api/admin/closings/{id}/verify closing
 GET /api/admin/audit audit
+GET /api/admin/security audit
+POST /api/admin/security/seen audit
 GET /api/admin/categories catalog stock
 POST /api/admin/categories catalog
 PUT /api/admin/categories/{id} catalog
@@ -179,6 +190,48 @@ POST /api/admin/fully/license devices
 POST /api/admin/fully/adb devices
 POST /api/admin/uplink/check devices
 """
+# Kritische Aktionen (T-0-N/FestPOS#9): nur mit frischer Bestätigung (Passwort und ggf. Code, 5 Minuten, twofa.py).
+_CRITICAL = """
+POST /api/admin/update/upload
+POST /api/admin/update/start
+POST /api/admin/update/rollback
+POST /api/admin/update/retry
+PUT /api/admin/update/net
+POST /api/admin/update/net/download
+POST /api/admin/users
+PUT /api/admin/users/{id}
+DELETE /api/admin/users/{id}
+POST /api/admin/roles
+PUT /api/admin/roles/{id}
+DELETE /api/admin/roles/{id}
+POST /api/admin/restore
+POST /api/admin/restore/keys
+POST /api/admin/reset-orders
+POST /api/admin/backup/password/new
+PUT /api/admin/printer-net
+PUT /api/admin/firewall
+POST /api/admin/season/close
+POST /api/admin/os/online
+POST /api/admin/cluster/expand
+POST /api/admin/cluster/kartenpaket
+POST /api/admin/cluster/karte
+POST /api/admin/krypt/{node}/umstellen
+GET /api/admin/krypt/{node}/offen
+POST /api/admin/krypt/{node}/bestaetigen
+POST /api/admin/umzug/start
+POST /api/admin/umzug/bestaetigen
+POST /api/admin/umzug/zurueck
+POST /api/admin/umzug/ca-key
+"""
+CRITICAL_SETTINGS = frozenset({"admin_cert_only", "admin_idle_minutes", "totp_required_roles", "net_keep",
+                               "net_updates", "net_phones"})
+
+
+def critical(method: str, path: str) -> bool:
+    """Kritische Aktion (Bestätigung nötig)? Einstellungen: settings_admin prüft die einzelnen Schlüssel."""
+    return any(m == method and rx.match(path) for m, rx, _ in CRITICAL_RULES)
+
+
 # Festleitung darf über PUT /settings nur den Testmodus ändern (siehe settings_admin.put_settings) – ohne Recht «admin»
 LEAD_SETTINGS = frozenset({"test_enabled", "test_pin", "test_print", "test_pin_required"})
 
@@ -200,6 +253,7 @@ def _compile(text: str) -> list[tuple[str, re.Pattern, tuple[str, ...]]]:
 
 
 RULES = _compile(_RULES)
+CRITICAL_RULES = _compile("\n".join(f"{line} admin" for line in _CRITICAL.strip().splitlines()))
 
 
 def required(method: str, path: str) -> tuple[str, ...]:

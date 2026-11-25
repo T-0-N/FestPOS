@@ -14,6 +14,16 @@ BOOT=/boot/firmware; [ -d "$BOOT" ] || BOOT=/boot
 # shellcheck source=festpos-conf.sh
 source "$(dirname "$0")/festpos-conf.sh"
 festpos_read_conf "$BOOT/festpos.conf"
+# Daten verschlüsselt (T-0-N/FestPOS#3): geheime Werte und Schlüssel liegen im Container, beim Start entpackt
+QUELLE=/run/festpos-geheim/quelle
+[ -f "$QUELLE/festpos.conf" ] && festpos_read_conf "$QUELLE/festpos.conf"
+KRYPT=/usr/local/sbin/festpos-krypt
+GEHEIM=/run/festpos-krypt/fs/geheim                         # Container (festpos-krypt: FS / "geheim")
+KVOR=""
+trap 'rm -rf ${KVOR:+"$KVOR"}' EXIT
+ALT=""                                                     # nie Werte aus der Umgebung übernehmen
+UNMASKED=""
+OLDKEY=$BOOT/festpos-tls/server.key; [ -f "$OLDKEY" ] || OLDKEY=$QUELLE/server.key
 die() { echo "FEHLER: $*"; echo "Nichts geändert."; exit 1; }
 
 for f in ca.crt server.crt server.key device-ca.crt; do [ -f "$SRC/$f" ] || die "$f fehlt in $SRC"; done
@@ -38,13 +48,22 @@ fi
 
 # Neuer Server-Schlüssel und CLUSTER_SECRET noch der Platzhalter: das bisher abgeleitete Geheimnis festschreiben
 # (jeder Pi rechnet es aus demselben alten Schlüssel) – sonst wären die Prüfsummen im Kassenbuch nicht mehr prüfbar
-if [ -f "$BOOT/festpos-tls/server.key" ] && ! cmp -s "$SRC/server.key" "$BOOT/festpos-tls/server.key" &&
-    festpos_secret_fix "$BOOT/festpos.conf" "$BOOT/festpos-tls/server.key"; then
+# Verschlüsselt und im Container nur der Platzhalter: ihn zurück in festpos.conf (kein Geheimnis), damit er wie bisher
+# festgeschrieben wird – festpos-krypt verschiebt das Ergebnis danach wieder in den Container
+if grep -qE '^[[:space:]]*CLUSTER_SECRET[[:space:]]*=[[:space:]]*"?im-container' "$BOOT/festpos.conf"; then
+  case "${CLUSTER_SECRET:-}" in
+    ""|admin|bitte-aendern|bitte-aendern-lang-und-zufaellig)
+      sed -i -E 's/^[[:space:]]*CLUSTER_SECRET[[:space:]]*=.*/CLUSTER_SECRET=bitte-aendern/' "$BOOT/festpos.conf"
+      UNMASKED=1 ;;
+  esac
+fi
+if [ -f "$OLDKEY" ] && ! cmp -s "$SRC/server.key" "$OLDKEY" && festpos_secret_fix "$BOOT/festpos.conf" "$OLDKEY"; then
   (festpos_read_conf "$BOOT/festpos.conf" >/dev/null 2>&1
-   tmp=$(mktemp /etc/festpos/env.XXXXXX)
-   grep -v '^FESTPOS_CLUSTER_SECRET=' /etc/festpos/env > "$tmp" || true
+   ENVF=$(readlink -f /etc/festpos/env)                  # Arbeitskopie im Arbeitsspeicher (festpos-node)
+   tmp=$(mktemp "$ENVF.XXXXXX")
+   grep -v '^FESTPOS_CLUSTER_SECRET=' "$ENVF" > "$tmp" || true
    festpos_env_line FESTPOS_CLUSTER_SECRET "$CLUSTER_SECRET" >> "$tmp"
-   chown root:festpos "$tmp"; chmod 0640 "$tmp"; mv "$tmp" /etc/festpos/env)
+   chown root:festpos "$tmp"; chmod 0640 "$tmp"; mv "$tmp" "$ENVF")
   echo "CLUSTER_SECRET in festpos.conf festgeschrieben (aus dem bisherigen Schlüssel, Prüfsummen bleiben prüfbar)."
 fi
 
@@ -59,6 +78,25 @@ for f in ca.crt server.crt server.key device-ca.crt device-ca.key; do
 done
 rm -f "$BOOT/festpos-tls/ca.key"
 sync
+# Verschlüsselt: Schlüssel (und ein festgeschriebenes CLUSTER_SECRET) gleich in den Container. Geht das nicht, bleibt
+# kein Schlüssel im Klartext auf der Boot-Partition: zurück zum bisherigen Stand (die neuen liegen ja noch in $SRC).
+if [ -e /run/festpos-krypt/eingehaengt ] && [ -x "$KRYPT" ]; then
+  # auch der Container zurück, falls einziehen ihn halb geändert hat (sonst passte sein server.key nicht mehr)
+  KVOR=$(mktemp -d /run/festpos-krypt/vor-zertifikate.XXXXXX)
+  [ -d "$GEHEIM/tls" ] && cp -a "$GEHEIM/tls" "$KVOR/tls"
+  [ -f "$GEHEIM/festpos.conf" ] && cp -a "$GEHEIM/festpos.conf" "$KVOR/festpos.conf"
+  if ! "$KRYPT" --einziehen || [ -f "$BOOT/festpos-tls/server.key" ] || [ -f "$BOOT/festpos-tls/device-ca.key" ]; then
+    rm -f "$BOOT/festpos-tls/server.key" "$BOOT/festpos-tls/device-ca.key"
+    [ -n "${ALT:-}" ] && cp -a "$ALT/." "$BOOT/festpos-tls/"
+    rm -rf "$GEHEIM/tls"
+    [ -d "$KVOR/tls" ] && cp -a "$KVOR/tls" "$GEHEIM/tls"
+    [ -f "$KVOR/festpos.conf" ] && cp -a "$KVOR/festpos.conf" "$GEHEIM/festpos.conf"
+    [ -n "${UNMASKED:-}" ] &&
+      sed -i -E 's/^[[:space:]]*CLUSTER_SECRET[[:space:]]*=.*/CLUSTER_SECRET=im-container/' "$BOOT/festpos.conf"
+    die "Schlüssel liessen sich nicht in den verschlüsselten Bereich verschieben (festpos-krypt) – bitte nochmals versuchen"
+  fi
+fi
+key_src() { if [ -f "$BOOT/festpos-tls/$1" ]; then echo "$BOOT/festpos-tls/$1"; elif [ -f "$QUELLE/$1" ]; then echo "$QUELLE/$1"; fi; }
 
 echo "==> Anwenden"
 # Nur die Zertifikate (wie festpos-node beim Start) – nicht das ganze festpos-node, das z.B. die Datenbank
@@ -66,9 +104,9 @@ echo "==> Anwenden"
 ETC=/etc/festpos/tls
 install -d -m 0750 -o root -g festpos "$ETC"
 install -m 0644 "$BOOT/festpos-tls/server.crt" "$BOOT/festpos-tls/ca.crt" "$BOOT/festpos-tls/device-ca.crt" "$ETC/"
-install -m 0640 -o root -g festpos "$BOOT/festpos-tls/server.key" "$ETC/"
-if [ -f "$BOOT/festpos-tls/device-ca.key" ]; then
-  install -m 0640 -o root -g festpos "$BOOT/festpos-tls/device-ca.key" "$ETC/"
+install -m 0640 -o root -g festpos "$(key_src server.key)" "$ETC/server.key"
+if [ -n "$(key_src device-ca.key)" ]; then
+  install -m 0640 -o root -g festpos "$(key_src device-ca.key)" "$ETC/device-ca.key"
 else
   rm -f "$ETC/device-ca.key"
 fi

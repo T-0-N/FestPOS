@@ -1,5 +1,7 @@
 [Unit]
 Description=FestPOS: rqlite (replizierte Datenbank, Raft)
+After=festpos-krypt.service
+Requires=festpos-krypt.service
 After=festpos-node.service network-online.target
 Wants=network-online.target
 Requires=festpos-node.service

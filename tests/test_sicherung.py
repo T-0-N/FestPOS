@@ -70,7 +70,8 @@ def test_download_is_encrypted_with_everything(client):
         assert plain.encode() not in data                         # nichts im Klartext
     content = backup.unpack(data, PW)
     cfg = _settings_of(content["festpos.sqlite"])
-    assert cfg["event_name"] == "Theaterfest" and all(cfg[k] == v for k, v in SECRETS.items())
+    from app import secretbox                    # in der Datenbank evtl. schon verschlüsselt (migrate, T-0-N/FestPOS#8)
+    assert cfg["event_name"] == "Theaterfest" and all(secretbox.unseal(k, cfg[k]) == v for k, v in SECRETS.items())
     assert json.loads(content["conf.json"])["admin_password"] == "geheim"
     with pytest.raises(backup.BadPassword):
         backup.unpack(data, PW + "x")

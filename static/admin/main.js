@@ -6,6 +6,7 @@
 import { $, api, download, forgetLogin, guard, myLang, setMe, toast, TOKEN } from "./core.js";
 import { loadBrand, loadLangs, loadNav, page, pairTimer, refreshTimer, RENDER, selectTab, shell, show, showLogin, showVersion, toggleMenu, toggleUserMenu } from "./shell.js";
 import { openOwnPassword, openPower } from "./system.js";
+import { checkSetup, openTotp } from "./twofa.js";
 // die Seiten tragen sich beim Laden in RENDER ein
 import "./overview.js";
 import "./orders.js";
@@ -36,6 +37,7 @@ document.addEventListener("click", async (e) => {
   // Wechsel in die Bestell-App = abmelden: Handys teilen sich die Bedienung, die Anmeldung soll nicht liegen bleiben
   if (e.target.closest('[data-jump="app"]')) { forgetLogin(); return; }
   if (e.target.closest("[data-ownpw]")) { openOwnPassword(); return; }
+  if (e.target.closest("[data-totp]")) { openTotp(); return; }
   const pw = e.target.closest("[data-power]");
   if (pw) { openPower(pw.dataset.power, pw.dataset.node); return; }
   if (e.target.closest("[data-logoutall]")) {
@@ -65,6 +67,7 @@ document.addEventListener("click", async (e) => {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
 });
+addEventListener("festpos:totp", () => { if ($("#main")) show(page); });   // zweiter Faktor eingerichtet: Seite neu
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if ($("#usermenu") && !$("#usermenu").hidden) { toggleUserMenu(false); $(".userbtn")?.focus(); return; }
@@ -74,7 +77,7 @@ document.addEventListener("keydown", (e) => {
   await Promise.all([I18n.load(myLang()), loadBrand(), loadNav()]);   // Sprache dieses Browsers (sonst Standard aus den Einstellungen)
   document.title = t("admin.nav.title");
   if (!TOKEN) return showLogin();
-  try { setMe(await api("GET", "/me")); await loadLangs(); shell(); showVersion(); show(page); }
+  try { setMe(await api("GET", "/me")); await loadLangs(); shell(); showVersion(); show(page); checkSetup(); }
   // 401: api() zeigt die Anmeldung schon. Sonst – z.B. 403 «nur mit Gerätezertifikat» bei noch gespeicherter
   // Anmeldung (CodeRabbit zu PR 80) – die Anmeldung mit der Meldung statt einer leeren Seite
   catch (e) { if (!$("#login")) showLogin(e.message); }

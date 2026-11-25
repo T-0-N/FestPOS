@@ -18,6 +18,8 @@ def server(tmp_path_factory):
     proc, base, c = _start(tmp_path_factory.mktemp("side"))
     r = c.post("/api/admin/users", auth=AUTH, json={"name": "Maria", "role": "admin", "password": "Muster-passwort"})
     assert r.status_code == 200, r.text                    # normaler Benutzer (der Notfall-Admin hat kein «Passwort ändern»)
+    # hier geht es um die Seitenleiste: ohne Pflicht für den zweiten Faktor (sonst zuerst «Einrichten», test_browser_twofa)
+    assert c.put("/api/admin/settings", auth=AUTH, json={"totp_required_roles": []}).status_code == 200
     yield base, c
     proc.terminate()
     proc.wait(10)
@@ -75,7 +77,7 @@ def test_user_menu(server, browser, width):  # noqa: F811
     btn.click()
     assert menu.is_visible() and btn.get_attribute("aria-expanded") == "true"
     items = " ".join(menu.inner_text().split())
-    for want in ("Angemeldet als Maria (Admin)", "Passwort ändern", "Überall abmelden", "Abmelden", "Version"):
+    for want in ("Angemeldet als Maria (Admin)", "Passwort ändern", "Zweiter Faktor", "Überall abmelden", "Abmelden", "Version"):
         assert want in items, items
     box = menu.bounding_box()
     assert box["x"] >= 0 and box["x"] + box["width"] <= width and box["y"] >= 0 and box["y"] + box["height"] <= 900   # ganz sichtbar

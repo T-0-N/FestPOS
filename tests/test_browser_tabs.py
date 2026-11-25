@@ -110,7 +110,7 @@ def test_settle_per_person_and_rights(server, browser):  # noqa: F811
     _until(page, "true")
     for _ in range(30):
         d = c.get(f"/api/admin/tabs/{tid}", auth=AUTH).json()
-        if d["payments"]:
+        if d["payments"] and d["paid"] > 0:                       # Zahlung und Summe (kann kurz nachhinken)
             break
         page.wait_for_timeout(100)
     assert len(d["payments"]) == 1 and d["payments"][0]["part"] == 1 and d["paid"] > 0

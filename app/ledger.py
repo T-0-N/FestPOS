@@ -1229,7 +1229,7 @@ class PhoneReceiptIn(BaseModel):
 
 
 async def _receipt_reply(res: dict) -> dict:
-    """Drucker wecken. (Über CHF 400 mit MWST verlangt receipts.issue Name und Adresse – am Handy gar nicht.)"""
+    """Drucker wecken. (Über CHF 400 mit MWST verlangt receipts.issue Name und Ort – am Handy gar nicht.)"""
     if rt.spooler and res.get("printer_id"):
         rt.spooler.notify(res["printer_id"])
     return res
@@ -1270,7 +1270,9 @@ async def phone_receipt(r: PhoneReceiptIn, request: Request):
 class AdminReceiptIn(BaseModel):
     request_id: str = Field(pattern=REQ_ID)
     copy_of: int | None = Field(default=None, ge=1)
-    recipient: str = Field(default="", max_length=300)                       # Name und Adresse (über CHF 400)
+    recipient: str = Field(default="", max_length=300)                       # ältere Form: Zeilen (Skripte)
+    recipient_name: str = Field(default="", max_length=48)       # über CHF 400 mit MWST: Name … (48 = eine Bonzeile)
+    recipient_place: str = Field(default="", max_length=48)      # … und Ort des Gastes (Art. 26 MWSTG)
 
 
 @admin_router.post("/orders/{oid}/receipt")
@@ -1284,8 +1286,11 @@ async def admin_receipt(oid: int, r: AdminReceiptIn, request: Request):
                 raise receipts.ReceiptError(t("err.receipt.unknown"), 404)
             res = await db(receipts.copies, rt.store, [r.copy_of], request_id=r.request_id, by_user=actor_of(request))
         else:
+            name, place = " ".join(r.recipient_name.split()), " ".join(r.recipient_place.split())
+            if bool(name) != bool(place):                  # Name UND Ort (T-0-N/FestPOS#12) – nicht nur eines
+                raise receipts.ReceiptError(t("err.receipt.name_place"), 422)
             res = await db(receipts.issue, rt.store, order_id=oid, request_id=r.request_id, by_user=actor_of(request),
-                           recipient=r.recipient)
+                           recipient=f"{name}\n{place}" if name else r.recipient)
     except receipts.ReceiptError as e:
         raise HTTPException(e.status, str(e)) from None
     return await _receipt_reply(res)
@@ -1409,8 +1414,14 @@ async def closing_verify(cid: int):
 
 
 @admin_router.get("/audit")
-async def audit_list(q: str = Query("", max_length=60), limit: int = Query(300, ge=1, le=2000)):
-    if q.strip():
+async def audit_list(q: str = Query("", max_length=60), limit: int = Query(300, ge=1, le=2000), sec: bool = False):
+    if sec:                                              # nur Sicherheitsereignisse (T-0-N/FestPOS#11)
+        from .sicherheit import ACTIONS
+        like = f"%{q.strip()}%"
+        rows = await db(rt.store.query, f"SELECT * FROM audit_log WHERE action IN ({','.join('?' * len(ACTIONS))}) "
+                                        "AND (actor LIKE ? OR action LIKE ? OR details LIKE ?) ORDER BY id DESC LIMIT ?",
+                        (*ACTIONS, like, like, like, limit))
+    elif q.strip():
         like = f"%{q.strip()}%"
         rows = await db(rt.store.query, "SELECT * FROM audit_log WHERE actor LIKE ? OR action LIKE ? OR details LIKE ? "
                                         "ORDER BY id DESC LIMIT ?", (like, like, like, limit))

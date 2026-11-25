@@ -24,7 +24,7 @@ jobs:
   zip:
     needs: pruefen
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
@@ -39,8 +39,22 @@ jobs:
         run: |
           python3 -c "import sys; sys.path.insert(0, '.'); from app.release import parse_key_line; \
           k = parse_key_line(open('deploy/festpos-update-projekt.pub').read()); print('Projekt-Schlüssel', k.fp)"
+      - name: Sicherheitsupdates des Betriebssystems holen (T-0-N/FestPOS#5, nur mit deploy/os-pakete.txt)
+        if: hashFiles('deploy/os-pakete.txt') != ''
+        run: |
+          sudo apt-get install -y -q debian-archive-keyring
+          curl -fsSL https://archive.raspberrypi.com/debian/raspberrypi.gpg.key | gpg --dearmor > "$RUNNER_TEMP/rpi.gpg"
+          # genau ein Hauptschlüssel, und zwar der bekannte (Fingerabdrücke von Unterschlüsseln zählen nicht)
+          fp=$(gpg --show-keys --with-colons "$RUNNER_TEMP/rpi.gpg" | awk -F: '/^pub/ {p=1; next} /^sub/ {p=0} p && /^fpr/ {print $10; p=0}')
+          test "$fp" = "$RPI_KEY_FP" || { echo "::error::Unerwartete Schlüssel von Raspberry Pi: $fp"; exit 1; }
+          python3 tools/os_updates.py --pakete deploy/os-pakete.txt --ziel dist/os-updates \
+            --debian-keyring /usr/share/keyrings/debian-archive-keyring.gpg --rpi-keyring "$RUNNER_TEMP/rpi.gpg"
+        env:
+          RPI_KEY_FP: CF8A1AF502A2AA2D763BAE7E82B129927FA3303E   # Raspberry Pi Archive Signing Key
       - name: festpos.zip bauen (Python-Pakete und rqlite mit Prüfsumme)
-        run: python tools/build_zip.py
+        run: |
+          if [ -d dist/os-updates ]; then python tools/build_zip.py --os-updates dist/os-updates
+          else python tools/build_zip.py; fi
       - name: Aufbau wie auf dem Pi prüfen
         run: python -c "import sys; sys.path.insert(0, '.'); from app.release import inspect_zip; print(inspect_zip('dist/festpos.zip'))"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
@@ -66,12 +80,32 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+      id-token: write          # Herkunftsnachweis (Sigstore, OIDC)
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
         with:
           path: out
           merge-multiple: true
+      - name: Paketliste (SBOM, CycloneDX) für Update-Paket und Image
+        run: |
+          python3 tools/sbom.py zip > out/festpos.zip.cdx.json
+          img=$(ls out/festpos-*.img.xz | head -1)
+          if [ -f out/festpos-pakete.txt ] && [ -n "$img" ]; then
+            python3 tools/sbom.py image out/festpos-pakete.txt > "$img.cdx.json"
+            # bleibt im Entwurf: release.ps1 übernimmt sie als deploy/os-pakete.txt (Updates des Betriebssystems, #5)
+          else
+            echo "::warning::Paketliste des Images fehlt – SBOM nur für festpos.zip"
+          fi
+      - name: Herkunftsnachweis (gh attestation verify DATEI -R T-0-N/FestPOS)
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f   # v3.2.0
+        with:
+          subject-path: |
+            out/festpos.zip
+            out/festpos-*.img.xz
+            out/*.apk
+            out/*.cdx.json
       - name: Prüfsummen und Release-Text
         run: |
           (cd out && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)

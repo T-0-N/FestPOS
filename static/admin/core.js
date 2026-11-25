@@ -22,6 +22,12 @@ export const fmtDate = (iso) => {
 export const LANG_KEY = "festpos.admin.lang";
 export const myLang = () => { try { return localStorage.getItem(LANG_KEY) || ""; } catch { return ""; } };
 export let LANGS = [];                                 // verfügbare Sprachen (aus den Einstellungen)
+// FestPOS-Netz (T-0-N/FestPOS#2, GET /netinfo): Netz, VIP und Beispieladressen – statt fester 192.168.55.x
+export let NET = { net: "192.168.55.0/24", vip: "192.168.55.10", examples: {} };
+export const netEx = (k) => NET.examples?.[k] || "";
+let NET_KNOWN = false;                                 // erst nach /netinfo: sonst nur die Vorgabe oben
+export function setNet(n) { if (n?.net) { NET = n; NET_KNOWN = true; } }
+export const netKnown = () => NET_KNOWN;
 
 // ------------------------------------------------------------------ API
 export let TOKEN = sessionStorage.getItem("festpos.token") || "";
@@ -37,7 +43,7 @@ export const ROLE_KEY = { view: "admin.users.role_view", lead: "admin.users.role
 export const roleName = (id, roles = []) => (ROLE_KEY[id] ? t(ROLE_KEY[id])
   : roles.find((r) => r.id === id)?.name || (id === ME?.role ? ME?.role_name : null) || id);
 export function setMe(m) { ME = m; try { sessionStorage.setItem("festpos.me", JSON.stringify(m)); } catch { /* egal */ } }
-export function forgetLogin() { TOKEN = ""; ME = null; sessionStorage.removeItem("festpos.token"); sessionStorage.removeItem("festpos.me"); }
+export function forgetLogin() { TOKEN = ""; ME = null; for (const k of ["festpos.token", "festpos.me", "festpos.idle"]) sessionStorage.removeItem(k); }
 
 // Zustand eines Druckers aus dem Fehlercode (nie aus dem Text – der ist übersetzt)
 const ERR = { paper_out: "admin.err.paper_out", cover_open: "admin.err.cover_open", printer_error: "admin.err.printer_error",
@@ -50,7 +56,13 @@ class ApiError extends Error {
 // Anmeldeformular bei «nicht angemeldet»: setzt shell.js (ein Import von dort gäbe einen Ring core <-> shell)
 let showLogin = () => {};
 export function setLoginView(fn) { showLogin = fn; }
-export async function api(method, path, body, { raw = false } = {}) {
+// Kritische Aktion (T-0-N/FestPOS#9): Server antwortet 428 «confirm_needed» -> Fenster «Bitte bestätigen», danach
+// dieselbe Anfrage nochmals; 403 «totp_setup» -> zweiten Faktor einrichten. Beides setzt twofa.js.
+let confirmView = async () => false, setupView = () => {};
+export function setTwofaViews(confirm, setup) { confirmView = confirm; setupView = setup; }
+const detailText = (d, status) => (typeof d === "string" ? d : typeof d?.text === "string" ? d.text
+  : Array.isArray(d) ? d.map((x) => `${x.loc?.slice(-1)[0]}: ${x.msg}`).join(", ") : t("admin.common.error_status", { status }));
+export async function api(method, path, body, { raw = false, again = false } = {}) {
   const headers = { Authorization: auth(), "X-Festpos-UI": "1", "X-Festpos-Lang": I18n.lang };
   let payload = body;
   if (body && !(body instanceof FormData)) { headers["Content-Type"] = "application/json"; payload = JSON.stringify(body); }
@@ -58,17 +70,24 @@ export async function api(method, path, body, { raw = false } = {}) {
   try { r = await fetch("/api/admin" + path, { method, headers, body: payload }); }
   catch { throw new ApiError(t("admin.common.server_unreachable")); }
   if (r.status === 401) { forgetLogin(); showLogin(t("admin.login.again")); throw new ApiError(t("admin.login.not_logged_in")); }
+  if (r.status === 428 || r.status === 403) {
+    const d = await r.clone().json().then((x) => x?.detail).catch(() => null);
+    if (d?.code === "confirm_needed" && !again) {
+      if (await confirmView()) return api(method, path, body, { raw, again: true });
+      throw new ApiError(t("admin.confirm.cancelled"));            // ohne 428: Sicherung fragt sonst nach dem Passwort
+    }
+    if (d?.code === "totp_setup") setupView();
+  }
   if (raw) {
     if (r.ok) return r;
     let d = null;
     try { d = (await r.json()).detail; } catch { /* keine JSON-Antwort */ }
-    throw new ApiError(typeof d === "string" ? d : t("admin.common.error_status", { status: r.status }), r.status);
+    throw new ApiError(detailText(d, r.status), r.status);
   }
   let data = null;
   try { data = await r.json(); } catch { /* leer */ }
   if (!r.ok && !(r.status === 422 && data?.summary)) {
-    const d = data?.detail;
-    throw new ApiError(typeof d === "string" ? d : Array.isArray(d) ? d.map((x) => `${x.loc?.slice(-1)[0]}: ${x.msg}`).join(", ") : t("admin.common.error_status", { status: r.status }), r.status);
+    throw new ApiError(detailText(data?.detail, r.status), r.status);
   }
   return data;
 }

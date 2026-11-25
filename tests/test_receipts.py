@@ -147,7 +147,7 @@ def test_vat_receipt_and_recipient(client, shop):  # noqa: F811
     assert r.status_code == 409 and "Verwaltung" in r.json()["detail"]
     assert _phone(client, cu2).status_code == 409
     r = client.post(f"/api/admin/orders/{oid2}/receipt", auth=AUTH, json={"request_id": _rid()})
-    assert r.status_code == 422 and "Name und Adresse" in r.json()["detail"]
+    assert r.status_code == 422 and "Name und Ort" in r.json()["detail"]
     r = client.post(f"/api/admin/orders/{oid2}/receipt", auth=AUTH,
                     json={"request_id": _rid(), "recipient": "Firma Muster AG\nBahnhofstr. 1, 6000 Luzern"}).json()
     assert r["receipts"][0]["no"] == 2 and r["receipts"][0]["total_cents"] == 62 * 650

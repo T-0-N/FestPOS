@@ -18,8 +18,8 @@ import hmac
 import http.client
 import json
 import os
-import socket
 import secrets
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,13 +50,29 @@ def _box() -> bytes:
     return hashlib.sha256(b"festpos-payrexx\0" + (Config.cluster_secret or "").encode()).digest()
 
 
-def seal(key: str) -> str:
+def seal(key: str, purpose: str = "gast_key_enc") -> str:
+    """Payrexx-Schlüssel (bzw. Tunnel-Token, purpose gast_tunnel_enc) verschlüsselt – gemeinsames Verfahren
+    (secretbox, T-0-N/FestPOS#8). Solange nicht alle Pi diese Version haben, im bisherigen Verfahren (das können
+    auch ältere Pi lesen); migrate() schreibt es danach um."""
+    from . import secretbox
+    if not secretbox.may_seal():
+        return seal_legacy(key)
+    return secretbox.seal(purpose, key)
+
+
+def seal_legacy(key: str) -> str:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     nonce = secrets.token_bytes(12)
     return base64.b64encode(nonce + AESGCM(_box()).encrypt(nonce, key.encode(), b"payrexx")).decode()
 
 
-def unseal(value: str) -> str | None:
+def unseal(value: str, purpose: str = "gast_key_enc") -> str | None:
+    """Neues Verfahren («enc1:…») oder das bisherige (bis die Werte umgeschrieben sind)."""
+    from . import secretbox
+    return secretbox.unseal(purpose, value) if secretbox.sealed(value) else unseal_legacy(value)
+
+
+def unseal_legacy(value: str) -> str | None:
     from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     try:

@@ -46,7 +46,7 @@ RENDER.jobs = async (refresh = false) => {
   const list = jobs.filter(F[jobFilter][1]);
   const ST = { pending: "admin.jobs.st_pending", printing: "admin.jobs.st_printing", done: "admin.jobs.st_done",
     failed: "admin.jobs.st_failed", uncertain: "admin.jobs.st_uncertain", cancelled: "admin.jobs.st_cancelled" };
-  if (page !== "jobs") return;                     // inzwischen andere Seite (REV-048)
+  if (page !== "jobs" || !$("#main")) return;    // inzwischen andere Seite (REV-048) oder abgemeldet
   if (!refresh || !$("#jobs-list")) {
     $("#main").innerHTML = `<h2>${th("admin.nav.jobs")}</h2><div class="card" id="jobs-list"></div>${rerouteCard(printers)}`;
     bindReroute();

@@ -13,7 +13,7 @@ pytest.importorskip("playwright.sync_api")
 
 from app import release  # noqa: E402
 from tests.release_util import build_bundle, keypair  # noqa: E402
-from tests.test_browser_p4 import _start, _watch, browser  # noqa: E402,F401  (browser = Fixture)
+from tests.test_browser_p4 import browser, _preconfirm, _start, _watch  # noqa: E402,F401  (browser = Fixture)
 
 NEW = "99.0.0"
 CUR = (Path(__file__).resolve().parent.parent / "VERSION").read_text().strip()   # läuft gerade
@@ -51,6 +51,8 @@ def _admin(browser, base, width=1300):  # noqa: F811
     page.goto(base + "/admin.html#maint/update")
     page.fill("#pw", "geheim")
     page.press("#pw", "Enter")
+    page.wait_for_selector("#upd-form")
+    _preconfirm(page)                                    # kritische Aktionen: schon bestätigt (#9)
     page.wait_for_selector("#upd-form")
     return ctx, page, errs
 

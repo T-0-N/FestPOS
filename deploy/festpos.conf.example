@@ -6,8 +6,10 @@
 # Wechsel 1 -> 3: hier auf 3 setzen, Pi A neu starten, Karten B und C einstecken. Daten bleiben.
 CLUSTER_SIZE=1
 
-NET_PREFIX=192.168.55
-NET_CIDR=24
+# Netz mit Grösse (frei wählbar bei der Ersteinrichtung, /16 bis /27, z.B. 10.20.0.0/22). Ältere Dateien haben statt
+# NET die ersten drei Zahlen als NET_PREFIX und NET_CIDR – geht weiter. Danach nur noch über «Netz umziehen» ändern:
+# die Zertifizierungsstelle gilt genau für dieses Netz.
+NET=192.168.55.0/24
 IFACE=eth0
 
 VIP=192.168.55.10            # Adresse für die Handys: https://192.168.55.10
@@ -30,7 +32,8 @@ RTC_AKKU=0
 PHONE_CERTS=1
 
 # DHCP für die Handys: 1 = die Pi vergeben Adressen – feste pro Handy (trägt «Neues Handy ausrollen» in der
-# Verwaltung ein) und für neue Geräte aus DHCP_POOL (letzte Stelle «von-bis», bei 3 Pi auf die Pi aufgeteilt).
+# Verwaltung ein) und für neue Geräte aus DHCP_POOL («von-bis»: ganze Adressen wie 10.20.1.1-10.20.3.200 oder der
+# Abstand zur Netzadresse wie 150-189; bei 3 Pi auf die Pi aufgeteilt).
 # 0 = aus (alle Geräte mit fester IP). Kein zweiter DHCP-Server im Netz (Mobilfunk-Router: DHCP aus).
 DHCP=1
 DHCP_POOL=150-189
@@ -40,7 +43,9 @@ DHCP_POOL=150-189
 DHCP_GATEWAY=
 DHCP_DNS=
 
-# Verwaltung: https://192.168.55.10:8443/admin.html  (Benutzer: admin). Passwort UNBEDINGT ändern.
+# Verwaltung: https://192.168.55.10:8443/admin.html  (Benutzer: admin). Passwort UNBEDINGT ändern, mindestens
+# 16 Zeichen. Beim nächsten Start ersetzt der Pi es durch einen Prüfwert (ADMIN_PASSWORD_HASH, ADMIN_PASSWORD_LAENGE)
+# – danach steht es nicht mehr in dieser Datei. Neues Passwort: wieder als ADMIN_PASSWORD eintragen und neu starten.
 ADMIN_PASSWORD=bitte-aendern
 # Geheimnis für die Pi untereinander (Uhrzeit stellen). Optional: bleibt der Platzhalter stehen, wird es
 # automatisch aus dem Server-Schlüssel abgeleitet. Wenn gesetzt: lange Zufallszeichenkette, auf allen Karten gleich.

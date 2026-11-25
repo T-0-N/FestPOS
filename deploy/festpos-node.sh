@@ -11,6 +11,12 @@ BOOT=${FESTPOS_BOOT:-/boot/firmware}
 CONF="$BOOT/festpos.conf"
 NODECONF="$BOOT/node.conf"
 ETC=/etc/festpos
+# Arbeitskopien mit Geheimnissen (env, Schlüssel, Tunnel) nur im Arbeitsspeicher, /etc/festpos verweist dorthin
+# (T-0-N/FestPOS#3). Ist der Datenbereich verschlüsselt, hat festpos-krypt die geheimen Werte aus festpos.conf (dort
+# steht nur «im-container») und die Schlüssel beim Start nach $QUELLE entpackt.
+GRUN=/run/festpos-geheim
+QUELLE=$GRUN/quelle
+GAST_RUN=/run/festpos-gast
 
 log() { echo "festpos-node: $*"; }
 die() { log "FEHLER: $*"; exit 1; }
@@ -114,6 +120,8 @@ Einrichtungscode: $CODE${FP:+
 Der Browser warnt vor dem Zertifikat (vorläufig, nur für die Einrichtung). Fingerabdruck SHA-256 beginnt mit: $FP}"
   install -d /etc/issue.d
   printf '\n%s\n\n' "$TEXT" > /etc/issue.d/festpos.issue        # Bildschirm am Pi (Anmeldeaufforderung)
+  # tty1 zeigt den Text nur beim Start (ohne Anmeldung, festpos-haertung): lief getty schon, neu zeigen
+  who 2>/dev/null | grep -qw tty1 || systemctl try-restart getty@tty1.service 2>/dev/null || true
   printf '%s\n' "$TEXT" | sed 's/$/\r/' > "$BOOT/festpos-einrichtung.txt" 2>/dev/null || true   # am PC lesbar
   log "Einrichtungscode: $CODE, Adressen: $ADR"
   exit 0
@@ -122,25 +130,48 @@ fi
 # Eingerichtet: Spuren der Ersteinrichtung entfernen (Code, Hinweise)
 rm -f /run/festpos/einrichtung "$BOOT/festpos-einrichtung.txt" /etc/issue.d/festpos.issue "$EINR_DIR/code"
 rm -rf "$EINR_DIR/tls"                                    # vorläufiges Zertifikat der Ersteinrichtung
+# Notfall-Passwort nur als Prüfwert (T-0-N/FestPOS#15): steht es noch im Klartext in festpos.conf, durch
+# ADMIN_PASSWORD_HASH (scrypt, Salz aus CLUSTER_SECRET) und ADMIN_PASSWORD_LAENGE ersetzen (app/emergency.py)
+if [ -x /opt/festpos/venv/bin/python3 ] && grep -qE '^[[:space:]]*ADMIN_PASSWORD[[:space:]]*=' "$CONF" &&
+   ! grep -qE '^[[:space:]]*ADMIN_PASSWORD[[:space:]]*=[[:space:]]*"?im-container' "$CONF"; then
+  /opt/festpos/venv/bin/python3 -I -c 'import sys; sys.path.insert(0, "/opt/festpos"); sys.dont_write_bytecode = True
+from app.emergency import main; sys.exit(main(sys.argv[1:]))' --conf "$CONF" --tls-key "$BOOT/festpos-tls/server.key" ||
+    log "WARNUNG: Notfall-Passwort nicht in einen Prüfwert umgewandelt – bleibt vorerst im Klartext"
+fi
 festpos_read_conf "$CONF"     || die "$CONF nicht lesbar"
 festpos_read_conf "$NODECONF" || die "$NODECONF nicht lesbar"
+# Geheime Werte aus dem verschlüsselten Bereich (T-0-N/FestPOS#3) – was dort fehlt, bleibt leer
+if [ -f "$QUELLE/festpos.conf" ]; then
+  festpos_read_conf "$QUELLE/festpos.conf" || die "geheime Werte (festpos-krypt) nicht lesbar"
+fi
+for v in CLUSTER_SECRET ADMIN_PASSWORD ADMIN_PASSWORD_HASH ADMIN_PASSWORD_LAENGE TUNNEL_TOKEN; do
+  [ "${!v-}" = im-container ] && unset "$v"
+done
 
 # Werte prüfen, bevor sie in Netzwerk-, Firewall- und keepalived-Dateien landen
 for v in VIP NODE_A_IP NODE_B_IP NODE_C_IP; do festpos_is_ip "${!v:-}" || die "$v ist keine gültige IP-Adresse: '${!v:-}'"; done
-festpos_is_ip "${NET_PREFIX:-}.0" || die "NET_PREFIX ungültig: '${NET_PREFIX:-}' (z.B. 192.168.55)"
-[[ ${NET_CIDR:-} =~ ^[0-9]{1,2}$ ]] && ((NET_CIDR >= 8 && NET_CIDR <= 30)) || die "NET_CIDR ungültig: '${NET_CIDR:-}'"
+# Netz (T-0-N/FestPOS#2): NET=Adresse/Grösse, ältere festpos.conf mit NET_PREFIX und NET_CIDR gehen weiter
+festpos_net_from_conf || die "Netz ungültig: NET='${NET:-}' bzw. NET_PREFIX='${NET_PREFIX:-}', NET_CIDR='${NET_CIDR:-}' (z.B. NET=10.20.0.0/22)"
+for v in VIP NODE_A_IP NODE_B_IP NODE_C_IP; do festpos_in_net "${!v}" "$NET" || die "$v=${!v} liegt nicht im Netz $NET"; done
 [[ ${IFACE:-} =~ ^[A-Za-z0-9._-]{1,15}$ ]] || die "IFACE ungültig: '${IFACE:-}'"
 [[ ${VRRP_ID:-55} =~ ^[0-9]{1,3}$ ]] && ((${VRRP_ID:-55} >= 1 && ${VRRP_ID:-55} <= 255)) || die "VRRP_ID muss 1..255 sein"
 [[ ${TZ:-Europe/Zurich} =~ ^[A-Za-z0-9_/+-]+$ ]] || die "TZ ungültig: '${TZ:-}'"
 [[ ${PHONE_CERTS:-1} =~ ^[01]$ ]] || die "PHONE_CERTS muss 0 oder 1 sein"
 [[ ${RTC_AKKU:-0} =~ ^[01]$ ]] || { log "WARNUNG: RTC_AKKU muss 0 oder 1 sein (ist: '${RTC_AKKU}') – gilt als 0"; RTC_AKKU=0; }
 [[ ${RAFT_TLS:-0} =~ ^[01]$ ]] || die "RAFT_TLS muss 0 oder 1 sein"
-[ -n "${ADMIN_PASSWORD:-}" ] || die "ADMIN_PASSWORD fehlt"
-# Notfall-Passwort: der Platzhalter sperrt den Notfall-Login (die App weist ihn ab), kurz gibt eine Warnung
-case "$ADMIN_PASSWORD" in
-  admin|bitte-aendern) log "WARNUNG: ADMIN_PASSWORD ist noch der Platzhalter – Notfall-Login gesperrt, in festpos.conf ändern" ;;
-  *) [ "${#ADMIN_PASSWORD}" -ge 10 ] || log "WARNUNG: ADMIN_PASSWORD ist kürzer als 10 Zeichen – in festpos.conf ändern" ;;
-esac
+[ -n "${ADMIN_PASSWORD:-}${ADMIN_PASSWORD_HASH:-}" ] || die "ADMIN_PASSWORD fehlt"
+# Notfall-Passwort: der Platzhalter sperrt den Notfall-Login (die App weist ihn ab); kürzer als 16 Zeichen sperrt
+# ihn, sobald es einen eigenen Admin-Benutzer gibt (prüft die App) – hier nur die Warnung
+if [ -n "${ADMIN_PASSWORD_HASH:-}" ]; then
+  [[ ${ADMIN_PASSWORD_HASH} =~ ^scrypt\$[0-9]+\$[0-9]+\$[0-9]+\$[0-9a-f]+\$[0-9a-f]+$ ]] || die "ADMIN_PASSWORD_HASH ungültig"
+  [ "${ADMIN_PASSWORD_LAENGE:-0}" -ge 16 ] 2>/dev/null ||
+    log "WARNUNG: Notfall-Passwort kürzer als 16 Zeichen – ein längeres als ADMIN_PASSWORD in festpos.conf eintragen"
+else
+  case "$ADMIN_PASSWORD" in
+    admin|bitte-aendern) log "WARNUNG: ADMIN_PASSWORD ist noch der Platzhalter – Notfall-Login gesperrt, in festpos.conf ändern" ;;
+    *) [ "${#ADMIN_PASSWORD}" -ge 16 ] || log "WARNUNG: ADMIN_PASSWORD ist kürzer als 16 Zeichen – in festpos.conf ändern" ;;
+  esac
+fi
 # SSH nur von diesen Adressen (REV-050), z.B. «192.168.55.200-192.168.55.254» (Admin-PC) – leer: ganzes Netz
 # Ein Tippfehler darf den Pi nicht lahmlegen: dann gilt das ganze Netz (mit Warnung).
 SSH_SET=""
@@ -174,6 +205,24 @@ ALL_IPS=("$NODE_A_IP" "$NODE_B_IP" "$NODE_C_IP")
 OTHER_IPS=()
 for ip in "${ALL_IPS[@]}"; do [ "$ip" != "$NODE_IP" ] && OTHER_IPS+=("$ip"); done
 log "Rolle $NODE, IP $NODE_IP, VIP $VIP, Cluster-Grösse $CLUSTER_SIZE"
+# --- Übergangszeit nach einem Netz-Umzug (T-0-N/FestPOS#2, festpos-netz): bis NET_ALT_BIS hat jeder Pi zusätzlich
+# seine alte Adresse (und die alte VIP) mit den alten Zertifikaten – Handhelds, die beim Umzug aus waren, kommen so
+# noch herein. Danach (beim nächsten Start) weg: Einträge aus festpos.conf, festpos-tls-alt/.
+ALT_NET=""; ALT_CIDR=""; ALT_NODE_IP=""; ALT_VIP=""
+if [ -n "${NET_ALT:-}" ] && [ "${1:-}" != "--pruefen" ]; then
+  ALT_IP_VAR="NODE_${NODE^^}_IP_ALT"
+  if [[ ${NET_ALT_BIS:-} =~ ^[0-9]{9,11}$ ]] && [ "$(date +%s)" -lt "$NET_ALT_BIS" ] &&
+     [[ $NET_ALT =~ ^([0-9.]+)/([0-9]{1,2})$ ]] && festpos_is_ip "${BASH_REMATCH[1]}" &&
+     festpos_in_net "${!ALT_IP_VAR:-}" "$NET_ALT" && festpos_in_net "${VIP_ALT:-}" "$NET_ALT"; then
+    ALT_NET=$NET_ALT; ALT_CIDR=${NET_ALT#*/}; ALT_NODE_IP=${!ALT_IP_VAR}; ALT_VIP=$VIP_ALT
+    log "Übergang nach dem Netz-Umzug: zusätzlich $ALT_NODE_IP und $ALT_VIP ($ALT_NET) bis $(date -d "@$NET_ALT_BIS" '+%d.%m. %H:%M')"
+  else
+    log "Übergang nach dem Netz-Umzug vorbei – alte Adressen weg"
+    sed -i -E '/^[[:space:]]*(NET_ALT|VIP_ALT|NODE_[ABC]_IP_ALT|NET_ALT_BIS)[[:space:]]*=/d' "$CONF"
+    rm -rf "$BOOT/festpos-tls-alt"
+  fi
+fi
+SRC_SET=$NET; [ -n "$ALT_NET" ] && SRC_SET="{ $NET, $ALT_NET }"
 # festpos-node --pruefen: nur lesen und prüfen, nichts ändern (update.sh ruft das auf, damit ein Fehler
 # in festpos.conf nicht erst beim nächsten Neustart – vielleicht am Anlass – auffällt)
 if [ "${1:-}" = "--pruefen" ]; then
@@ -181,7 +230,7 @@ if [ "${1:-}" = "--pruefen" ]; then
   if [ -r "$ETC/env" ]; then
     (
       festpos_read_conf "$ETC/env" 2>/dev/null || exit 0
-      [ "${FESTPOS_ADMIN_PASSWORD-}" = "$ADMIN_PASSWORD" ] ||
+      [ "${FESTPOS_ADMIN_PASSWORD-}" = "${ADMIN_PASSWORD:-}" ] || [ -n "${ADMIN_PASSWORD_HASH:-}" ] ||
         echo "ACHTUNG: Das Admin-Passwort wird ab dem nächsten Neustart anders gelesen als bisher." \
              "Sonderzeichen in festpos.conf prüfen (Wert ggf. in \"…\" setzen)."
       [ "${FESTPOS_CLUSTER_SECRET-}" = "${CLUSTER_SECRET:-}" ] ||
@@ -219,15 +268,19 @@ if [ -z "$CON" ]; then
 fi
 # Einzelbetrieb: VIP fest auf diesem Pi (kein keepalived). Cluster: keepalived verwaltet die VIP.
 if [ "$CLUSTER_SIZE" = 1 ]; then WANT="$NODE_IP/$NET_CIDR,$VIP/$NET_CIDR"; else WANT="$NODE_IP/$NET_CIDR"; fi
+if [ -n "$ALT_NET" ]; then                                 # Übergang nach dem Netz-Umzug: alte Adresse zusätzlich
+  WANT="$WANT,$ALT_NODE_IP/$ALT_CIDR"
+  [ "$CLUSTER_SIZE" = 1 ] && WANT="$WANT,$ALT_VIP/$ALT_CIDR"
+fi
 # Internet für den Pi (T22 QR-Bestellung: Payrexx und Cloudflare Tunnel): INTERNET_GATEWAY = Mobilfunk-Router im
 # Festnetz. Leer: kein Internet (wie bisher).
 GW=""; DNS=""
 if [ -n "${INTERNET_GATEWAY:-}" ]; then
-  if festpos_is_ip "$INTERNET_GATEWAY" && [ "${INTERNET_GATEWAY%.*}" = "$NET_PREFIX" ]; then
+  if festpos_in_net "$INTERNET_GATEWAY" "$NET"; then
     GW=$INTERNET_GATEWAY; DNS=${INTERNET_DNS:-$INTERNET_GATEWAY}
     festpos_is_ip "$DNS" || DNS=$INTERNET_GATEWAY
   else
-    log "WARNUNG: INTERNET_GATEWAY ungültig (muss im Netz $NET_PREFIX.x liegen): '$INTERNET_GATEWAY' – kein Internet"
+    log "WARNUNG: INTERNET_GATEWAY ungültig (muss im Netz $NET liegen): '$INTERNET_GATEWAY' – kein Internet"
   fi
 fi
 HAVE=$(nmcli -g ipv4.addresses con show "$CON" 2>/dev/null | tr -d ' ' || true)
@@ -245,15 +298,25 @@ fi
 nmcli radio wifi off >/dev/null 2>&1 || true
 
 # --- TLS (gleiches Zertifikat auf allen Knoten, liegt auf der Boot-Partition) --
-install -d -m 0750 -o root -g festpos "$ETC" "$ETC/tls"
-if [ -f "$BOOT/festpos-tls/server.crt" ]; then
+# Die Schlüssel kommen von der Boot-Partition oder – Daten verschlüsselt – aus dem Container (festpos-krypt). Die
+# Arbeitskopien liegen nur im Arbeitsspeicher; /etc/festpos/tls verweist dorthin (T-0-N/FestPOS#3).
+key_src() { if [ -f "$BOOT/festpos-tls/$1" ]; then echo "$BOOT/festpos-tls/$1"; elif [ -f "$QUELLE/$1" ]; then echo "$QUELLE/$1"; fi; }
+install -d -m 0750 -o root -g festpos "$ETC" "$GRUN" "$GRUN/tls"
+if [ -d "$ETC/tls" ] && [ ! -L "$ETC/tls" ]; then rm -rf "$ETC/tls"; fi
+ln -sfn "$GRUN/tls" "$ETC/tls"
+if [ -f "$BOOT/festpos-tls/server.crt" ] && [ -n "$(key_src server.key)" ]; then
   install -m 0644 "$BOOT/festpos-tls/server.crt" "$BOOT/festpos-tls/ca.crt" "$ETC/tls/"
-  install -m 0640 -o root -g festpos "$BOOT/festpos-tls/server.key" "$ETC/tls/"
+  install -m 0640 -o root -g festpos "$(key_src server.key)" "$ETC/tls/server.key"
+  rm -f "$ETC/tls/alt-server.crt" "$ETC/tls/alt-ca.crt"
+  if [ -n "$ALT_NET" ] && [ -f "$BOOT/festpos-tls-alt/server.crt" ]; then   # Übergang: gleicher Schlüssel, alte CA
+    install -m 0644 "$BOOT/festpos-tls-alt/server.crt" "$ETC/tls/alt-server.crt"
+    [ -f "$BOOT/festpos-tls-alt/ca.crt" ] && install -m 0644 "$BOOT/festpos-tls-alt/ca.crt" "$ETC/tls/alt-ca.crt"
+  fi
   # Zum PRÜFEN der Handys genügt device-ca.crt; den Schlüssel braucht es nur zum Ausstellen (REV-027).
   if [ -f "$BOOT/festpos-tls/device-ca.crt" ]; then
     install -m 0644 "$BOOT/festpos-tls/device-ca.crt" "$ETC/tls/"
-    if [ -f "$BOOT/festpos-tls/device-ca.key" ]; then
-      install -m 0640 -o root -g festpos "$BOOT/festpos-tls/device-ca.key" "$ETC/tls/"
+    if [ -n "$(key_src device-ca.key)" ]; then
+      install -m 0640 -o root -g festpos "$(key_src device-ca.key)" "$ETC/tls/device-ca.key"
     else
       rm -f "$ETC/tls/device-ca.key"
       log "HINWEIS: device-ca.key fehlt – Handys werden geprüft, aber dieser Pi kann keine neuen Gerätezertifikate ausstellen"
@@ -346,10 +409,16 @@ umask 027
   festpos_env_line NODE_IP "$NODE_IP"
   festpos_env_line FESTPOS_IFACE "$IFACE"                # Drucker-Netz (festpos-druckernetz, app/printer_net.py)
   festpos_env_line FESTPOS_NET_CIDR "$NET_CIDR"
+  festpos_env_line FESTPOS_NET "$NET"                    # Netz mit Grösse (app/netz.py, T-0-N/FestPOS#2)
   festpos_env_line JOIN_OTHERS "$JOIN_OTHERS"
   festpos_env_line CLUSTER_SIZE "$CLUSTER_SIZE"
   festpos_env_line FESTPOS_DB "rqlite://127.0.0.1:4001"
-  festpos_env_line FESTPOS_ADMIN_PASSWORD "$ADMIN_PASSWORD"
+  if [ -n "${ADMIN_PASSWORD_HASH:-}" ]; then           # Prüfwert (T-0-N/FestPOS#15); sonst ältere Konfiguration
+    festpos_env_line FESTPOS_ADMIN_PASSWORD_HASH "$ADMIN_PASSWORD_HASH"
+    festpos_env_line FESTPOS_ADMIN_PASSWORD_LEN "${ADMIN_PASSWORD_LAENGE:-0}"
+  else
+    festpos_env_line FESTPOS_ADMIN_PASSWORD "$ADMIN_PASSWORD"
+  fi
   festpos_env_line FESTPOS_CLUSTER_SECRET "${CLUSTER_SECRET:-}"
   festpos_env_line FESTPOS_ADMIN_FROM "$ADMIN_SET"
   festpos_env_line FESTPOS_PEERS "$PEERS"
@@ -360,12 +429,20 @@ umask 027
   festpos_env_line FESTPOS_RAFT_TLS "$RAFT_TLS"
   festpos_env_line FESTPOS_PHONE_CERTS_PROBLEM "${PHONE_CERTS_PROBLEM:-}"
   festpos_env_line FESTPOS_TLS_CERT "$ETC/tls/server.crt"
+  festpos_env_line FESTPOS_NET_ALT "$ALT_NET"             # Übergang nach dem Netz-Umzug (app/serve.py, app/netz.py)
+  if [ -n "$ALT_NET" ] && [ -f "$ETC/tls/alt-server.crt" ]; then
+    festpos_env_line FESTPOS_LISTEN "$NODE_IP,$VIP,127.0.0.1"
+    festpos_env_line FESTPOS_LISTEN_ALT "$ALT_NODE_IP,$ALT_VIP"
+    festpos_env_line FESTPOS_TLS_ALT_CERT "$ETC/tls/alt-server.crt"
+  fi
   festpos_env_line FESTPOS_TLS_KEY "$ETC/tls/server.key"
   festpos_env_line FESTPOS_DEVICE_CA "$ETC/tls/device-ca.crt"
   festpos_env_line FESTPOS_DEVICE_CA_KEY "$ETC/tls/device-ca.key"
-} > "$ETC/env.neu"
-mv "$ETC/env.neu" "$ETC/env"
-chown root:festpos "$ETC/env"
+} > "$GRUN/env.neu"
+mv "$GRUN/env.neu" "$GRUN/env"
+chown root:festpos "$GRUN/env"
+[ -L "$ETC/env" ] || rm -f "$ETC/env"                   # früher als Datei auf der Karte
+ln -sfn "$GRUN/env" "$ETC/env"
 umask 022
 
 # --- keepalived: VIP folgt dem Raft-Leader -----------------------------------
@@ -399,6 +476,7 @@ $PEER_LINES
     }
     virtual_ipaddress {
         $VIP/$NET_CIDR dev $IFACE
+${ALT_VIP:+        $ALT_VIP/$ALT_CIDR dev $IFACE}
     }
     track_script {
         chk_leader
@@ -418,7 +496,8 @@ local stratum 10 orphan
 makestep 1 -1
 rtcsync
 driftfile /var/lib/chrony/chrony.drift
-allow $NET_PREFIX.0/$NET_CIDR
+allow $NET
+${ALT_NET:+allow $ALT_NET}
 EOF
 
 # --- DHCP für die Handys (dnsmasq, nur DHCP) ------------------------------------
@@ -429,7 +508,7 @@ if [ "${DHCP:-1}" = 1 ]; then
   if ! command -v dnsmasq >/dev/null; then
     log "WARNUNG: DHCP=1, aber dnsmasq fehlt (einmal mit Internet: sudo apt install dnsmasq-base) – DHCP aus"
     rm -f "$ETC/dnsmasq.conf"
-  elif festpos_dhcp_conf "$NET_PREFIX" "$NET_CIDR" "$IFACE" "${DHCP_POOL:-150-189}" "${DHCP_GATEWAY:-auto:$VIP}" \
+  elif festpos_dhcp_conf "$NET" "$IFACE" "${DHCP_POOL:-$(festpos_dhcp_pool_default "$NET_CIDR")}" "${DHCP_GATEWAY:-auto:$VIP}" \
       "${DHCP_DNS:-1.1.1.1}" "$NODE" "$CLUSTER_SIZE" "$VIP" > "$ETC/dnsmasq.conf.neu"; then
     mv "$ETC/dnsmasq.conf.neu" "$ETC/dnsmasq.conf"
     install -d -o festpos -g festpos -m 0755 "$FESTPOS_DHCP_HOSTS"
@@ -453,15 +532,18 @@ fi
 # Token aus festpos.conf (TUNNEL_TOKEN, hat Vorrang) oder aus der Verwaltung (festpos-update legt ihn in
 # tunnel-app.env ab). Benutzer, Gruppe und Firewall des Gästedienstes gibt es immer: So lässt sich der Tunnel in der
 # Verwaltung ohne Neustart einschalten (die App muss schon beim Start in der Gruppe sein). Der Gästedienst darf nur
-# FestPOS auf 127.0.0.1:8443 erreichen; sein Schlüssel ist pro Pi zufällig (/etc/festpos-gast/token) und liegt nur
-# da, solange der Tunnel eingeschaltet ist.
+# FestPOS auf 127.0.0.1:8443 erreichen; sein Schlüssel ist pro Pi zufällig ($GAST_RUN/token, Arbeitsspeicher) und
+# liegt nur da, solange der Tunnel eingeschaltet ist. Tunnel-Token ebenso nur im Arbeitsspeicher ($GRUN/tunnel.env).
 id festpos-gast >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin festpos-gast
 id -nG festpos 2>/dev/null | grep -qw festpos-gast || usermod -aG festpos-gast festpos
-install -d -o root -g festpos-gast -m 0750 /etc/festpos-gast
+install -d -o root -g festpos-gast -m 0750 "$GAST_RUN"
+rm -rf /etc/festpos-gast                                  # früher auf der Karte
+[ -L "$ETC/tunnel.env" ] || rm -f "$ETC/tunnel.env"
+ln -sfn "$GRUN/tunnel.env" "$ETC/tunnel.env"
 TUNNEL_SRC=""
 if [ -n "${TUNNEL_TOKEN:-}" ]; then
   if [[ $TUNNEL_TOKEN =~ ^[A-Za-z0-9+/_-]{60,2000}={0,2}$ ]]; then
-    (umask 077; printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" > "$ETC/tunnel.env")
+    (umask 077; printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" > "$GRUN/tunnel.env")
     touch "$ETC/tunnel-conf"; chmod 0644 "$ETC/tunnel-conf"     # für App und festpos-update: festpos.conf hat Vorrang
     TUNNEL_SRC=festpos.conf
   else
@@ -471,8 +553,9 @@ if [ -n "${TUNNEL_TOKEN:-}" ]; then
 else
   rm -f "$ETC/tunnel-conf"
 fi
-if [ -z "$TUNNEL_SRC" ] && [ -s "$ETC/tunnel-app.env" ]; then
-  (umask 077; cp "$ETC/tunnel-app.env" "$ETC/tunnel.env")
+TUNNEL_APP=$ETC/tunnel-app.env; [ -s "$QUELLE/tunnel-app.env" ] && TUNNEL_APP=$QUELLE/tunnel-app.env
+if [ -z "$TUNNEL_SRC" ] && [ -s "$TUNNEL_APP" ]; then
+  (umask 077; cp "$TUNNEL_APP" "$GRUN/tunnel.env")
   TUNNEL_SRC=Verwaltung
 fi
 GAST_UID=$(id -u festpos-gast)
@@ -497,23 +580,23 @@ GAST_RULES="    chain output {
         meta skuid $TUNNEL_UID ip6 daddr { fc00::/7, fe80::/10 } drop
     }"
 if [ -n "$TUNNEL_SRC" ]; then
-  if [ ! -s /etc/festpos-gast/token ]; then
-    (umask 037; head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' > /etc/festpos-gast/token)
+  if [ ! -s "$GAST_RUN/token" ]; then
+    (umask 037; head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' > "$GAST_RUN/token")
   fi
-  chown root:festpos-gast /etc/festpos-gast/token; chmod 0640 /etc/festpos-gast/token
+  chown root:festpos-gast "$GAST_RUN/token"; chmod 0640 "$GAST_RUN/token"
   log "QR-Bestellung: Tunnel ein (Token aus $TUNNEL_SRC)"
   command -v cloudflared >/dev/null ||
     log "HINWEIS: Tunnel eingeschaltet, cloudflared fehlt noch – FestPOS installiert es, sobald der Pi Internet hat"
   systemctl enable festpos-gast.service festpos-tunnel.service >/dev/null 2>&1 || true
 else
   systemctl disable --now festpos-tunnel.service festpos-gast.service >/dev/null 2>&1 || true
-  rm -f "$ETC/tunnel.env" /etc/festpos-gast/token
+  rm -f "$GRUN/tunnel.env" "$GAST_RUN/token"
 fi
 
 # --- Firewall ------------------------------------------------------------------
 # Raft (rqlite, ohne eigene Anmeldung) und VRRP nur im Cluster – und nur von den ANDEREN Knoten.
 # Im Einzelbetrieb bleiben beide zu, sonst könnte jemand mit der IP .12/.13 direkt an die Datenbank.
-[ -n "$SSH_SET" ] || SSH_SET="$NET_PREFIX.0/$NET_CIDR"
+[ -n "$SSH_SET" ] || SSH_SET="$NET${ALT_NET:+, $ALT_NET}"
 CLUSTER_RULES=""
 if [ "$CLUSTER_SIZE" = 3 ]; then
   PEERS_SET=$(IFS=,; echo "${OTHER_IPS[*]}")
@@ -531,10 +614,10 @@ table inet festpos {
         ct state established,related accept
         ct state invalid drop
         ip protocol icmp accept
-        ip saddr $NET_PREFIX.0/$NET_CIDR tcp dport { 80, 443, 8443 } accept
+        ip saddr $SRC_SET tcp dport { 80, 443, 8443 } accept
         ip saddr { $SSH_SET } tcp dport 22 ct state new limit rate 6/minute burst 6 packets accept   # SSH (SSH_FROM), Bremse (T23)
 $CLUSTER_RULES
-        ip saddr $NET_PREFIX.0/$NET_CIDR udp dport 123 accept # NTP
+        ip saddr $SRC_SET udp dport 123 accept # NTP
         udp sport 67 udp dport 68 accept                      # DHCP-Antworten («Update aus dem Internet»: WLAN/USB)
 $DHCP_RULE
     }
@@ -560,14 +643,21 @@ table inet festpos {
         iif lo accept
         ct state established,related accept
         ip protocol icmp accept
-        ip saddr $NET_PREFIX.0/$NET_CIDR tcp dport { 80, 443, 8443 } accept
-        ip saddr $NET_PREFIX.0/$NET_CIDR tcp dport 22 ct state new limit rate 6/minute burst 6 packets accept
-        ip saddr $NET_PREFIX.0/$NET_CIDR udp dport 123 accept
+        ip saddr $NET tcp dport { 80, 443, 8443 } accept
+        ip saddr $NET tcp dport 22 ct state new limit rate 6/minute burst 6 packets accept
+        ip saddr $NET udp dport 123 accept
     }
 }
 EOF
 fi
 nft -f /etc/nftables.conf || log "WARNUNG: Firewall-Regeln konnten nicht geladen werden"
+# Verbindungen ins Internet (T-0-N/FestPOS#10): gleich mit den zuletzt aufgelösten Adressen, ohne auf DNS zu warten
+# («flush ruleset» oben hat die Tabelle entfernt); festpos-firewall.timer löst danach neu auf.
+[ -x /usr/local/sbin/festpos-firewall ] && { /usr/local/sbin/festpos-firewall --ohne-dns ||
+  log "WARNUNG: Firewall ins Internet nicht geladen (festpos-firewall)"; }
+# Betriebssystem (T-0-N/FestPOS#5): ein unterbrochenes apt (Strom weg) zu Ende bringen, Stand für die Verwaltung
+[ -x /usr/local/sbin/festpos-os-update ] && { /usr/local/sbin/festpos-os-update --reparieren ||
+  log "WARNUNG: unterbrochenes Update des Betriebssystems nicht repariert (Verwaltung › Wartung)"; }
 
 # --- Boot-Partition nur für root lesbar (Passwort, Schlüssel; REV-026) ---------------
 # Zuletzt, damit ein Problem beim neu Einhängen nichts von oben verhindert.

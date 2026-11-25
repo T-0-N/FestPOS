@@ -9,7 +9,7 @@ import secrets
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from . import auth, backup as backup_mod, device_ids, fully, i18n, ledger, monitor as monitor_mod
+from . import auth, backup as backup_mod, device_ids, fully, i18n, ledger, monitor as monitor_mod, secretbox
 from . import ledger_base as lb
 from .core import admin, admin_cert_ok, current_user, db, forget_cert_only, rt
 from .i18n import t
@@ -61,6 +61,8 @@ class SettingsIn(BaseModel):
     swipe_categories: bool | None = None      # im Produktbereich wischen = andere Kategorie
     staff_qr: bool | None = None              # Tisch per QR-Code scannen (Personal); aus: ✕ in der Tischwahl
     admin_cert_only: bool | None = None       # Verwaltung nur mit Gerätezertifikat (main.admin_cert_gate)
+    admin_idle_minutes: int | None = Field(default=None, ge=10, le=120)   # Verwaltung: abmelden ohne Bedienung (core)
+    totp_required_roles: list[str] | None = Field(default=None, max_length=50)   # zweiter Faktor Pflicht (twofa.py)
     tutorial_auto: bool | None = None         # Einführung startet nach dem Eingeben/Ändern des Gerätenamens
     test_enabled: bool | None = None          # Testmodus (Üben) auf den Handys erlaubt
     test_pin: str | None = Field(default=None, pattern=r"^\d{4,8}$")
@@ -140,6 +142,12 @@ async def put_settings(s: SettingsIn, request: Request):
     values = s.model_dump(exclude_none=True)
     if not auth.has(current_user(request), auth.ADMIN_PERM) and set(values) - auth.LEAD_SETTINGS:   # sonst nur den Testmodus
         raise HTTPException(403, t("err.login.forbidden"))
+    from .core import session_confirmed
+    if set(values) & auth.CRITICAL_SETTINGS and not session_confirmed(request, current_user(request) or {}):
+        raise HTTPException(428, {"code": "confirm_needed", "text": t("err.login.confirm_needed")})   # (#9)
+    if "totp_required_roles" in values:                 # nur bekannte Rollen, als JSON
+        values["totp_required_roles"] = json.dumps(sorted({r for r in values["totp_required_roles"]
+                                                           if await db(auth.known_role, r)}))
     if values.get("admin_cert_only") and not await db(admin_cert_ok, request):
         raise HTTPException(409, t("err.login.cert_first"))     # nur einschalten, wer selbst mit Zertifikat kommt
     if "delivery_times" in values:            # bereinigen: "Sofort, Pause, Schluss"
@@ -185,8 +193,7 @@ async def put_settings(s: SettingsIn, request: Request):
         need = values.get("test_pin_required", await db(rt.store.setting, "test_pin_required", "1") != "0")
         if on and need and not await db(rt.store.setting, "test_pin_hash"):
             raise HTTPException(422, t("err.settings.test_pin_first"))
-    stmts = [("INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-              (k, ("1" if v else "0") if isinstance(v, bool) else str(v)))
+    stmts = [secretbox.put_stmt(k, ("1" if v else "0") if isinstance(v, bool) else str(v))   # Geheimnisse verschlüsselt
              for k, v in values.items()]
     # Protokoll: welche Einstellungen; geheime Werte (PIN, Passwörter) nie mit Inhalt
     secret = {"pin_hash": "pin", "test_pin_hash": "test_pin", "fully_password": "fully_password"}
@@ -195,5 +202,7 @@ async def put_settings(s: SettingsIn, request: Request):
     stmts.append(lb.audit_stmt(ledger.actor_of(request), "settings", **shown))
     await db(rt.store.batch, stmts)
     await db(i18n.forget_default)
+    from . import twofa
+    twofa.forget()                                      # Pflicht für den zweiten Faktor gilt sofort
     forget_cert_only()                                  # «Verwaltung nur mit Gerätezertifikat» gilt sofort
     return await get_settings()
