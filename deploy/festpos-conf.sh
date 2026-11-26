@@ -13,7 +13,7 @@
 
 FESTPOS_CONF_KEYS="CLUSTER_SIZE NET NET_PREFIX NET_CIDR IFACE VIP NODE_A_IP NODE_B_IP NODE_C_IP VRRP_ID TZ PHONE_CERTS
 ADMIN_PASSWORD ADMIN_PASSWORD_HASH ADMIN_PASSWORD_LAENGE CLUSTER_SECRET NODE NODE_IP JOIN_OTHERS CA_DAYS SERVER_DAYS SSH_FROM ADMIN_FROM RAFT_TLS
-DHCP DHCP_POOL DHCP_GATEWAY DHCP_DNS RTC_AKKU INTERNET_GATEWAY INTERNET_DNS TUNNEL_TOKEN"
+DHCP DHCP_POOL DHCP_GATEWAY DHCP_DNS RTC_AKKU INTERNET_GATEWAY INTERNET_DNS TUNNEL_TOKEN GATEWAY DNS NTP"
 
 _festpos_unescape() {           # \x -> x (für Werte in doppelten Anführungszeichen)
   local s=$1 out="" i c
@@ -152,6 +152,54 @@ festpos_in_net() {              # festpos_in_net IP NETZ/GRÖSSE -> 0, wenn die 
   (((i & m) == n && i != n && i != (n | (~m & 0xFFFFFFFF)))) || return 1
 }
 
+# Gateway, DNS und Zeitserver für Pi und Handhelds (GATEWAY, DNS, NTP in festpos.conf):
+#   GATEWAY leer/auto  automatisch wie bisher: Handhelds nach Verwaltung › Internet (Router oder VIP), der Pi über
+#                      INTERNET_GATEWAY/INTERNET_DNS (älter), DHCP_GATEWAY/DHCP_DNS gelten weiter
+#   GATEWAY=ohne       geschlossenes Netz: kein Gateway, kein DNS (Pi und Handhelds)
+#   GATEWAY=IP         fester Router im FestPOS-Netz für Pi und Handhelds, DNS=IP[,IP] (leer: der Router)
+#   NTP=Name oder IP   Zeitserver der Pi (leer: ch.pool.ntp.org); die Handhelds holen die Zeit immer von den Pi
+# festpos_gateway setzt GW_ART (auto|fest|ohne), PI_GW, PI_DNS (für NetworkManager), DHCP_GW, DHCP_DNS_LIST (für
+# festpos_dhcp_conf) und NTP_SERVER; gibt 1 zurück (und gilt automatisch), wenn GATEWAY oder DNS ungültig sind.
+festpos_dns_list() {            # festpos_dns_list "a, b" -> «a,b» (höchstens zwei Adressen), sonst 1
+  local liste="" d n=0
+  for d in ${1//,/ }; do
+    festpos_is_ip "$d" || return 1
+    n=$((n + 1)); ((n <= 2)) || return 1
+    liste="${liste:+$liste,}$d"
+  done
+  [ -n "$liste" ] || return 1
+  echo "$liste"
+}
+
+# shellcheck disable=SC2034  # setzt Variablen für festpos-node.sh
+festpos_gateway() {
+  local g=${GATEWAY:-auto} d rc=0
+  GW_ART=auto; PI_GW=""; PI_DNS=""; DHCP_GW=${DHCP_GATEWAY:-auto:$VIP}; DHCP_DNS_LIST=${DHCP_DNS:-1.1.1.1}
+  NTP_SERVER=""
+  if [ -n "${NTP:-}" ]; then
+    if [[ $NTP =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then NTP_SERVER=$NTP; else rc=1; fi
+  fi
+  case "$g" in
+    auto) ;;
+    ohne) GW_ART=ohne; DHCP_GW=ohne; DHCP_DNS_LIST=""; return $rc ;;
+    *)
+      if festpos_in_net "$g" "$NET" && d=$(festpos_dns_list "${DNS:-$g}"); then
+        GW_ART=fest; PI_GW=$g; PI_DNS=$d; DHCP_GW=$g; DHCP_DNS_LIST=$d
+        return $rc
+      fi
+      rc=1 ;;
+  esac
+  if [ -n "${INTERNET_GATEWAY:-}" ]; then        # automatisch: Internet für den Pi wie bisher (T22)
+    if festpos_in_net "$INTERNET_GATEWAY" "$NET"; then
+      PI_GW=$INTERNET_GATEWAY; PI_DNS=${INTERNET_DNS:-$INTERNET_GATEWAY}
+      festpos_is_ip "$PI_DNS" || PI_DNS=$INTERNET_GATEWAY
+    else
+      rc=1
+    fi
+  fi
+  return $rc
+}
+
 FESTPOS_DHCP_HOSTS=/var/lib/festpos/dhcp          # feste Zuteilungen, schreibt die App (app/dhcp.py)
 FESTPOS_DHCP_LEASES=/var/lib/festpos/dhcp.leases
 FESTPOS_DHCP_OPTS=/var/lib/festpos/dhcp-opts      # Gateway der Handhelds bei «auto», schreibt die App (app/dhcp.py)
@@ -159,7 +207,8 @@ FESTPOS_DHCP_OPTS=/var/lib/festpos/dhcp-opts      # Gateway der Handhelds bei «
 # festpos_dhcp_conf NETZ/GRÖSSE IFACE POOL GATEWAY DNS KNOTEN CLUSTER_SIZE [NTP] -> dnsmasq.conf (nur DHCP)
 # (ältere Form: NET_PREFIX NET_CIDR statt NETZ/GRÖSSE – geht weiter)
 # GATEWAY «auto:IP»: das Gateway der Handhelds folgt dem Weg ins Internet (Verwaltung › Internet) – die App
-# schreibt es nach $FESTPOS_DHCP_OPTS (Startwert IP); eine feste IP (DHCP_GATEWAY in festpos.conf) gilt immer.
+# schreibt es nach $FESTPOS_DHCP_OPTS (Startwert IP); eine feste IP gilt immer; «ohne»: kein Gateway (geschlossenes
+# Netz). DNS: eine oder zwei Adressen mit Komma, leer = keiner.
 # POOL «150-189»: Abstand zur Netzadresse (im /24 die letzte Stelle) oder ganze Adressen «10.20.1.1-10.20.3.200»;
 # bei 3 Pi bekommt jeder ein Drittel (a, b, c), damit nie zwei Pi dieselbe Adresse vergeben. Feste Zuteilungen sind
 # auf allen Pi gleich (aus der Datenbank).
@@ -182,8 +231,8 @@ festpos_dhcp_conf() {
     return 1
   fi
   ((von > base && bis < last && von <= bis)) || return 1
-  festpos_is_ip "$gw" || return 1
-  [ -z "$dns" ] || festpos_is_ip "$dns" || return 1
+  [ "$gw" = ohne ] || festpos_is_ip "$gw" || return 1
+  [ -z "$dns" ] || festpos_dns_list "$dns" >/dev/null || return 1
   [ -z "$ntp" ] || festpos_is_ip "$ntp" || return 1
   if [ "$size" = 3 ]; then
     n=$((bis - von + 1)); teil=$((n / 3)); ((teil >= 1)) || return 1
@@ -192,12 +241,13 @@ festpos_dhcp_conf() {
   fi
   mask=$(festpos_int2ip "$m")
   cat <<EOF
-# generiert von festpos-node.sh – nicht von Hand ändern (DHCP, DHCP_POOL, DHCP_GATEWAY, DHCP_DNS in festpos.conf)
+# generiert von festpos-node.sh – nicht von Hand ändern (DHCP, DHCP_POOL, GATEWAY, DNS bzw. DHCP_GATEWAY, DHCP_DNS in festpos.conf)
 port=0
 interface=$iface
 bind-dynamic
 dhcp-range=$(festpos_int2ip "$von"),$(festpos_int2ip "$bis"),$mask,2m
-$( [ -n "$auto" ] && echo "dhcp-optsdir=$FESTPOS_DHCP_OPTS" || echo "dhcp-option=option:router,$gw" )
+$( if [ -n "$auto" ]; then echo "dhcp-optsdir=$FESTPOS_DHCP_OPTS"; elif [ "$gw" = ohne ]; then echo "dhcp-option=option:router"
+   else echo "dhcp-option=option:router,$gw"; fi )
 $( [ -n "$dns" ] && echo "dhcp-option=option:dns-server,$dns" || echo "dhcp-option=option:dns-server" )
 $( [ -n "$ntp" ] && echo "dhcp-option=option:ntp-server,$ntp" )
 dhcp-hostsdir=$FESTPOS_DHCP_HOSTS

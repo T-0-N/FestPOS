@@ -9,6 +9,12 @@ Neue Einträge zuerst unter «Unveröffentlicht» sammeln; beim Release wird dar
 ## [Unveröffentlicht]
 
 ### Neu
+- **Gateway, DNS & Zeitserver einstellbar.** Geräte & Netz › Netz & Internet, oben: **automatisch** (wie bisher:
+  mobiler Router oder der Pi), **fester Router** (z.B. Firewall im Firmennetz, mit eigenen DNS-Servern) für die Pi und
+  die Handhelds, oder **ohne Internet** (geschlossenes Netz); ein eigener Zeitserver in jeder Art. Gespeichert in
+  `festpos.conf` (`GATEWAY`, `DNS`, `NTP`), gilt schon beim Start; die Pi übernehmen eine Änderung selbst, ohne
+  Neustart, mit Stand pro Pi. Auch bei der Ersteinrichtung (unter «Erweitert») und beim Netz-Umzug (vorgeschlagen,
+  umgerechnet, änderbar; die Checkliste nennt die neue Adresse des Routers).
 - **Netz im Betrieb umziehen.** Geräte & Netz › Pi › «Netz umziehen …»: planen (Prüfung, Checkliste was automatisch und
   was von Hand geht), neue CA für das neue Netz (Server-Schlüssel und Gerätezertifikate bleiben), CA über Fully auf die
   Handhelds, alle Pi stellen gleichzeitig um (rqlite mit den neuen Adressen), Adressen in Einstellungen, Druckern und
@@ -113,6 +119,8 @@ Neue Einträge zuerst unter «Unveröffentlicht» sammeln; beim Release wird dar
   Weg). WLAN: Land CH im Image und beim Verbinden, Suche bis 30 s, mit 3 Pi nur der Pi mit der VIP am Hotspot.
 
 ### Geändert
+- **Python-Pakete und GitHub Actions aktualisiert:** Pillow 13.0, ReportLab 5.1, python-multipart 0.0.34, Starlette
+  1.10, Pydantic 2.14.4 und weitere; in der CI checkout 7, setup-python 7, setup-java 6 und attest-build-provenance 4.
 - **Einfache Statusanzeige** (`/status-einfach`, iPad mini mit iOS 9): aktualisiert sich ohne weisses Aufblitzen –
   ein kleines Skript (ES5, für Safari 9) holt alle 10 s nur den Inhalt und tauscht ihn aus, statt die ganze Seite neu
   zu laden. Ohne Verbindung zum Server erscheint ein Hinweis und die Anzeige wird abgedunkelt; nach einem Update lädt

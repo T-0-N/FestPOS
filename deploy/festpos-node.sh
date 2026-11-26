@@ -272,21 +272,16 @@ if [ -n "$ALT_NET" ]; then                                 # Übergang nach dem 
   WANT="$WANT,$ALT_NODE_IP/$ALT_CIDR"
   [ "$CLUSTER_SIZE" = 1 ] && WANT="$WANT,$ALT_VIP/$ALT_CIDR"
 fi
-# Internet für den Pi (T22 QR-Bestellung: Payrexx und Cloudflare Tunnel): INTERNET_GATEWAY = Mobilfunk-Router im
-# Festnetz. Leer: kein Internet (wie bisher).
-GW=""; DNS=""
-if [ -n "${INTERNET_GATEWAY:-}" ]; then
-  if festpos_in_net "$INTERNET_GATEWAY" "$NET"; then
-    GW=$INTERNET_GATEWAY; DNS=${INTERNET_DNS:-$INTERNET_GATEWAY}
-    festpos_is_ip "$DNS" || DNS=$INTERNET_GATEWAY
-  else
-    log "WARNUNG: INTERNET_GATEWAY ungültig (muss im Netz $NET liegen): '$INTERNET_GATEWAY' – kein Internet"
-  fi
-fi
+# Gateway und DNS des Pi (festpos_gateway): fester Router (GATEWAY=IP), keiner (GATEWAY=ohne) oder automatisch – dann
+# wie bisher INTERNET_GATEWAY (T22, Mobilfunk-Router im Festnetz), leer: kein Internet.
+festpos_gateway || log "WARNUNG: GATEWAY, DNS, NTP oder INTERNET_GATEWAY ungültig (Gateway im Netz $NET, DNS mit Komma," \
+  "Zeitserver als Name oder Adresse) – gilt automatisch"
+GW=$PI_GW; DNS=$PI_DNS
 HAVE=$(nmcli -g ipv4.addresses con show "$CON" 2>/dev/null | tr -d ' ' || true)
 METHOD=$(nmcli -g ipv4.method con show "$CON" 2>/dev/null || true)
 HAVE_GW=$(nmcli -g ipv4.gateway con show "$CON" 2>/dev/null || true)
-if [ "$HAVE" != "$WANT" ] || [ "$METHOD" != "manual" ] || [ "$HAVE_GW" != "$GW" ]; then
+HAVE_DNS=$(nmcli -g ipv4.dns con show "$CON" 2>/dev/null | tr -d ' ' || true)
+if [ "$HAVE" != "$WANT" ] || [ "$METHOD" != "manual" ] || [ "$HAVE_GW" != "$GW" ] || [ "$HAVE_DNS" != "$DNS" ]; then
   log "setze feste IP $WANT auf $CON${GW:+ (Internet über $GW)}"
   nmcli con mod "$CON" ipv4.method manual ipv4.addresses "$WANT" ipv4.gateway "$GW" ipv4.dns "$DNS" \
         ipv6.method disabled connection.autoconnect yes
@@ -410,6 +405,10 @@ umask 027
   festpos_env_line FESTPOS_IFACE "$IFACE"                # Drucker-Netz (festpos-druckernetz, app/printer_net.py)
   festpos_env_line FESTPOS_NET_CIDR "$NET_CIDR"
   festpos_env_line FESTPOS_NET "$NET"                    # Netz mit Grösse (app/netz.py, T-0-N/FestPOS#2)
+  festpos_env_line FESTPOS_GW_MODE "$GW_ART"              # Gateway, DNS, Zeitserver (app/gateway.py)
+  festpos_env_line FESTPOS_GW "$PI_GW"
+  festpos_env_line FESTPOS_GW_DNS "$PI_DNS"
+  festpos_env_line FESTPOS_NTP "$NTP_SERVER"
   festpos_env_line JOIN_OTHERS "$JOIN_OTHERS"
   festpos_env_line CLUSTER_SIZE "$CLUSTER_SIZE"
   festpos_env_line FESTPOS_DB "rqlite://127.0.0.1:4001"
@@ -490,8 +489,9 @@ PEER_NTP=""
 cat > /etc/chrony/chrony.conf <<EOF
 # generiert von festpos-node.sh
 $PEER_NTP
-# Mit Internet (Update, Router) holt sich der Pi die Zeit selbst; offline findet chrony den Server einfach nicht (T2)
-pool ch.pool.ntp.org iburst maxsources 2
+# Mit Internet (Update, Router) holt sich der Pi die Zeit selbst; offline findet chrony den Server einfach nicht (T2).
+# NTP in festpos.conf: eigener Zeitserver (z.B. im Firmennetz) statt des Pools
+$( if [ -n "$NTP_SERVER" ]; then echo "server $NTP_SERVER iburst"; else echo "pool ch.pool.ntp.org iburst maxsources 2"; fi )
 local stratum 10 orphan
 makestep 1 -1
 rtcsync
@@ -508,11 +508,11 @@ if [ "${DHCP:-1}" = 1 ]; then
   if ! command -v dnsmasq >/dev/null; then
     log "WARNUNG: DHCP=1, aber dnsmasq fehlt (einmal mit Internet: sudo apt install dnsmasq-base) – DHCP aus"
     rm -f "$ETC/dnsmasq.conf"
-  elif festpos_dhcp_conf "$NET" "$IFACE" "${DHCP_POOL:-$(festpos_dhcp_pool_default "$NET_CIDR")}" "${DHCP_GATEWAY:-auto:$VIP}" \
-      "${DHCP_DNS:-1.1.1.1}" "$NODE" "$CLUSTER_SIZE" "$VIP" > "$ETC/dnsmasq.conf.neu"; then
+  elif festpos_dhcp_conf "$NET" "$IFACE" "${DHCP_POOL:-$(festpos_dhcp_pool_default "$NET_CIDR")}" "$DHCP_GW" \
+      "$DHCP_DNS_LIST" "$NODE" "$CLUSTER_SIZE" "$VIP" > "$ETC/dnsmasq.conf.neu"; then
     mv "$ETC/dnsmasq.conf.neu" "$ETC/dnsmasq.conf"
     install -d -o festpos -g festpos -m 0755 "$FESTPOS_DHCP_HOSTS"
-    if [ -z "${DHCP_GATEWAY:-}" ]; then                 # Gateway automatisch: Startwert der Pi (VIP), danach die App
+    if [[ $DHCP_GW == auto:* ]]; then                   # Gateway automatisch: Startwert der Pi (VIP), danach die App
       install -d -o festpos -g festpos -m 0755 "$FESTPOS_DHCP_OPTS"
       [ -s "$FESTPOS_DHCP_OPTS/festpos-gateway" ] || {
         echo "option:router,$VIP" > "$FESTPOS_DHCP_OPTS/festpos-gateway"
@@ -520,7 +520,7 @@ if [ "${DHCP:-1}" = 1 ]; then
     fi
     DHCP_RULE="        udp dport 67 accept                                   # DHCP-Anfragen (Handys, DHCP=1)"
   else
-    log "WARNUNG: DHCP_POOL, DHCP_GATEWAY oder DHCP_DNS ungültig (z.B. 150-189, 192.168.55.1, 1.1.1.1) – DHCP aus"
+    log "WARNUNG: DHCP_POOL, GATEWAY/DNS oder DHCP_GATEWAY/DHCP_DNS ungültig (z.B. 150-189, 192.168.55.1, 1.1.1.1) – DHCP aus"
     rm -f "$ETC/dnsmasq.conf"
   fi
 else

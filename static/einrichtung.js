@@ -31,6 +31,19 @@
   const field = (k, label, val) => `<label>${th(label)}<input name="${k}" value="${esc(val)}" inputmode="decimal" autocomplete="off"></label>`;
   const radio = (name, v, on, title, sub) => `<label><input type="radio" name="${name}" value="${v}" ${on ? "checked" : ""}>
     <b>${th(title)}</b><span>${th(sub)}</span></label>`;
+  // Gateway, DNS und Zeitserver (app/gateway.py, wie static/admin/gateway.js): zugeklappt, Vorgabe automatisch
+  const GW = [["auto", "admin.gw.m_auto", "admin.gw.s_auto_setup"], ["fest", "admin.gw.m_fest", "admin.gw.s_fest"],
+    ["ohne", "admin.gw.m_ohne", "admin.gw.s_ohne"]];
+  const gwPart = (v) => {
+    const mode = v.gw_mode || "auto", dns = v.gw_dns || [];
+    return `<details id="s-gw" ${mode !== "auto" || v.gw_ntp ? "open" : ""}><summary>${th("admin.setup.gw_more")}</summary>
+      <div class="choice gw-choice" id="s-gwmode">${GW.map(([m, a, b]) => radio("gw_mode", m, mode === m, a, b)).join("")}</div>
+      ${mode === "fest" ? `<div class="gw-fields">${field("gw", "admin.gw.f_gw", v.gw || "")}
+        <div class="gw-row2">${field("gw_dns1", "admin.gw.f_dns1", dns[0] || "")}${field("gw_dns2", "admin.gw.f_dns2", dns[1] || "")}</div></div>` : ""}
+      <div class="gw-fields"><label>${th("admin.gw.f_ntp")}<input name="gw_ntp" value="${esc(v.gw_ntp || "")}"
+        placeholder="${esc(t("admin.gw.ntp_ph"))}" autocomplete="off"></label></div>
+      <p class="hint">${th("admin.setup.gw_later")}</p></details>`;
+  };
 
   function draw() {
     const m = $("#s-main"), v = W.values;
@@ -74,6 +87,7 @@
           <details id="s-netmore"><summary>${th("admin.setup.net_more")}</summary><div class="form col" style="margin-top:8px">
             ${field("b", "admin.setup.net_b", v.b)}${field("c", "admin.setup.net_c", v.c)}
             ${field("dhcp_from", "admin.setup.net_dhcp_from", v.dhcp_from)}${field("dhcp_to", "admin.setup.net_dhcp_to", v.dhcp_to)}</div></details>
+          ${gwPart(v)}
           <label class="check"><input type="checkbox" name="dhcp" ${v.dhcp ? "checked" : ""}> ${th("admin.setup.net_dhcp")}</label></div>`,
       t("admin.setup.next"));
     } else if (W.step === "rtc") {
@@ -96,6 +110,7 @@
         : [["admin.setup.sum_way", t(W.way === "neu" ? "admin.setup.way_neu" : "admin.setup.way_backup")],
           ["admin.setup.sum_pi", W.size === 3 ? t("admin.setup.sum_three", { pi: W.node.toUpperCase() }) : t("admin.setup.pi_one")],
           ["admin.setup.sum_addr", v.vip], ["admin.setup.sum_dhcp", t(v.dhcp ? "admin.setup.yes" : "admin.setup.no")],
+          ["admin.setup.sum_gw", `${t((GW.find((x) => x[0] === (v.gw_mode || "auto")) || GW[0])[1])}${v.gw_mode === "fest" ? ` ${v.gw}` : ""}`],
           ...(W.way === "neu" ? [["admin.setup.sum_rtc", t(v.rtc_akku ? "admin.setup.yes" : "admin.setup.no")]] : [])];
       rows.push(["admin.setup.sum_time", t(W.takeTime ? "admin.setup.sum_time_take" : "admin.setup.sum_time_keep")]);
       if (W.way === "neu") rows.push(["admin.setup.sum_updates", t(W.upKey ? "admin.setup.sum_upd_own" : "admin.setup.sum_upd_project")]);
@@ -167,6 +182,11 @@
     if (!f) return;
     for (const k of NET_KEYS) W.values[k] = f.querySelector(`[name=${k}]`).value.trim();
     W.values.dhcp = f.querySelector("[name=dhcp]").checked;
+    const g = (n) => f.querySelector(`[name=${n}]`)?.value.trim() || "";
+    W.values.gw_mode = f.querySelector("[name=gw_mode]:checked")?.value || "auto";
+    W.values.gw = W.values.gw_mode === "fest" ? g("gw") : "";
+    W.values.gw_dns = W.values.gw_mode === "fest" ? [g("gw_dns1"), g("gw_dns2")].filter(Boolean) : [];
+    W.values.gw_ntp = g("gw_ntp");
   }
   // Netz «10.20.0.0/22» -> {base, size} oder null (nur die Netzadresse, /16 bis /27 wie app/netz.py)
   const NET_KEYS = ["net", "vip", "a", "b", "c", "dhcp_from", "dhcp_to"];
@@ -206,6 +226,7 @@
       }
     });
     f.querySelector("[name=net]").addEventListener("input", info);
+    $("#s-gwmode")?.addEventListener("change", () => { readNet(); draw(); $("#s-gw")?.setAttribute("open", ""); });
     info();
   }
   function vals() { return { ...W.values, cluster_size: W.way === "neu" ? 1 : W.size, node: W.way === "neu" ? "a" : W.node }; }

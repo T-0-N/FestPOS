@@ -247,6 +247,10 @@ class Values(BaseModel):
     node: str = Field("a", pattern="^[abc]$")
     rtc_akku: bool = False
     tz: str = Field("Europe/Zurich", max_length=40)
+    gw_mode: str = Field("auto", pattern="^(auto|fest|ohne)$")   # Gateway, DNS, Zeitserver (app/gateway.py)
+    gw: str = Field("", max_length=15)
+    gw_dns: list[str] = Field(default_factory=list, max_length=2)
+    gw_ntp: str = Field("", max_length=253)
 
 
 class NewIn(BaseModel):
@@ -259,7 +263,9 @@ class NewIn(BaseModel):
     update_key: str | None = Field(None, max_length=4096)
 
 
-NET_ERRORS = {"net": "err.setup.net_net", "size": "err.setup.net_size", "ip_bad": "err.setup.net_ip_bad",
+NET_ERRORS = {"mode": "err.gw.mode", "ntp": "err.gw.ntp", "gw_bad": "err.gw.bad", "gw_outside": "err.gw.outside",
+              "gw_taken": "err.gw.taken", "gw_pool": "err.gw.pool", "dns_bad": "err.gw.dns", "dns_many": "err.gw.dns",
+              "net": "err.setup.net_net", "size": "err.setup.net_size", "ip_bad": "err.setup.net_ip_bad",
               "ip_outside": "err.setup.net_ip_outside", "ip_twice": "err.setup.net_ip_twice",
               "dhcp_bad": "err.setup.net_dhcp_bad", "dhcp_outside": "err.setup.net_dhcp_outside",
               "dhcp_small": "err.setup.net_dhcp_small", "dhcp_overlap": "err.setup.net_dhcp_overlap",
@@ -279,6 +285,11 @@ def net_values(v: dict) -> dict:
         v["dhcp_from"], v["dhcp_to"] = d["dhcp_from"], d["dhcp_to"]
     errs = netz.plan_errors(v["net"], v.get("vip", ""), v.get("a", ""), v.get("b", ""), v.get("c", ""),
                             v["dhcp_from"], v["dhcp_to"], int(v.get("cluster_size") or 1), v.get("dhcp") is not False)
+    n = netz.parse(v["net"])
+    if not errs and n:                             # Gateway, DNS und Zeitserver (app/gateway.py)
+        mode, dns = str(v.get("gw_mode") or "auto"), [str(x) for x in (v.get("gw_dns") or []) if str(x).strip()]
+        errs = netz.gw_errors(mode, str(v.get("gw") or ""), dns, str(v.get("gw_ntp") or ""), n,
+                              avoid=[v.get(k, "") for k in ("vip", "a", "b", "c")], pool=(v["dhcp_from"], v["dhcp_to"]))
     if errs:
         raise HTTPException(422, t(NET_ERRORS[errs[0]], net=v["net"], printer=netz.PRINTER_NET, setup=netz.SETUP_IP,
                                    min=netz.MIN_CIDR, max=netz.MAX_CIDR))

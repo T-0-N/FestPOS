@@ -43,6 +43,14 @@ DHCP_POOL=150-189
 DHCP_GATEWAY=
 DHCP_DNS=
 
+# Gateway, DNS und Zeitserver für Pi und Handhelds (oder in der Verwaltung › Geräte & Netz › Netz & Internet):
+# GATEWAY leer = automatisch (wie bisher, DHCP_GATEWAY und INTERNET_GATEWAY gelten), eine Adresse = fester Router im
+# FestPOS-Netz (z.B. Firmennetz) für Pi und Handhelds, «ohne» = geschlossenes Netz. DNS: eine oder zwei Adressen mit
+# Komma (leer = der Router). NTP: eigener Zeitserver (Name oder Adresse), leer = ch.pool.ntp.org.
+GATEWAY=
+DNS=
+NTP=
+
 # Verwaltung: https://192.168.55.10:8443/admin.html  (Benutzer: admin). Passwort UNBEDINGT ändern, mindestens
 # 16 Zeichen. Beim nächsten Start ersetzt der Pi es durch einen Prüfwert (ADMIN_PASSWORD_HASH, ADMIN_PASSWORD_LAENGE)
 # – danach steht es nicht mehr in dieser Datei. Neues Passwort: wieder als ADMIN_PASSWORD eintragen und neu starten.

@@ -298,7 +298,8 @@ def test_start_switch_confirm_and_fallback(client, move, monkeypatch):
 def test_confirm_over_new_address(client, move, monkeypatch):
     u, store = move["umzug"], move["store"]
     m = client.post("/api/admin/umzug/start", auth=AUTH, json=NEW_PLAN).json()
-    store.execute(u.UPSERT, (u.KEY, json.dumps({**u.load(), "phase": "switching"})))
+    with u._lock:                                     # wie im Betrieb: die CA-Aufgabe im Hintergrund schreibt nicht dazwischen
+        store.execute(u.UPSERT, (u.KEY, json.dumps({**u.load(), "phase": "switching"})))
     monkeypatch.setenv("FESTPOS_NET", "10.20.0.0/22")                           # nach dem Neustart
     for n in "abc":
         store.execute(u.UPSERT, (u.NODE_KEY + n, json.dumps({"id": m["id"], "net": "10.20.0.0/22",
@@ -426,3 +427,58 @@ def test_phone_gets_new_address_only_with_new_ca(monkeypatch):
     ca_state[0] = "ok"
     phones = asyncio.run(umzug.phones_url({**m, "phones": phones}))
     assert phones["Kasse 1"] == {"ca": "ok", "url": "ok"} and sent[0] == "installUserCa" and "restartApp" in sent
+
+
+def test_gateway_in_plan_moved_checked_and_taken_back(client, move, monkeypatch):
+    """Fester Router: im Plan umgerechnet vorgeschlagen und geprüft; kurz vor dem Umstellen wird er der gewünschte Stand
+    für alle Pi (app/gateway.py), beim Rückfall wieder der alte; die neue festpos.conf bekommt ihn (festpos-netz)."""
+    from app import gateway
+    u, store = move["umzug"], move["store"]
+    client.put("/api/admin/gateway", auth=AUTH, json={"mode": "fest", "gateway": "192.168.55.254", "ntp": "ntp.firma.local"})
+    r = client.post("/api/admin/umzug/pruefen", auth=AUTH, json=NEW_PLAN).json()
+    assert r["new"]["gw"] == {"mode": "fest", "gateway": "10.20.0.254", "dns": ["10.20.0.254"], "ntp": "ntp.firma.local"}
+    assert ("router", "192.168.55.254", "10.20.0.254") in {(x["kind"], x["old"], x["new"]) for x in r["manual"]}
+    bad = client.post("/api/admin/umzug/pruefen", auth=AUTH, json={**NEW_PLAN, "gw": {"mode": "fest", "gateway": "10.20.0.10"}})
+    assert "gw_taken" in bad.json()["errors"]
+    plan = {**NEW_PLAN, "gw": {"mode": "fest", "gateway": "10.20.3.254", "dns": ["10.20.3.253"], "ntp": ""}}
+    m = client.post("/api/admin/umzug/start", auth=AUTH, json=plan).json()
+    assert m["new"]["gw"]["gateway"] == "10.20.3.254"
+    for n in "bc":
+        store.execute(u.UPSERT, (u.NODE_KEY + n, json.dumps({"id": m["id"], "prepared": 1, "net": str(OLD),
+                                                             "at": int(time.time())})))
+    monkeypatch.setattr(u.rt.spooler, "is_leader", True, raising=False)
+    with u._lock:
+        store.execute(u.UPSERT, (u.KEY, json.dumps({**u.load(), "at": int(time.time()) + 5})))
+    u.tick()
+    w = gateway.wanted()
+    assert u.load()["phase"] == "switching" and w["gateway"] == "10.20.3.254" and w["rev"] == 2
+    with u._lock:
+        store.execute(u.UPSERT, (u.KEY, json.dumps({**u.load(), "at": int(time.time()) - 100,
+                                                    "deadline": int(time.time()) - 1})))
+    u.tick()
+    assert u.load()["phase"] == "back" and gateway.wanted()["gateway"] == "192.168.55.254"
+
+
+def test_new_conf_gets_gateway_from_plan(pi):
+    job = {**pi["job"], "new": {**NEW_PLAN, "gw": {"mode": "fest", "gateway": "10.20.3.254", "dns": ["10.20.3.253"],
+                                                   "ntp": "ntp.firma.local"}}}
+    p, res = pi["run"]("--vorbereiten", stdin=job)
+    assert res == {"ok": True}, p.stderr
+    c = conf(pi, "festpos.conf.umzug")
+    assert c("GATEWAY") == "10.20.3.254" and c("DNS") == "10.20.3.253" and c("NTP") == "ntp.firma.local"
+    assert c("INTERNET_GATEWAY") == "10.20.0.1"                                      # bisheriges weiter umgerechnet
+
+
+def test_plan_gateway_replaces_unmovable_old_one(pi):
+    """Der alte feste Router passt nicht ins kleinere neue Netz – der Plan gibt einen neuen: kein «ip_no_room»."""
+    (pi["boot"] / "festpos.conf").write_text(CONF + "GATEWAY=192.168.55.254\nDNS=192.168.55.254\n")
+    small = ipaddress.IPv4Network("10.30.0.0/26")
+    certs = zertifikate.for_move(str(small), ["10.30.0.10", "10.30.0.11", "10.30.0.12", "10.30.0.13"], pi["old"]["server.crt"])
+    new = {"net": str(small), "vip": "10.30.0.10", "a": "10.30.0.11", "b": "10.30.0.12", "c": "10.30.0.13",
+           "dhcp_from": "10.30.0.32", "dhcp_to": "10.30.0.60", "gw": {"mode": "fest", "gateway": "10.30.0.62", "dns": [], "ntp": ""}}
+    job = {**pi["job"], "new": new, "ca_crt": certs["ca.crt"].decode(), "server_crt": certs["server.crt"].decode()}
+    (pi["boot"] / "festpos.conf").write_text((pi["boot"] / "festpos.conf").read_text().replace("ADMIN_FROM=192.168.55.200-192.168.55.220\n", ""))
+    p, res = pi["run"]("--vorbereiten", stdin=job)
+    assert res == {"ok": True}, p.stderr
+    c = conf(pi, "festpos.conf.umzug")
+    assert c("GATEWAY") == "10.30.0.62" and c("DNS") is None

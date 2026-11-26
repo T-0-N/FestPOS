@@ -120,7 +120,7 @@ ERR_KEYS = {
     "rollback_failed": "err.update.rollback_failed", "internal": "err.update.internal", "no_helper": "err.update.no_helper",
     "no_answer": "err.update.no_answer", "fetch": "err.update.fetch", "interrupted": "err.update.interrupted",
     # Update aus dem Internet (update_net.py und festpos-update)
-    "net_bad": "err.update.net_bad", "net_gateway": "err.update.net_gateway", "net_resolv": "err.update.net_resolv",
+    "net_bad": "err.update.net_bad", "net_none": "err.update.net_none", "net_gateway": "err.update.net_gateway", "net_resolv": "err.update.net_resolv",
     "net_no_wlan": "err.update.net_no_wlan", "net_wlan": "err.update.net_wlan", "net_no_usb": "err.update.net_no_usb",
     "net_no_link": "err.update.net_no_link", "net_dhcp": "err.update.net_dhcp", "net_same_net": "err.update.net_same_net",
     "net_share": "err.update.net_share",

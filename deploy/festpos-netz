@@ -11,6 +11,8 @@
                               Adressen, Neustart
   festpos-netz --wache        jede Minute (festpos-netz.timer): Frist zum Bestätigen abgelaufen -> zurück; verpasstes
                               Umstellen (Pi war gerade aus) innert 5 Minuten nachholen, sonst verwerfen
+  festpos-netz --gateway      (JSON auf stdin) Gateway, DNS und Zeitserver (GATEWAY, DNS, NTP) in festpos.conf schreiben
+                              und ohne Neustart übernehmen: NetworkManager, DHCP der Handhelds, chrony, Firewall
 
 Die neue festpos.conf entsteht aus der bisherigen: Netz, VIP, Pi und DHCP neu (app/netz.py), Adressen des alten Netzes in
 INTERNET_GATEWAY, INTERNET_DNS, DHCP_GATEWAY, DHCP_DNS, SSH_FROM, ADMIN_FROM umgerechnet (gleicher Abstand zur
@@ -24,6 +26,7 @@ import fcntl
 import ipaddress
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -49,7 +52,17 @@ SYSTEMD_RUN = os.environ.get("FESTPOS_SYSTEMD_RUN", "systemd-run")
 SELF = os.environ.get("FESTPOS_NETZ_BIN", "/usr/local/sbin/festpos-netz")
 RAFT_PORT = 4002
 MISSED_S = 300                      # verpasstes Umstellen so lange nachholen
-TRANSLATE = ("INTERNET_GATEWAY", "INTERNET_DNS", "DHCP_GATEWAY", "DHCP_DNS", "SSH_FROM", "ADMIN_FROM", "DHCP_POOL")
+TRANSLATE = ("INTERNET_GATEWAY", "INTERNET_DNS", "DHCP_GATEWAY", "DHCP_DNS", "SSH_FROM", "ADMIN_FROM", "DHCP_POOL",
+             "GATEWAY", "DNS")
+# Gateway, DNS und Zeitserver (--gateway): dieselbe Rechnung wie beim Start (festpos-conf.sh, festpos_gateway)
+LIB = os.environ.get("FESTPOS_CONF_LIB", "/usr/local/sbin/festpos-conf.sh")
+NMCLI = os.environ.get("FESTPOS_NMCLI", "nmcli")
+FIREWALL = os.environ.get("FESTPOS_FIREWALL_BIN", "/usr/local/sbin/festpos-firewall")
+DNSMASQ_CONF = Path(f"{R}/etc/festpos/dnsmasq.conf")
+DHCP_OPTS = Path(f"{R}/var/lib/festpos/dhcp-opts")
+CHRONY_CONF = Path(f"{R}/etc/chrony/chrony.conf")
+GW_STATE = Path(f"{R}/var/lib/festpos-netz/gateway.json")   # Dienste, die noch neu gestartet werden müssen
+NTP_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 ALT_KEYS = ("NET_ALT", "VIP_ALT", "NODE_A_IP_ALT", "NODE_B_IP_ALT", "NODE_C_IP_ALT", "NET_ALT_BIS")
 
 
@@ -124,12 +137,17 @@ def new_conf(cur: str, job: dict) -> str:
             continue                                       # eigener Wert: unten umgerechnet
         cur = backup.conf_set(cur, k, v)
     for k in TRANSLATE:
+        if k in ("GATEWAY", "DNS") and isinstance(new.get("gw"), dict):
+            continue                                       # ersetzt unten der Plan (auch wenn nicht umrechenbar)
         v = backup.conf_value(cur, k)
         if v:
             moved, missing = netz.move_text(v, on, nn)
             if missing:
                 raise Fehler("ip_no_room")
             cur = backup.conf_set(cur, k, moved)
+    if isinstance(new.get("gw"), dict):                     # Gateway, DNS, Zeitserver im Plan angegeben
+        for k, v in gw_conf(new["gw"], nn).items():
+            cur = backup.conf_set(cur, k, v) if v else backup.conf_remove(cur, k)
     alt = {"NET_ALT": str(on), "VIP_ALT": old["vip"], "NET_ALT_BIS": str(int(job["until"]))}
     for k in ("a", "b", "c"):
         if old.get(k):
@@ -199,6 +217,161 @@ def vorbereiten(job: dict) -> dict:
                     "--umstellen"], capture_output=True, timeout=30)
     log(f"vorbereitet: {old['net']} -> {new['net']} in {wait} s")
     return {"ok": True}
+
+
+# -- Gateway, DNS und Zeitserver (Verwaltung › Netz & Internet) -------------------------------------------------
+def gw_conf(job: dict, net: ipaddress.IPv4Network) -> dict[str, str]:
+    """Auftrag -> Einträge für festpos.conf (leer = Eintrag weg). Streng geprüft: root schreibt damit die Boot-Partition."""
+    mode = job.get("mode")
+    ntp = str(job.get("ntp") or "").strip()
+    if ntp and not NTP_RE.match(ntp):
+        raise Fehler("gw_ntp")
+    if mode == "auto":
+        return {"GATEWAY": "", "DNS": "", "NTP": ntp}
+    if mode == "ohne":
+        return {"GATEWAY": "ohne", "DNS": "", "NTP": ntp}
+    if mode != "fest":
+        raise Fehler("job")
+    try:
+        gw = ipaddress.IPv4Address(str(job.get("gateway") or ""))
+        dns = [ipaddress.IPv4Address(str(x)) for x in (job.get("dns") or []) if str(x).strip()]
+    except ValueError:
+        raise Fehler("gw_bad") from None
+    if gw not in net or gw in (net.network_address, net.broadcast_address):
+        raise Fehler("gw_outside")
+    if len(dns) > 2:
+        raise Fehler("gw_bad")
+    return {"GATEWAY": str(gw), "DNS": ",".join(str(x) for x in dns), "NTP": ntp}
+
+
+def gw_rechnen(conf: Path) -> dict[str, str]:
+    """Werte wie festpos-node.sh beim Start (festpos_gateway) -> {GW_ART, PI_GW, PI_DNS, DHCP_GW, DHCP_DNS_LIST,
+    NTP_SERVER, IFACE, VIP}."""
+    script = ('source "$1"; festpos_read_conf "$2" >/dev/null 2>&1 || exit 3; festpos_net_from_conf || exit 3; '
+              'IFACE=${IFACE:-eth0}; festpos_gateway; '
+              'for k in GW_ART PI_GW PI_DNS DHCP_GW DHCP_DNS_LIST NTP_SERVER IFACE VIP; do printf "%s=%s\\n" "$k" "${!k}"; done')
+    r = subprocess.run(["bash", "-c", script, "festpos-netz", LIB, str(conf)], capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        raise Fehler("conf")
+    return dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+
+
+def _ersetze(text_: str, muster: str, zeile: str) -> str:
+    """Zeilen, die mit muster (regulärer Ausdruck) beginnen, durch zeile ersetzen (die erste; weitere weg)."""
+    out, done = [], False
+    for ln in text_.splitlines():
+        if re.match(muster, ln):
+            if not done:
+                out.append(zeile)
+                done = True
+            continue
+        out.append(ln)
+    if not done:
+        out.append(zeile)
+    return "\n".join(out) + "\n"
+
+
+def _neu_starten_dienst(unit: str) -> None:
+    r = subprocess.run([SYSTEMCTL, "try-restart", unit], capture_output=True, text=True, timeout=60)
+    if r.returncode:
+        log(f"{unit}: {(r.stderr or '').strip()[:200]}")
+        raise Fehler("gw_restart")
+
+
+def gw_anwenden(w: dict[str, str]) -> list[str]:
+    """Ohne Neustart übernehmen: Route und DNS (NetworkManager), DHCP der Handhelds, Zeitserver, Firewall ins
+    Internet -> was geändert wurde. Scheitert etwas: Fehler (die App versucht es in einer Minute nochmals). Ein Dienst,
+    dessen Datei geschrieben, der aber nicht neu gestartet wurde, bleibt vorgemerkt (GW_OFFEN) bis zum Erfolg."""
+    done = []
+    offen = set(state_gw().get("offen") or [])
+    iface = w.get("IFACE") or "eth0"
+    con = subprocess.run([NMCLI, "-g", "GENERAL.CONNECTION", "device", "show", iface], capture_output=True, text=True,
+                         timeout=30).stdout.strip().splitlines()
+    if not con or not con[0]:
+        raise Fehler("gw_nm")
+    r = subprocess.run([NMCLI, "connection", "modify", con[0], "ipv4.gateway", w.get("PI_GW", ""),
+                        "ipv4.dns", w.get("PI_DNS", "")], capture_output=True, text=True, timeout=30)
+    if r.returncode == 0:
+        r = subprocess.run([NMCLI, "device", "reapply", iface], capture_output=True, text=True, timeout=60)
+    if r.returncode:
+        log(f"NetworkManager: {(r.stderr or '').strip()[:200]}")
+        raise Fehler("gw_nm")
+    done.append("route")
+    if DNSMASQ_CONF.is_file():
+        cur = text(DNSMASQ_CONF)
+        gw = w.get("DHCP_GW", "")
+        if gw.startswith("auto:"):
+            router = f"dhcp-optsdir={DHCP_OPTS}"
+            opts = DHCP_OPTS / "festpos-gateway"
+            if not opts.is_file():
+                DHCP_OPTS.mkdir(parents=True, exist_ok=True)
+                schreibe(opts, f"option:router,{gw[5:]}\n".encode())
+        else:
+            router = "dhcp-option=option:router" + ("" if gw == "ohne" else f",{gw}")
+        dns = w.get("DHCP_DNS_LIST", "")
+        new = _ersetze(cur, r"^(dhcp-optsdir=|dhcp-option=option:router)", router)
+        new = _ersetze(new, r"^dhcp-option=option:dns-server", "dhcp-option=option:dns-server" + (f",{dns}" if dns else ""))
+        if new != cur:
+            offen.add("festpos-dhcp.service")
+            save_state_gw({"offen": sorted(offen)})
+            schreibe(DNSMASQ_CONF, new.encode())
+    if CHRONY_CONF.is_file():
+        cur = text(CHRONY_CONF)
+        ntp = w.get("NTP_SERVER", "")
+        line = f"server {ntp} iburst" if ntp else "pool ch.pool.ntp.org iburst maxsources 2"
+        new = _ersetze(cur, r"^(pool|server) ", line)
+        if new != cur:
+            offen.add("chrony.service")
+            save_state_gw({"offen": sorted(offen)})
+            schreibe(CHRONY_CONF, new.encode())
+    for unit in sorted(offen):                              # auch nach einem früheren Fehlschlag (Datei schon gleich)
+        _neu_starten_dienst(unit)
+        offen.discard(unit)
+        save_state_gw({"offen": sorted(offen)})
+        done.append("dhcp" if "dhcp" in unit else "ntp")
+    if os.path.exists(FIREWALL):                            # DNS-Server der Regeln ins Internet (aus resolv.conf)
+        r = subprocess.run([FIREWALL], capture_output=True, text=True, timeout=120)
+        if r.returncode:
+            log(f"Firewall: {(r.stderr or '').strip()[:200]}")
+            raise Fehler("gw_firewall")
+    return done
+
+
+def state_gw() -> dict:
+    try:
+        d = json.loads(GW_STATE.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state_gw(d: dict) -> None:
+    GW_STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    schreibe(GW_STATE, json.dumps(d).encode(), 0o600)
+
+
+def gateway(job: dict) -> dict:
+    """Gateway, DNS und Zeitserver in festpos.conf schreiben und gleich übernehmen. Während eines Netz-Umzugs nicht."""
+    if state().get("phase") in ("vorbereitet", "wechsel", "umgestellt"):
+        raise Fehler("running")
+    try:
+        cur = text(CONF)
+    except OSError:
+        raise Fehler("conf") from None
+    net = netz.from_conf(cur)
+    if not net:
+        raise Fehler("conf")
+    new = cur
+    for k, v in gw_conf(job, net).items():
+        new = backup.conf_set(new, k, v) if v else backup.conf_remove(new, k)
+    if new != cur:
+        schreibe(CONF, new.encode("utf-8", errors="surrogateescape"))
+    w = gw_rechnen(CONF)
+    done = gw_anwenden(w)
+    log(f"Gateway: {w.get('GW_ART')} {w.get('PI_GW') or '–'}, DNS {w.get('PI_DNS') or '–'}, "
+        f"Zeitserver {w.get('NTP_SERVER') or 'Pool'} ({', '.join(done) or 'unverändert'})")
+    return {"ok": True, "rev": job.get("rev"), "applied": {"mode": w.get("GW_ART"), "gateway": w.get("PI_GW", ""),
+            "dns": [x for x in w.get("PI_DNS", "").split(",") if x], "ntp": w.get("NTP_SERVER", "")}}
 
 
 def peers_json(pis: dict) -> None:
@@ -328,6 +501,8 @@ def _main(argv: list[str]) -> int:
             return melde(bestaetigt(json.loads(sys.stdin.read() or "{}")))
         if argv == ["--wache"]:
             return wache()
+        if argv == ["--gateway"]:
+            return melde(gateway(json.loads(sys.stdin.read() or "{}")))
     except Fehler as e:
         return melde({"ok": False, "code": e.code})
     except ValueError:

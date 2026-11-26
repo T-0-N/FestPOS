@@ -169,10 +169,10 @@ def load_app():
 
     from app import (cards, catalog, core, devices, dhcp, display, fully, fully_apk, gast, ledger, mac_change, main,
                      maintenance, payrexx, payrexx_api, plan, bon_design, printer_net, printers, restore_check, tabs, settings_admin, status, status_simple, stock, system, tables, test_mode, time_admin,
-                     sicherheit, firewall, saison, krypt, umzug, tunnel, twofa, update, update_net, uplink_admin, users, web)
+                     sicherheit, firewall, saison, krypt, gateway, umzug, tunnel, twofa, update, update_net, uplink_admin, users, web)
     for mod in (core, devices, dhcp, mac_change, display, fully, fully_apk, uplink_admin, update, update_net, users, twofa, sicherheit, firewall, saison, printer_net, system, ledger,
                 test_mode, status, status_simple, stock, settings_admin, printers, catalog, tables, plan, cards, maintenance, restore_check,
-                time_admin, payrexx, payrexx_api, tunnel, web, gast, tabs, bon_design, krypt, umzug, main):
+                time_admin, payrexx, payrexx_api, tunnel, web, gast, tabs, bon_design, krypt, gateway, umzug, main):
         importlib.reload(mod)
     return main
 

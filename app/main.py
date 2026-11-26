@@ -39,6 +39,7 @@ from . import auth, catalog, certs, cluster as cluster_mod, device_ids, devices,
     restore_check, secretbox, sicherheit, timesync, twofa, users as users_mod, firewall, saison
 from . import release as release_mod
 from . import krypt as krypt_mod
+from . import gateway as gateway_mod
 from . import umzug as umzug_mod
 from . import ledger_base as lb
 from .core import (APP_VERSION, LOGIN_MAX_FAILS, LOGIN_WINDOW_S, PW_WARN_LEN, Config, RequestGate, Throttle,  # noqa: F401
@@ -79,6 +80,10 @@ def _tick() -> None:
         umzug_mod.tick()
     except Exception:  # noqa: BLE001 – Monitor darf nie stehen bleiben
         log.exception("Netz umziehen: Takt gescheitert")
+    try:                                         # Gateway, DNS, Zeitserver: neuen Stand übernehmen – jeder Pi
+        gateway_mod.tick()
+    except Exception:  # noqa: BLE001 – Monitor darf nie stehen bleiben
+        log.exception("Gateway: Takt gescheitert")
 
 
 _payrexx_last = [0.0]
@@ -870,6 +875,7 @@ app.include_router(cards.admin_router)
 app.include_router(krypt_mod.router)
 app.include_router(krypt_mod.admin_router)
 app.include_router(umzug_mod.admin_router)
+app.include_router(gateway_mod.admin_router)
 app.include_router(ledger.router)
 app.include_router(ledger.admin_router)
 app.include_router(stock_mod.router)

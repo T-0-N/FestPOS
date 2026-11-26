@@ -338,6 +338,21 @@ danach wieder eine FestPOS-Karte, stellt `festpos-haertung` den Bootloader erneu
   Handhelds übernehmen ein neues Gateway beim Erneuern ihrer Adresse, spätestens nach 30 Minuten (sofort: WLAN am
   Handheld aus und wieder ein). Eine feste Adresse, z.B. `192.168.55.1`, gilt immer. `DHCP_DNS`: leer =
   `1.1.1.1`. `DHCP=0` schaltet es ab. Wirkt nach einem Neustart des Pi. `dnsmasq` bringt `setup.sh` mit.
+- `GATEWAY`, `DNS`, `NTP` – **Gateway, DNS & Zeitserver** für die Pi und die Handhelds, am einfachsten in der
+  Verwaltung › Geräte & Netz › Netz & Internet (oben) oder bei der Ersteinrichtung unter «Erweitert»:
+  - `GATEWAY` leer = **automatisch** wie bisher (`DHCP_GATEWAY`, `INTERNET_GATEWAY` gelten weiter).
+  - `GATEWAY=192.168.55.254` = **fester Router** (z.B. Firewall im Firmennetz) für Pi **und** Handhelds, immer;
+    `DNS=192.168.55.254,192.168.55.253` (eine oder zwei, leer = der Router). Die Pi teilen dann kein Internet über WLAN
+    oder USB. Das Gateway darf nicht die VIP, kein Pi und nicht im DHCP-Bereich sein.
+  - `GATEWAY=ohne` = **geschlossenes Netz**: kein Gateway, kein DNS; keine Online-Zahlung, kein Tunnel, kein
+    «Update aus dem Internet» – Updates per Datei oder USB-Stick.
+  - `NTP=ntp.firma.local` (Name oder Adresse) = Zeitserver der Pi statt `ch.pool.ntp.org`, in jeder Art. Die
+    Handhelds holen die Zeit immer von den Pi.
+
+  In der Verwaltung geändert, übernehmen es die Pi selbst, ohne Neustart (Stand pro Pi auf der Karte); ein Pi, der aus
+  war, holt es nach. Am PC eingetragen: gilt nach dem nächsten Start (bei 3 Pi auf jeder Karte gleich) – **ausser**, in
+  der Verwaltung wurde inzwischen ein neuerer Stand gespeichert, den dieser Pi noch nicht hatte: Dann gilt der aus der
+  Verwaltung, der Pi schreibt ihn gleich nach dem Start in seine `festpos.conf`.
 - `RAFT_TLS=1` – der Datenbank-Verkehr zwischen den Pi ist verschlüsselt und gegenseitig geprüft (wirkt erst
   mit 3 Pi). Ändern nur, wenn danach alle Pi zusammen neu gestartet werden.
 
@@ -941,8 +956,8 @@ Bons, Protokoll und Statusanzeige nehmen die Uhr des Pi. Die Zeitzone kommt aus 
   und beim Stellen gespeichert) – ungefähr richtig statt 1970. Hält die RTC die Zeit (Batterie ab 2,5 V), schaltet
   `festpos-node` fake-hwclock beim Start ab und löscht die gespeicherte Zeit, denn es stellte sonst die richtige
   RTC-Zeit zurück. Wird die Batterie schwach, kommt es beim nächsten Start von selbst zurück.
-- **Internet**: Ist der Pi online (Update, Router), holt chrony die Zeit von `ch.pool.ntp.org`. Das zählt als
-  Bestätigung.
+- **Internet**: Ist der Pi online (Update, Router), holt chrony die Zeit von `ch.pool.ntp.org` – oder vom eigenen
+  Zeitserver (`NTP`, Geräte & Netz › Netz & Internet › Gateway, DNS & Zeitserver). Das zählt als Bestätigung.
 - **Andere Pi**: chrony gleicht die Pi untereinander ab. Startet ein Pi mit leerer RTC-Batterie, holt er die Zeit
   selbst von einem Pi mit sicherer Uhr (braucht `CLUSTER_SECRET`).
 - **Festleitung**: Die Handhelds stellen den Pi **nicht** (mehr). Stattdessen fragt die Verwaltung nach.

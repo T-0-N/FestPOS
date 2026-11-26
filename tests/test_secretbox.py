@@ -63,6 +63,7 @@ def test_no_secret_in_plain_text_after_saving_and_migration(client, monkeypatch)
 def test_payrexx_key_and_tunnel_token_old_format_migrated(client, monkeypatch):
     from app import core, main, payrexx_api, secretbox, tunnel
     store = main.store
+    monkeypatch.setattr(main, "_secrets_last", [1e12])      # der Takt im Hintergrund verschlüsselt hier nicht vorher
     monkeypatch.setattr(core.Config, "cluster_secret", "c" * 40)
     old = payrexx_api.unseal_legacy
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM

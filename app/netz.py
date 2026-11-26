@@ -124,6 +124,53 @@ def current() -> ipaddress.IPv4Network | None:
         return None
 
 
+GW_MODES = ("auto", "fest", "ohne")
+NTP_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+def gw_errors(mode: str, gateway: str, dns: list[str], ntp: str, net: ipaddress.IPv4Network,
+              avoid: list[str] | None = None, pool: tuple[str, str] | None = None) -> list[str]:
+    """Gateway, DNS und Zeitserver (app/gateway.py) prüfen -> Fehlercodes (leer = in Ordnung): mode, ntp, gw_bad,
+    gw_outside, gw_taken (VIP oder ein Pi), gw_pool (im DHCP-Bereich), dns_bad, dns_many."""
+    errs: list[str] = []
+    if mode not in GW_MODES:
+        return ["mode"]
+    if ntp and not NTP_RE.match(ntp):
+        errs.append("ntp")
+    if mode != "fest":
+        return errs
+    try:
+        gw = ipaddress.IPv4Address(str(gateway).strip())
+    except ValueError:
+        return [*errs, "gw_bad"]
+    if gw not in net or gw in (net.network_address, net.broadcast_address):
+        errs.append("gw_outside")
+    if str(gw) in (avoid or []):
+        errs.append("gw_taken")
+    if pool:
+        try:
+            if ipaddress.IPv4Address(pool[0]) <= gw <= ipaddress.IPv4Address(pool[1]):
+                errs.append("gw_pool")
+        except ValueError:
+            pass
+    if len(dns) > 2:
+        errs.append("dns_many")
+    for d in dns:
+        try:
+            ipaddress.IPv4Address(str(d).strip())
+        except ValueError:
+            errs.append("dns_bad")
+            break
+    return errs
+
+
+def gw_conf(mode: str, gateway: str, dns: list[str], ntp: str) -> dict[str, str]:
+    """Einträge für festpos.conf (leer = Eintrag weg): GATEWAY (leer = automatisch, «ohne», Adresse), DNS, NTP."""
+    if mode == "fest":
+        return {"GATEWAY": gateway.strip(), "DNS": ",".join(d.strip() for d in dns if d.strip()), "NTP": ntp.strip()}
+    return {"GATEWAY": "ohne" if mode == "ohne" else "", "DNS": "", "NTP": ntp.strip()}
+
+
 def pool() -> tuple[str, str] | None:
     """DHCP-Bereich dieses Pi aus der von festpos-node geschriebenen dnsmasq.conf (wie dhcp.CONF), sonst None."""
     try:

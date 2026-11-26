@@ -293,8 +293,14 @@ def einrichtung_werte(v: dict) -> dict:
     if not TZ_RE.match(tz) or not Path("/usr/share/zoneinfo", tz).exists() and not TROCKEN:
         raise Fehler("tz")
     lines = netz.conf_lines(net, ips["vip"], ips["a"], ips["b"], ips["c"], lo, hi)
+    gw_mode = str(v.get("gw_mode") or "auto")                # Gateway, DNS, Zeitserver (app/gateway.py)
+    gw_dns = [str(x) for x in (v.get("gw_dns") or []) if str(x).strip()][:3]
+    if netz.gw_errors(gw_mode, str(v.get("gw") or ""), gw_dns, str(v.get("gw_ntp") or ""), netz.parse(net),
+                      avoid=list(ips.values()), pool=(lo, hi)):
+        raise Fehler("gateway")
+    gw = {k: x for k, x in netz.gw_conf(gw_mode, str(v.get("gw") or ""), gw_dns, str(v.get("gw_ntp") or "")).items() if x}
     return {"node": node, "net": lines["NET"], "ips": [ips["vip"], ips["a"], ips["b"], ips["c"]],
-            "conf": {"CLUSTER_SIZE": size, **lines, "TZ": tz, "RTC_AKKU": "1" if v.get("rtc_akku") else "0",
+            "conf": {"CLUSTER_SIZE": size, **lines, **gw, "TZ": tz, "RTC_AKKU": "1" if v.get("rtc_akku") else "0",
                      "DHCP": "0" if v.get("dhcp") is False else "1"}}
 
 
@@ -571,6 +577,12 @@ def auftrag_netz_zurueck(_job: dict) -> dict:
     return {}
 
 
+def auftrag_netz_gateway(job: dict) -> dict:
+    """Gateway, DNS und Zeitserver (Verwaltung › Netz & Internet): in festpos.conf und gleich übernehmen."""
+    res = krypt("--gateway", {k: job.get(k) for k in ("mode", "gateway", "dns", "ntp", "rev")}, 180, NETZ_BIN)
+    return {"applied": res.get("applied"), "rev": res.get("rev")}
+
+
 def karte(arg: str, job: dict | None = None, timeout: float = 60) -> dict:
     """festpos-karte aufrufen (T10: SD-Karte im USB-Kartenleser schreiben) -> seine Antwort (JSON)."""
     try:
@@ -602,7 +614,8 @@ AUFTRAEGE = {"keys": auftrag_keys, "kartenpaket": auftrag_kartenpaket, "cluster3
              "einrichtung_neustart": auftrag_einrichtung_neustart, "ca_key_usb": auftrag_ca_key_usb, "archiv_usb": auftrag_archiv_usb,
              "os_online": auftrag_os_online, "krypt_umstellen": auftrag_krypt_umstellen,
              "krypt_bestaetigen": auftrag_krypt_bestaetigen, "netz_vorbereiten": auftrag_netz_vorbereiten,
-             "netz_bestaetigt": auftrag_netz_bestaetigt, "netz_zurueck": auftrag_netz_zurueck}
+             "netz_bestaetigt": auftrag_netz_bestaetigt, "netz_zurueck": auftrag_netz_zurueck,
+             "netz_gateway": auftrag_netz_gateway}
 
 
 def melde(job_id: str, res: dict) -> None:

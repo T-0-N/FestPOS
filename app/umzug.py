@@ -36,7 +36,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from . import cards, ledger, netz, secretbox, zertifikate
+from . import cards, gateway, ledger, netz, secretbox, zertifikate
 from . import ledger_base as lb
 from .core import Config, admin, current_user, db, log, rt
 from .i18n import t
@@ -58,7 +58,16 @@ UPSERT = "INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDAT
 _local: dict = {"prepared": None, "back": None, "confirmed": None, "reported": 0.0, "phones": 0.0}
 
 
+class GwPlan(BaseModel):
+    """Gateway, DNS und Zeitserver im neuen Netz (app/gateway.py)."""
+    mode: str = Field(pattern=r"^(auto|fest|ohne)$")
+    gateway: str = Field(default="", max_length=15)
+    dns: list[str] = Field(default_factory=list, max_length=4)
+    ntp: str = Field(default="", max_length=253)
+
+
 class PlanIn(BaseModel):
+    gw: GwPlan | None = None                        # leer: wie bisher, Adressen umgerechnet
     net: str = Field(max_length=20)
     vip: str = Field(max_length=15)
     a: str = Field(max_length=15)
@@ -156,6 +165,13 @@ def check(p: PlanIn) -> dict:
     out = {"errors": errors, "old": old, "new": {"net": p.net.strip(), "vip": p.vip.strip(), **use,
                                                  "dhcp_from": p.dhcp_from.strip(), "dhcp_to": p.dhcp_to.strip()}}
     n = netz.parse(p.net)
+    gw_now, gw_new = _gw_plan(p, netz.parse(old["net"]), n)
+    out["gw_now"], out["new"]["gw"] = gw_now, gw_new
+    if n and not errors:
+        d = netz.defaults(str(n))
+        pool = (p.dhcp_from.strip() or d["dhcp_from"], p.dhcp_to.strip() or d["dhcp_to"])
+        errors += [e for e in gateway.errors(gw_new["mode"], gw_new["gateway"], gw_new["dns"], gw_new["ntp"],
+                                                       net=n, avoid=[p.vip.strip(), *use.values()], pool=pool)]
     if n:
         out["range"] = {"first": str(n.network_address), "last": str(n.broadcast_address),
                         "hosts": n.num_addresses - 2}
@@ -177,9 +193,12 @@ def check(p: PlanIn) -> dict:
                 manual.append({"kind": "device", "name": name, "old": ip, "new": new_ip})
             elif _in(ip, on):
                 missing.append(ip)
-        gw = (_get("update_net").get("gateway") or "")
-        if gw and netz.move_ip(gw, on, nn):
-            manual.append({"kind": "router", "name": "", "old": gw, "new": netz.move_ip(gw, on, nn)})
+        if gw_new["mode"] == "fest":                       # fester Router: genau die Adresse, die er bekommen muss
+            manual.append({"kind": "router", "name": "", "old": gw_now.get("gateway") or "–", "new": gw_new["gateway"]})
+        else:
+            gw = (_get("update_net").get("gateway") or "")
+            if gw and netz.move_ip(gw, on, nn):
+                manual.append({"kind": "router", "name": "", "old": gw, "new": netz.move_ip(gw, on, nn)})
         for d in _get_list("monitor_devices"):
             if _in(d.get("ip"), on) and not netz.move_ip(d.get("ip"), on, nn):
                 missing.append(str(d.get("ip")))
@@ -204,6 +223,20 @@ def check(p: PlanIn) -> dict:
         blockers.append("pis")
     out["blockers"], out["backup_at"] = blockers, at
     return out
+
+
+def _gw_plan(p: PlanIn, on, nn) -> tuple[dict, dict]:
+    """Gateway, DNS, Zeitserver jetzt und im neuen Netz: aus dem Plan, sonst die jetzigen, Adressen umgerechnet."""
+    now = gateway.current()
+    if p.gw:
+        dns = [d.strip() for d in p.gw.dns if d.strip()]
+        gw = p.gw.gateway.strip() if p.gw.mode == "fest" else ""
+        return now, {"mode": p.gw.mode, "gateway": gw, "dns": (dns or [gw]) if p.gw.mode == "fest" else [],
+                     "ntp": p.gw.ntp.strip()}
+    move = (lambda ip: netz.move_ip(ip, on, nn) or ip) if on and nn else (lambda ip: ip)  # noqa: E731
+    return now, {"mode": now.get("mode") or "auto", "gateway": move(now.get("gateway") or "") if now.get("mode") == "fest" else "",
+                 "dns": [move(d) for d in now.get("dns") or []] if now.get("mode") == "fest" else [],
+                 "ntp": now.get("ntp") or ""}
 
 
 def _in(ip, net) -> bool:
@@ -249,6 +282,22 @@ def translate(m: dict) -> dict:
         if new_ip:
             undo["printers"][str(r["id"])] = r["host"]
             stmts.append(("UPDATE printers SET host=? WHERE id=?", (new_ip, r["id"])))
+    gw = (m.get("new") or {}).get("gw")
+    if not isinstance(gw, dict):                     # ohne Plan (z.B. Sicherung aus einem anderen Netz): fester Router
+        cur = gateway.wanted()                         # mit gleichem Abstand umgerechnet wie die anderen Adressen
+        if cur.get("mode") == "fest":
+            moved = {**cur, "gateway": netz.move_ip(cur.get("gateway") or "", on, nn) or cur.get("gateway"),
+                     "dns": [netz.move_ip(d, on, nn) or d for d in cur.get("dns") or []]}
+            gw = moved if moved != cur else None
+    if isinstance(gw, dict) and gw.get("mode") in gateway.MODES:   # Gateway, DNS, Zeitserver: neuer Stand für alle Pi
+        raw = rt.store.scalar("SELECT value FROM settings WHERE key=?", (gateway.KEY,))
+        if raw is None:
+            undo["delete"] = [gateway.KEY]
+        else:
+            undo["settings"][gateway.KEY] = raw
+        rev = int(gateway.wanted().get("rev") or 0) + 1
+        stmts.append((UPSERT, (gateway.KEY, json.dumps({**{k: gw.get(k) for k in ("mode", "gateway", "dns", "ntp")},
+                                                          "rev": rev, "by": m.get("by"), "at": int(time.time())}))))
     if stmts:
         rt.store.batch(stmts)
     return undo
@@ -256,6 +305,7 @@ def translate(m: dict) -> dict:
 
 def untranslate(undo: dict) -> None:
     stmts = [(UPSERT, (k, v)) for k, v in (undo.get("settings") or {}).items()]
+    stmts += [("DELETE FROM settings WHERE key=?", (k,)) for k in undo.get("delete") or []]
     stmts += [("UPDATE printers SET host=? WHERE id=?", (h, int(i))) for i, h in (undo.get("printers") or {}).items()]
     if stmts:
         rt.store.batch(stmts)
@@ -450,7 +500,7 @@ def view() -> dict:
     m = load()
     now = time.time()
     st = _node_status() if m.get("id") else {}
-    return {"move": public(m), "nodes": st, "old": old_plan(), "now": now,
+    return {"move": public(m), "nodes": st, "old": old_plan(), "now": now, "gw": gateway.current(),
             "defaults": netz.defaults("10.20.0.0/22" if old_plan()["net"] != "10.20.0.0/22" else "192.168.55.0/24"),
             "all_new": bool(m.get("id")) and _all_new(m) if m.get("new") else False}
 

@@ -209,6 +209,7 @@ const AUDIT_ACTIONS = {
   net_move_aborted: "admin.audit.a_net_move_aborted", net_move_back: "admin.audit.a_net_move_back",
   net_move_back_requested: "admin.audit.a_net_move_back_requested", net_move_done: "admin.audit.a_net_move_done",
   net_move_ca_key: "admin.audit.a_net_move_ca_key", net_restore_moved: "admin.audit.a_net_restore_moved",
+  net_gateway: "admin.audit.a_net_gateway",
   card_write: "admin.audit.a_card_write", card_written: "admin.audit.a_card_written", card_failed: "admin.audit.a_card_failed",
   card_cancelled: "admin.audit.a_card_cancelled", device_pin: "admin.audit.a_device_pin",
   payrexx_paid: "admin.audit.a_payrexx_paid", payrexx_settings: "admin.audit.a_payrexx_settings",

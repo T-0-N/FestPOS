@@ -156,7 +156,8 @@ def test_mouse_pointer_appears_while_moving(server, browser):  # noqa: F811
     page.goto(base + "/status.html?ansicht=pc")
     page.wait_for_selector("#devices .item")
     cursor = "() => getComputedStyle(document.querySelector('.log')).cursor"
-    assert page.evaluate(cursor) == "none"
+    # in Ruhe kein Zeiger – meldet Chromium beim Laden selbst eine Mausbewegung, erst nach deren 3 s (CI, langsam)
+    _until(page, "getComputedStyle(document.querySelector('.log')).cursor === 'none'", 4500)
     page.mouse.move(300, 300)
     page.mouse.move(320, 310)
     assert page.evaluate(cursor) != "none"

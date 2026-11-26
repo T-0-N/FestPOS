@@ -48,6 +48,7 @@ def test_release_workflow_attests_and_notes_explain_verification():
     notes = subprocess.run([sys.executable, str(ROOT / "tools" / "release_notes.py"), "v1.1.0"], capture_output=True,
                            text=True, check=True).stdout
     assert "gh attestation verify festpos.zip -R T-0-N/FestPOS" in notes and "cdx.json" in notes
-    dep = (ROOT / ".github" / "dependabot.yml").read_text()
-    for eco in ("pip", "gradle", "github-actions"):
-        assert f"package-ecosystem: {eco}" in dep
+    dep = ROOT / ".github" / "dependabot.yml"                   # Entscheid: Updates nur im Entwicklungs-Repo prüfen
+    if dep.exists():
+        for eco in ("pip", "gradle", "github-actions"):
+            assert f"package-ecosystem: {eco}" in dep.read_text()

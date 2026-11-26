@@ -179,7 +179,14 @@ def test_grow_from_single_pi(tmp_path):
         shutil.rmtree(a.data)
         a.start()
         local_a = RqliteStore("127.0.0.1", a.http_port, read_level="none")
-        wait_for(lambda: local_a.scalar("SELECT COUNT(*) FROM tables") == 2, 15, "A synchronisiert")
+
+        def a_synced():
+            # Wie systemd (rqlited.service: Restart=always): Schickt der Leader seine Daten, bevor der Beitritt fertig
+            # ist, beendet sich rqlited («clustering failure») – nach dem Neustart läuft A mit diesen Daten weiter.
+            if a.proc.poll() is not None:
+                a.start()
+            return local_a.scalar("SELECT COUNT(*) FROM tables") == 2
+        wait_for(a_synced, 20, "A synchronisiert")
     finally:
         for nd in (a, b, c):
             nd.stop()

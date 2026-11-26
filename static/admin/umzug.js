@@ -2,6 +2,7 @@
    Schritt 1 Planen (Netz, VIP, Pi, DHCP, Prüfung, Checkliste), dann Ablauf: vorbereiten, umstellen (Neustart),
    Pi im neuen Netz, Bestätigen über die neue Adresse innert 10 Minuten – sonst stellen die Pi selbst zurück. */
 import { $, api, download, esc, guard, piName, toast } from "./core.js";
+import { GW_ERR, GW_MODES, gwChoice, gwFields, gwRead } from "./gateway.js";
 
 let DATA = null, AT = 0, TIMER = null, PLAN = null, CHECK = null, LAST = "";
 const RUNNING = new Set(["prepared", "switching", "back_requested"]);
@@ -63,9 +64,10 @@ function planView() {
       ${f("vip", "admin.umzug.f_vip", "um-wide")}
       <div class="um-row">${letters.map((k) => f(k, FIELD[k])).join("")}</div>
       <div class="um-row">${f("dhcp_from", "admin.umzug.f_dhcp_from")}${f("dhcp_to", "admin.umzug.f_dhcp_to")}</div>
+      ${gwPlan()}
     </form>
     ${c ? `<ul class="um-checks">
-      ${okRow(!errs, errs ? errs.map((e) => th(ERR[e] || "admin.umzug.e_other", { net: p.net, code: e })).join("<br>") : th("admin.umzug.c_ok"))}
+      ${okRow(!errs, errs ? errs.map((e) => th(ERR[e] || GW_ERR[e] || "admin.umzug.e_other", { net: p.net, code: e })).join("<br>") : th("admin.umzug.c_ok"))}
       ${okRow(!(errs || []).some((e) => e.startsWith("overlap")), th("admin.umzug.c_overlap", { old: DATA.old.net }))}
       ${blocks.map((b) => okRow(false, th(BLOCK[b] || "admin.umzug.e_other", { code: b }))).join("")}</ul>
       <h4>${th("admin.umzug.auto")}</h4>
@@ -76,10 +78,40 @@ function planView() {
       <button type="button" class="btn pri" data-um="${c && !errs && !blocks.length ? "start" : "check"}">${th(c && !errs && !blocks.length ? "admin.umzug.start" : "admin.umzug.check")}</button></div>`;
 }
 
+// Gateway, DNS und Zeitserver im neuen Netz (gateway.js): vorgeschlagen (umgerechnet), änderbar
+const gwText = (g) => !g ? "–" : g.mode === "fest" ? `${t(GW_MODES.fest[0])} ${g.gateway} · DNS ${(g.dns || []).join(", ") || g.gateway}`
+  + (g.ntp ? ` · ${t("admin.gw.r_ntp")} ${g.ntp}` : "") : t(GW_MODES[g.mode]?.[0] || GW_MODES.auto[0]) + (g.ntp ? ` · ${t("admin.gw.r_ntp")} ${g.ntp}` : "");
+// Adresse mit gleichem Abstand zur Netzadresse im neuen Netz (wie netz.move_ip), sonst unverändert
+const ip2n = (s) => { const p = String(s || "").split("."); return p.length === 4 && p.every((x) => /^\d{1,3}$/.test(x) && +x < 256)
+  ? p.reduce((a, x) => a * 256 + +x, 0) : null; };
+const n2ip = (n) => [24, 16, 8, 0].map((s) => Math.floor(n / 2 ** s) % 256).join(".");
+function moveIp(ip, from, to) {
+  const [fa, fb] = String(from || "").split("/"), [ta, tb] = String(to || "").split("/"), x = ip2n(ip), f = ip2n(fa), n = ip2n(ta);
+  if (x == null || f == null || n == null || !/^\d+$/.test(fb || "") || !/^\d+$/.test(tb || "")) return ip;
+  const off = x - f, size = 2 ** (32 - +tb);
+  return off > 0 && off < 2 ** (32 - +fb) - 1 && off < size - 1 ? n2ip(n + off) : ip;
+}
+// Vorschlag: aus der Prüfung (umgerechnet vom Server), sonst die jetzigen Werte hier umgerechnet. Gesendet wird PLAN.gw
+// nur, wenn an diesen Feldern etwas geändert wurde – sonst rechnet der Server selbst um.
+function gwProposal() {
+  if (CHECK?.new?.gw) return CHECK.new.gw;
+  const g = DATA.gw || { mode: "auto" }, mv = (ip) => moveIp(ip, DATA.old?.net, PLAN.net);
+  return g.mode === "fest" ? { ...g, gateway: mv(g.gateway), dns: (g.dns || []).map(mv) } : g;
+}
+function gwPlan() {
+  const g = (PLAN.gwTouched && PLAN.gw) || gwProposal(), now = DATA.gw || {};
+  const moved = g.mode === "fest" && now.mode === "fest" && g.gateway && g.gateway !== now.gateway;
+  return `<div class="um-wide um-gw"><b>${th("admin.umzug.gw_h")}</b>
+      <p class="hint">${th("admin.umzug.gw_now", { now: gwText(now) })}</p>${gwChoice(g.mode, "gw", true)}
+      ${gwFields(g, "gw", "")}${moved ? `<p class="hint">${th("admin.umzug.gw_moved", { old: now.gateway })}</p>` : ""}</div>`;
+}
+
 function readForm() {
   const f = $("#um-form");
   if (!f) return;
-  for (const el of f.elements) if (el.name) PLAN[el.name] = el.value.trim();
+  for (const el of f.elements) if (el.name && !el.name.startsWith("gw_")) PLAN[el.name] = el.value.trim();
+  if (PLAN.gwTouched && f.querySelector("[name=gw_mode]")) PLAN.gw = gwRead(f, "gw", gwProposal());
+  else delete PLAN.gw;
 }
 
 async function runCheck() {
@@ -173,7 +205,14 @@ export function bindUmzug() {
     tickLeft();
     if (!PLAN && Math.round(Date.now() / 1000) % 5 === 0) reload();
   }, 1000);
-  card.addEventListener("input", (e) => { if (e.target.closest("#um-form")) readForm(); });
+  card.addEventListener("input", (e) => {
+    if (!e.target.closest("#um-form")) return;
+    if (e.target.name?.startsWith("gw_") && PLAN) PLAN.gwTouched = true;   // ab jetzt gilt, was eingegeben wurde
+    readForm();
+  });
+  card.addEventListener("change", (e) => {                     // andere Art: Felder ein- oder ausblenden
+    if (e.target.name === "gw_mode" && PLAN) { PLAN.gwTouched = true; readForm(); CHECK = null; draw(planView()); }
+  });
   card.addEventListener("submit", async (e) => {
     if (e.target.id !== "um-cakey") return;
     e.preventDefault();

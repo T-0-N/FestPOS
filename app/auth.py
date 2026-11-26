@@ -210,6 +210,7 @@ POST /api/admin/reset-orders
 POST /api/admin/backup/password/new
 PUT /api/admin/printer-net
 PUT /api/admin/firewall
+PUT /api/admin/gateway
 POST /api/admin/season/close
 POST /api/admin/os/online
 POST /api/admin/cluster/expand

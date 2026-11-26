@@ -15,33 +15,33 @@ seiner Version hier steht. Nach `python3 tools/pin-requirements.py` nachführen.
 
 | Paket | Version | Lizenz | Quelle |
 |---|---|---|---|
-| annotated-doc | 0.0.5 | MIT | https://github.com/fastapi/annotated-doc |
+| annotated-doc | 0.0.7 | MIT | https://github.com/fastapi/annotated-doc |
 | annotated-types | 0.8.0 | MIT | https://github.com/annotated-types/annotated-types |
-| anyio | 4.15.1 | MIT | https://github.com/agronholm/anyio |
+| anyio | 4.16.0 | MIT | https://github.com/agronholm/anyio |
 | cffi | 2.1.1 | MIT-0 | https://github.com/python-cffi/cffi |
-| charset-normalizer | 3.5.2 | MIT |  |
-| click | 8.5.0 | BSD-3-Clause | https://github.com/pallets/click/ |
+| charset-normalizer | 3.5.3 | MIT |  |
+| click | 8.5.1 | BSD-3-Clause | https://github.com/pallets/click/ |
 | cryptography | 50.0.1 | Apache-2.0 OR BSD-3-Clause | https://github.com/pyca/cryptography |
 | fastapi | 0.142.4 | MIT | https://github.com/fastapi/fastapi |
 | h11 | 0.16.0 | MIT | https://github.com/python-hyper/h11 |
 | httptools | 0.9.0 | MIT | https://github.com/MagicStack/httptools |
 | idna | 3.20 | BSD-3-Clause | https://github.com/kjd/idna |
-| opentelemetry-api | 1.45.1 | Apache-2.0 | https://github.com/open-telemetry/opentelemetry-python/tree/main/opentelemetry-api |
-| pillow | 12.3.0 | MIT-CMU | https://python-pillow.github.io |
-| pycparser | 3.11 | BSD-3-Clause | https://github.com/eliben/pycparser |
-| pydantic | 2.14.0 | MIT | https://github.com/pydantic/pydantic |
-| pydantic_core | 2.50.0 | MIT | https://github.com/pydantic/pydantic |
+| opentelemetry-api | 1.45.2 | Apache-2.0 | https://github.com/open-telemetry/opentelemetry-python/tree/main/opentelemetry-api |
+| pillow | 13.0.0 | MIT-CMU | https://python-pillow.github.io |
+| pycparser | 3.12 | BSD-3-Clause | https://github.com/eliben/pycparser |
+| pydantic | 2.14.4 | MIT | https://github.com/pydantic/pydantic |
+| pydantic_core | 2.50.5 | MIT | https://github.com/pydantic/pydantic |
 | python-dotenv | 1.2.4 | BSD-3-Clause | https://github.com/theskumar/python-dotenv |
-| python-multipart | 0.0.32 | Apache-2.0 | https://github.com/Kludex/python-multipart |
-| PyYAML | 6.0.3 | MIT | https://pyyaml.org/ |
-| reportlab | 5.0.1 | BSD-3-Clause | https://www.reportlab.com/ |
-| starlette | 1.7.0 | BSD-3-Clause | https://github.com/Kludex/starlette |
+| python-multipart | 0.0.34 | Apache-2.0 | https://github.com/Kludex/python-multipart |
+| PyYAML | 6.0.4 | MIT | https://pyyaml.org/ |
+| reportlab | 5.1.0 | BSD-3-Clause | https://www.reportlab.com/ |
+| starlette | 1.10.0 | BSD-3-Clause | https://github.com/Kludex/starlette |
 | typing_extensions | 4.16.0 | PSF-2.0 | https://github.com/python/typing_extensions |
-| typing-inspection | 0.4.4 | MIT | https://github.com/pydantic/typing-inspection |
+| typing-inspection | 0.4.5 | MIT | https://github.com/pydantic/typing-inspection |
 | uvicorn | 0.53.0 | BSD-3-Clause | https://uvicorn.dev/ |
 | uvloop | 0.23.0 | MIT OR Apache-2.0 | https://github.com/MagicStack/uvloop |
 | watchfiles | 1.3.0 | MIT | https://github.com/samuelcolvin/watchfiles |
-| websockets | 17.2 | BSD-3-Clause | https://github.com/python-websockets/websockets |
+| websockets | 17.4 | BSD-3-Clause | https://github.com/python-websockets/websockets |
 
 reportlab bringt die Schriften Bitstream Vera mit (Bitstream Vera Fonts Copyright); FestPOS benutzt sie für
 durchgestrichene Positionen auf dem Storno-Bon.

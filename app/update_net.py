@@ -77,6 +77,26 @@ def _raw() -> dict:
     return c if isinstance(c, dict) else {}
 
 
+def _cfg() -> dict:
+    """Verbindung, wie sie gilt: mit festem Router (Gateway, DNS & Zeitserver, app/gateway.py) immer über ihn."""
+    from . import gateway
+    c, f = _raw(), gateway.fixed()
+    return {**c, "via": "lan", "gateway": f["gateway"], "dns": f["dns"]} if f else c
+
+
+def _want(cfg: dict | None = None) -> list:
+    """Weg der Verbindung, wie er gilt (Weg, Router, WLAN) – ändert er sich, wird neu verbunden."""
+    c = cfg or _cfg()
+    via = c.get("via") if c.get("via") in VIA else "lan"
+    return [via, (c.get("gateway") or "") if via == "lan" else "", (c.get("ssid") or "") if via == "wlan" else ""]
+
+
+def _closed() -> bool:
+    """Geschlossenes Netz (Gateway «ohne»): kein Internet, auch nicht kurz."""
+    from . import gateway
+    return gateway.mode() == "ohne"
+
+
 def short_token(tok: str) -> str:
     """Nie ganz zeigen: Anfang und die letzten drei Zeichen."""
     prefix = next((p for p in ("github_pat_", "ghp_") if tok.startswith(p)), "")
@@ -136,11 +156,12 @@ def _job_view() -> dict | None:
 
 def allowed() -> bool:
     """Seite «Internet», Schalter (a): Internet für Updates erlaubt (Standard ja – wie vor T5)."""
-    return rt.store.setting("net_updates", "1") != "0"
+    return not _closed() and rt.store.setting("net_updates", "1") != "0"
 
 
 def view() -> dict:
-    return {"config": _public(), "node": Config.node, "devices": devices(), "job": _job_view(),
+    from . import gateway
+    return {"config": _public(), "gw_mode": gateway.mode(), "node": Config.node, "devices": devices(), "job": _job_view(),
             "running": APP_VERSION, "busy": bool(_task and not _task.done()), "allowed": allowed(),
             "keep": keep_view()}
 
@@ -172,7 +193,7 @@ _keep: dict = {}
 
 
 def keep_on() -> bool:
-    return rt.store.setting("net_keep", "0") == "1"
+    return not _closed() and rt.store.setting("net_keep", "0") == "1"
 
 
 def keep_report() -> dict:
@@ -312,7 +333,7 @@ def phone_issue() -> bool:
     """Bestell-App: Internet über WLAN/USB des Pi weg, obwohl Karte/TWINT oder QR-Bestellung es brauchen (der Weg über
     den Router meldet sich als Mobilfunk-Router, status.uplink_issue). Erst nach der ersten Prüfung."""
     from . import status
-    if not keep_on() or (_raw().get("via") or "lan") == "lan" or not status.internet_needed():
+    if not keep_on() or (_cfg().get("via") or "lan") == "lan" or not status.internet_needed():
         return False
     st = _keep.get("state")
     return st in ("failed", "no_way") or (st == "up" and _keep.get("online") is False)
@@ -345,7 +366,8 @@ def _adopt(cfg: dict, now: float) -> bool:
         return False                                         # anderer Weg, Router oder ein anderes WLAN eingestellt
     _keep.clear()
     _keep.update(state="up", via=via, iface=h.get("dev") or "", since=int(h.get("at") or now), share=bool(h.get("share")),
-                 peer=peer, device=h["via"] in ("wlan", "usb"), allow=None, fails=0, tries=0, adopted=True)
+                 peer=peer, device=h["via"] in ("wlan", "usb"), allow=None, fails=0, tries=0, adopted=True,
+                 want=_want(cfg))
     log.info("Internet dauerhaft: bestehende Verbindung übernommen (%s)", via)
     return True
 
@@ -378,9 +400,13 @@ def keep_tick() -> None:
     if _task and not _task.done():
         return                                               # Update aus dem Internet läuft gerade
     now = time.time()
-    cfg = _raw()
+    cfg = _cfg()
     if not _keep:
         _adopt(cfg, now)
+    if _keep.get("state") == "up" and _keep.get("want") not in (None, _want(cfg)):
+        log.info("Internet dauerhaft: anderer Weg eingestellt (z.B. fester Router) – neu verbinden")
+        _keep.clear()
+        _net_down(force=True)
     if _keep.get("state") == "up":
         reason = _probe()
         _keep.update(online=reason is None, reason=reason, checked=int(now))
@@ -429,7 +455,8 @@ def keep_tick() -> None:
         return
     _keep.clear()
     _keep.update(state="up", via=via, iface=iface, since=int(now), share=share, peer=peer and peer["node"],
-                 checked=int(now), device=device, allow=allow if share else None, fails=0, last=int(now))
+                 checked=int(now), device=device, allow=allow if share else None, fails=0, last=int(now),
+                 want=_want(_cfg()))
     reason = _probe()
     _keep.update(online=reason is None, reason=reason, tries=0 if reason is None else tries,
                  next=None if reason is None else time.time() + wait)
@@ -543,6 +570,11 @@ def _net_up(cfg: dict, psk: str, share: bool = False, keep: bool = False, allow:
     """Internet ein (über festpos-update). share: an die Geräte im FestPOS-Netz weitergeben – an alle (Ausrollen,
     fully.py) oder nur an allow. keep: dauerhaft (Schalter c). Steht die dauerhafte Verbindung schon, bleibt sie;
     fürs Ausrollen gibt sie dann ans ganze Netz weiter (bis keep_tick wieder einschränkt)."""
+    if _closed():
+        raise release.ReleaseError("net_none")
+    if not keep and _keep.get("state") == "up" and _keep.get("want") not in (None, _want()):
+        _keep.clear()                                          # anderer Weg eingestellt: die alte Verbindung nicht nehmen
+        _net_down(force=True)
     if not keep and _keep.get("state") == "up":
         if share and (not _keep.get("share") or _keep.get("allow")):
             _share_set(True, None)
@@ -574,7 +606,7 @@ def _set(**kw) -> None:
 
 
 def _run(op: str, actor: str) -> None:
-    cfg, token, psk = _raw(), rt.store.setting("update_net_token") or "", rt.store.setting("update_net_psk") or ""
+    cfg, token, psk = _cfg(), rt.store.setting("update_net_token") or "", rt.store.setting("update_net_psk") or ""
     repo = repo_of(cfg)
     up = False
     try:
@@ -635,8 +667,8 @@ def _start(op: str, actor: str) -> dict:
     if _task and not _task.done():
         raise HTTPException(409, i18n.t("err.update.net_busy"))
     if not allowed():
-        raise HTTPException(409, i18n.t("err.update.net_off"))
-    cfg = _raw()
+        raise HTTPException(409, i18n.t("err.update.net_none" if _closed() else "err.update.net_off"))
+    cfg = _cfg()
     if not REPO_RE.match(repo_of(cfg)):
         raise HTTPException(422, update.err_text("gh_no_repo"))
     if op == "download":

@@ -8,6 +8,7 @@ import { pageHead, RENDER, rerender, view } from "./shell.js";
 import { bindMon, monTable, switchHTML } from "./monitor.js";
 import { bindNetConn, netConnForm } from "./update.js";
 import { bindUplink, setUplink, uplinkCard } from "./uplink.js";
+import { bindGw, gwCard } from "./gateway.js";
 import { shareVia } from "./fully.js";
 
 function shareLine(sh) {
@@ -81,25 +82,29 @@ function fwCard(fw, system) {
 }
 RENDER.internet = async () => {
   const adm = can("admin");
-  const [net, prov, up, s, fw, system] = await Promise.all([adm ? guard(() => api("GET", "/update/net")) : null,
+  const [net, prov, up, s, fw, system, gw] = await Promise.all([adm ? guard(() => api("GET", "/update/net")) : null,
     adm ? api("GET", "/fully/provision").catch(() => null) : null, api("GET", "/uplink").catch(() => null),
     adm ? api("GET", "/settings").catch(() => null) : null, adm ? api("GET", "/firewall").catch(() => null) : null,
-    adm ? api("GET", "/system").catch(() => null) : null]);
+    adm ? api("GET", "/system").catch(() => null) : null, adm ? api("GET", "/gateway").catch(() => null) : null]);
   if (view !== "internet" || (adm && !net)) return;    // inzwischen andere Seite (REV-048)
   setUplink(up);
   const sh = prov?.share;
-  $("#main").innerHTML = `${pageHead()}
-    ${adm ? `<div class="card"><h3>${th("admin.internet.use_title")}</h3>
-      <p class="hint">${th("admin.internet.intro")}</p>
+  // Gateway, DNS & Zeitserver oben; die Karten darunter richten sich nach der Art (gateway.js)
+  const mode = net?.gw_mode || "auto", fixedGw = gw?.current?.mode === "fest" ? gw.current.gateway : "";
+  const useCard = !adm || mode === "ohne" ? "" : `<div class="card" id="usecard"><h3>${th("admin.internet.use_title")}</h3>
+      <p class="hint">${th("admin.internet.intro")}</p>${mode === "fest" ? `<p class="hint">${th("admin.gw.use_fest")}</p>` : ""}
       <div class="swrow">${switchHTML(net.allowed !== false, "net-sw", { text: t("admin.internet.updates"), hidden: true })}
         <div><b>${th("admin.internet.updates")}</b><p class="hint">${th("admin.internet.updates_hint")}</p></div></div>
-      <div class="swrow">${switchHTML(sh?.allowed !== false, "share-sw", { text: t("admin.internet.phones"), hidden: true })}
-        <div><b>${th("admin.internet.phones")}</b><p class="hint">${th("admin.internet.phones_hint")}</p>${shareLine(sh)}</div></div>
+      ${mode === "fest" ? "" : `<div class="swrow">${switchHTML(sh?.allowed !== false, "share-sw", { text: t("admin.internet.phones"), hidden: true })}
+        <div><b>${th("admin.internet.phones")}</b><p class="hint">${th("admin.internet.phones_hint")}</p>${shareLine(sh)}</div></div>`}
       <div class="swrow">${switchHTML(!!net.keep?.on, "keep-sw", { text: t("admin.internet.keep"), hidden: true })}
         <div><b>${th("admin.internet.keep")}</b><p class="hint">${th("admin.internet.keep_hint")}</p>${keepLine(net.keep)}</div></div>
-    </div>
-    <div class="card"><h3>${th("admin.internet.conn_title")}</h3><p class="hint">${th("admin.internet.conn_hint")}</p>${netConnForm(net)}</div>
-    ${fwCard(fw, system)}` : ""}
+    </div>`;
+  const connCard = !adm || mode === "ohne" ? "" : mode === "fest"
+    ? `<div class="card" id="conncard"><h3>${th("admin.internet.conn_title")}</h3><p>${th("admin.gw.conn_fest", { gw: esc(fixedGw) })}</p></div>`
+    : `<div class="card" id="conncard"><h3>${th("admin.internet.conn_title")}</h3><p class="hint">${th("admin.internet.conn_hint")}</p>${netConnForm(net)}</div>`;
+  $("#main").innerHTML = `${pageHead()}
+    ${adm ? `${gwCard(gw)}${useCard}${connCard}${fwCard(fw, system)}` : ""}
     ${uplinkCard()}
     ${adm && s ? `<form class="card" id="netform"><h3>${th("admin.net.title")}</h3>
       <p class="hint">${th("admin.net.hint")}</p>
@@ -109,8 +114,9 @@ RENDER.internet = async () => {
     </form>` : ""}`;
   if (adm && s) bindMon("net", s, "#net-rows", "#netform", "#net-add");
   if (adm) {
-    bindNetConn(net);
-    const flag = (sel, key, on, off) => $(sel).addEventListener("change", async (e) => {
+    bindGw(() => rerender());
+    if (mode === "auto") bindNetConn(net);
+    const flag = (sel, key, on, off) => $(sel)?.addEventListener("change", async (e) => {
       if (!await guard(() => api("PUT", "/settings", { [key]: e.target.checked }), t(e.target.checked ? on : off))) e.target.checked = !e.target.checked;
     });
     flag(".net-sw", "net_updates", "admin.internet.updates_on", "admin.internet.updates_off");
